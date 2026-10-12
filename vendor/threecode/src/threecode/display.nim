@@ -1,0 +1,984 @@
+## Transcript formatting: markdown, receipts, tool banners, and session lists.
+##
+## This module formats append-only scrollback content. It may write ordinary
+## transcript text, usually while `api.writeTranscriptWithFatPrompt` has temporarily
+## captured stdout or while terminal locking is already active, but it does not
+## own volatile cursor movement or prompt repainting.
+##
+## - **Markdown rendering**: headers, fences, tables, bold/italic/code pass
+##   through `handleMdLine` which calls `applyInlineMd` and wraps at terminal
+##   width. Tables buffer rows and render aligned box-drawing via `renderMdTable`.
+## - **Token receipt**: the cyan receipt in scroll history after each turn.
+##   All receipts route through `receiptBytes`. Live token-bar policy lives
+##   in `fatprompt.nim`.
+## - **Tool banners**: per-kind glyph and path header for each tool call result.
+## - **Session replay**: the replay emitter lives in `transcript.nim` and
+##   reuses these formatters so a replayed item matches the live rendering.
+##
+## The three-tier colour palette (bold cyan for hints, plain cyan for notes,
+## a dim-white for subtle FYI output) is mode-aware: the greyscale palette is
+## resolved per `ColorMode` at startup (see `util.applyPalette`), so it reads
+## on both light and dark backgrounds. SGR `dim` (`\x1b[2m`) is still avoided,
+## since it drops below readable contrast on light backgrounds and has no
+## clean mode switch.
+
+import std/[critbits, exitprocs, json, os, strformat, strutils, tables, terminal]
+import types, util, config, prompts, session, search, actions, minline, toolstream
+import terminal as termui
+
+# Three visible tiers, designed to read on both light + dark terminal
+# backgrounds:
+#   hint/note/warn = regular white   (status, help, validation — not brand)
+#   err            = non-bold magenta (never indented)
+#   subtle         = dim white        (FYI: skill markers, tool output)
+# Bold cyan stays on the startup screen and the live token bar only. The
+# greyscale palette (`BrightWhiteFg`, `OffWhiteFg`, `GreyFg`) is resolved per
+# `ColorMode` in `util.applyPalette`.
+
+template hint*(args: varargs[untyped]) =
+  stdout.styledWrite(fgDefault, args, resetStyle)
+
+template hintLn*(args: varargs[untyped]) =
+  stdout.styledWrite(fgDefault, args, resetStyle)
+  stdout.write "\r\n"
+
+template note*(args: varargs[untyped]) =
+  stdout.styledWrite(fgDefault, args, resetStyle)
+
+template noteLn*(args: varargs[untyped]) =
+  stdout.styledWrite(fgDefault, args, resetStyle)
+  stdout.write "\r\n"
+
+template warn*(args: varargs[untyped]) =
+  stdout.styledWrite(fgDefault, args, resetStyle)
+
+template warnLn*(args: varargs[untyped]) =
+  stdout.styledWrite(fgDefault, args, resetStyle)
+  stdout.write "\r\n"
+
+template err*(args: varargs[untyped]) =
+  stdout.styledWrite(fgMagenta, args, resetStyle)
+
+template errLn*(args: varargs[untyped]) =
+  stdout.styledWrite(fgMagenta, args, resetStyle)
+  stdout.write "\r\n"
+
+## String-returning counterparts of the write templates above. Command
+## emitters build their transcript body with these and return it; the
+## controller commits the body via the single history path. `styledWrite`
+## resolves the same globals (`BrightWhiteFg` and friends) at expansion
+## time, so a string built here carries the mode-resolved palette exactly
+## like a direct write.
+proc styleText*(args: varargs[string, `$`]): string =
+  for a in args: result.add a
+
+proc hintS*(args: varargs[string, `$`]): string =
+  styleText(args)
+
+proc hintLnS*(args: varargs[string, `$`]): string =
+  styleText(args) & "\r\n"
+
+proc noteLnS*(args: varargs[string, `$`]): string =
+  styleText(args) & "\r\n"
+
+proc errS*(args: varargs[string, `$`]): string =
+  "\x1b[35m" & styleText(args) & ansiResetCode
+
+proc errLnS*(args: varargs[string, `$`]): string =
+  errS(args) & "\r\n"
+
+func cmdResponseS*(body: string): string =
+  ## String form of `cmdResponse`: default color, flush left, content only.
+  result = body
+  if not body.endsWith("\n"): result.add "\n"
+
+func cmdErrorS*(body: string): string =
+  ## String form of `cmdError`: non-bold magenta, content only.
+  result = "\x1b[35m" & body & ansiResetCode
+  if not body.endsWith("\n"): result.add "\n"
+
+proc cmdResponse*(body: string) =
+  ## System-command response body: default terminal color, no indent, content
+  ## lines only. Inter-item spacing is owned by the scrollback engine.
+  stdout.write body
+  if not body.endsWith("\n"): stdout.write "\n"
+  stdout.flushFile
+
+proc cmdError*(body: string) =
+  ## Actionable error body from a system command: non-bold magenta, no indent,
+  ## content lines only. Spacing is owned by the scrollback engine.
+  stdout.styledWrite(fgMagenta, body, resetStyle)
+  if not body.endsWith("\n"): stdout.write "\n"
+  stdout.flushFile
+
+proc renderHelpS*(): string =
+  ## :help body in default terminal color: content lines only, no spacing.
+  ## `3code` highlighted bright white; `:command` tokens highlighted
+  ## bright white. Inter-item spacing is owned by the scrollback engine.
+  for line in HelpText.splitLines:
+    var i = 0
+    while i < line.len:
+      if i + 5 <= line.len and line[i ..< i + 5] == "3code":
+        result.add BrightWhiteFg & "3code" & ansiResetCode
+        i += 5
+      elif line[i] == '/' and i + 1 < line.len and
+           line[i + 1] in {'a'..'z', 'A'..'Z', '?', '!'}:
+        var j = i + 1
+        while j < line.len and line[j] in {'a'..'z', 'A'..'Z', '?', '!'}:
+          inc j
+        # `/command` tokens in the greyscale palette: `BrightWhiteFg` so they
+        # participate in light/dark mode switching (plain white is
+        # invisible on a light background).
+        result.add BrightWhiteFg & line[i ..< j] & Reset
+        i = j
+      else:
+        result.add line[i]
+        inc i
+    result.add "\n"
+
+proc renderHelp*() =
+  stdout.write renderHelpS()
+  stdout.flushFile
+
+proc subtleWrite*(outFile: File, body: string) =
+  ## FYI tier — grey 244, readable on both backgrounds. Replaces
+  ## styledWrite(styleDim, ..., resetStyle) which is invisible on
+  ## white terminals.
+  outFile.write GreyFg
+  outFile.write body
+  outFile.write Reset
+
+proc subtleWriteLn*(outFile: File, body: string) =
+  outFile.write GreyFg
+  outFile.write body
+  outFile.write Reset
+  outFile.write "\r\n"
+
+# `writeTranscriptWithFatPrompt` lives in `api.nim` now — it owns
+# `currentBarLabel`, the cached bar payload that drives repaint after a
+# content write.
+# `display.nim`'s job here is purely formatting: receipts, banners,
+# diff coloring, the welcome screen, etc.
+
+const
+  CompactHead = 3
+  CompactTail = 0
+  ReadHead = 2
+  ReadTail = 5
+
+proc isSkillRead*(act: Action): bool =
+  ## True when the action is a `cat`/`head`/`sed`-style read of a skill
+  ## file (any path under a registered skills dir). The main loop
+  ## suppresses banner + body output for these and prints its own dim
+  ## "loaded skill: <name>" marker so the user sees a single, styled
+  ## signal rather than a tool transcript.
+  let dirs = skillsDirs()
+  case act.kind
+  of akRead:
+    for d in dirs:
+      if act.path.startsWith(d): return true
+  of akBash:
+    for d in dirs:
+      if d in act.body: return true
+  else: discard
+  false
+
+proc skillNameFromAct*(act: Action): string =
+  ## Best-effort extraction of the skill name from a skill-read action.
+  ## Returns the basename without the `.md` suffix, or "" if we can't
+  ## tell. The bash form scans for the first registered skills-dir
+  ## prefix in the command body, then takes the path that follows.
+  var fname = ""
+  case act.kind
+  of akRead:
+    fname = act.path.extractFilename
+  of akBash:
+    let dirs = skillsDirs()
+    for d in dirs:
+      let idx = act.body.find(d)
+      if idx < 0: continue
+      let after = act.body[idx + d.len .. ^1].strip(chars = {'/'}, trailing = false)
+      var endIdx = 0
+      while endIdx < after.len and
+            after[endIdx] notin {' ', '\t', '\n', ';', '|', '&', '"', '\''}:
+        inc endIdx
+      fname = after[0 ..< endIdx].extractFilename
+      break
+  else: discard
+  if fname.endsWith(".md"): fname[0 ..< fname.len - 3] else: fname
+
+proc skillLoadedBytes*(act: Action): string =
+  ## String form of the skill-loaded marker (subtle grey).
+  let name = skillNameFromAct(act)
+  if name.len == 0: return
+  GreyFg & "· loaded skill: " & name & Reset & "\r\n"
+
+proc printSkillLoaded*(act: Action) =
+  let bytes = skillLoadedBytes(act)
+  if bytes.len > 0:
+    stdout.write bytes
+    stdout.flushFile
+
+proc trimBoundaryBlank(lines: var seq[string]) =
+  ## Strip blank rows from both ends of a tool-output line list so an item
+  ## never brings its own newlines into scrollback. Only the transcript
+  ## separator (one place) is allowed to insert the inter-item blank.
+  while lines.len > 0 and lines[^1].strip == "":
+    lines.setLen lines.len - 1
+  var start = 0
+  while start < lines.len and lines[start].strip == "":
+    inc start
+  if start > 0:
+    lines = lines[start ..< lines.len]
+
+proc wrappedSubtleBytes(body: string; widthPad = 3): string =
+  let termW = try: terminalWidth() except CatchableError: 80
+  let bodyW = max(20, termW - widthPad)
+  for line in body.splitLines:
+    for chunk in wrapAnsi(line, bodyW):
+      result.add GreyFg & "  " & chunk & Reset & "\r\n"
+
+proc compactHeadTailBytes(res: string; idx: int;
+                          head = CompactHead; tail = CompactTail): string =
+  var lines = res.splitLines
+  trimBoundaryBlank(lines)
+  var header = 0
+  if header < lines.len and lines[header].startsWith("$ "):
+    result.add wrappedSubtleBytes(lines[header])
+    inc header
+  var footer = lines.len
+  if footer > 0 and lines[footer-1].startsWith("[exit "):
+    dec footer
+  let bodyLen = footer - header
+  let hidden = bodyLen - head - tail
+  if hidden <= head + tail + 1:
+    for i in header ..< footer:
+      result.add wrappedSubtleBytes(lines[i])
+  else:
+    for i in header ..< header + head:
+      result.add wrappedSubtleBytes(lines[i])
+    result.add GreyFg & "  … " & $hidden & " line" &
+      (if hidden == 1: "" else: "s") &
+      " hidden · :show " & $idx & " for full …" & Reset & "\r\n"
+    for i in footer - tail ..< footer:
+      result.add wrappedSubtleBytes(lines[i])
+  if footer < lines.len:
+    result.add wrappedSubtleBytes(lines[footer])
+
+proc addDiffPainted(outBytes: var string; l: string) =
+  let termW = try: terminalWidth() except CatchableError: 80
+  let bodyW = max(20, termW - 2)
+  for chunk in wrapAnsi(l, bodyW):
+    if l.len > 0 and l[0] == '+':
+      outBytes.add ansiForegroundColorCode(fgGreen) & "  " & chunk &
+        ansiResetCode & "\r\n"
+    elif l.len > 0 and l[0] == '-':
+      outBytes.add ansiForegroundColorCode(fgRed) & "  " & chunk &
+        ansiResetCode & "\r\n"
+    else:
+      outBytes.add GreyFg & "  " & chunk & Reset & "\r\n"
+
+proc diffBytes(diff: string): string =
+  const DiffHead = 15
+  const DiffTail = 20
+  var lines = diff.splitLines
+  while lines.len > 0 and lines[^1].strip == "":
+    lines.setLen lines.len - 1
+  if lines.len == 0:
+    return ""
+  if lines.len <= DiffHead + DiffTail + 2:
+    for l in lines:
+      result.addDiffPainted(l)
+    return
+  for i in 0 ..< DiffHead:
+    result.addDiffPainted(lines[i])
+  result.add GreyFg & "  … " & $(lines.len - DiffHead - DiffTail) &
+    " line" & (if lines.len - DiffHead - DiffTail == 1: "" else: "s") &
+    " hidden · `git diff` for full …" & Reset & "\r\n"
+  for i in lines.len - DiffTail ..< lines.len:
+    result.addDiffPainted(lines[i])
+
+proc firstDiffLine(diff: string): string =
+  for line in diff.splitLines:
+    if line.strip.len > 0:
+      return line
+  ""
+
+proc diffBytesSkippingFirst(diff: string): string =
+  var skipped = false
+  var rest: seq[string]
+  for line in diff.splitLines:
+    if not skipped and line.strip.len > 0:
+      skipped = true
+      continue
+    if skipped:
+      rest.add line
+  diffBytes(rest.join("\n"))
+
+proc planStatusGlyph(status: string): string =
+  case status
+  of "completed": "✓"
+  of "in_progress": "~"
+  else: "○"
+
+proc planResultBytes*(plan: seq[PlanItem]): string =
+  ## One item per line, glyph-prefixed. The single renderer for plan
+  ## output - used by `planTranscriptBytes` (live transcript) and `showTool`
+  ## so a plan looks identical whether it just ran or was scrolled back to.
+  for item in plan:
+    result.add GreyFg & "  " & planStatusGlyph(item.status) & " " &
+      item.text & Reset & "\r\n"
+
+proc planTranscriptBytes(act: Action): string =
+  result.add "≡ ──────────\r\n"
+  result.add planResultBytes(act.plan)
+
+proc clearTranscriptBytes(act: Action): string =
+  result.add "═════════════════════════════════════════\r\n"
+  result.add "↻ " & act.body.strip & "\r\n"
+
+proc contextLabel*(promptTokens, window: int): string =
+  ## "○ 12%" / "◔ 25%" / … / "● 92%". Empty when there's no useful
+  ## number (no window). Always shows a bullet with a percentage, defaulting
+  ## to 0% while `promptTokens` is still zero (first turn in flight).
+  if window <= 0: return ""
+  let pct = int(promptTokens.float / window.float * 100.0)
+  let glyph =
+    if pct < 20: "○"
+    elif pct < 40: "◔"
+    elif pct < 60: "◑"
+    elif pct < 80: "◕"
+    else: "●"
+  &"{glyph}{pct}%"
+
+type MarkdownState* = ref object
+  ## Per-line markdown rendering state. Shared between the streaming
+  ## path (api.nim feeds chunks line by line as they arrive over SSE)
+  ## and the replay path (display.nim feeds the stored full content).
+  ## Both call `handleMdLine` per line and `finishMd` at end so the
+  ## visible output is byte-identical regardless of who fed the lines.
+  ## `ref` so nested closures inside the handlers can mutate it.
+  firstEmit*: bool
+  tableBuf*: seq[string]
+  codeBuf*: seq[string]
+  inCode*: bool
+
+proc initMarkdownState*(firstEmit = true): MarkdownState =
+  MarkdownState(firstEmit: firstEmit)
+
+proc handleMdLine*(s: MarkdownState, l: string, outFile: File): bool {.discardable.} =
+  ## Route one input line through markdown handlers (headers, fences,
+  ## tables, paragraphs). Returns true if anything was written to
+  ## `outFile` this call (table rows and code-block bodies buffer
+  ## silently until flushed). State accumulates across calls.
+  proc emitLine(l: string) =
+    let termW = try: terminalWidth() except CatchableError: 80
+    let bodyW = max(20, termW - 2)
+    let chunks = wrapAnsi(applyInlineMd(l), bodyW)
+    var k = 0
+    for chunk in chunks:
+      let prefix = if s.firstEmit and k == 0: "" else: "  "
+      outFile.write(prefix & chunk & "\n")
+      inc k
+    s.firstEmit = false
+  proc emitHeader(text: string) =
+    let termW = try: terminalWidth() except CatchableError: 80
+    let bodyW = max(20, termW - 2)
+    let chunks = wrapAnsi(text, bodyW)
+    var k = 0
+    for chunk in chunks:
+      let prefix = if s.firstEmit and k == 0: "" else: "  "
+      outFile.styledWrite(styleBright, prefix & chunk & "\n", resetStyle)
+      inc k
+    s.firstEmit = false
+  proc flushTable(): bool =
+    if s.tableBuf.len == 0: return false
+    if s.firstEmit:
+      outFile.write "\n"
+      s.firstEmit = false
+    if s.tableBuf.len < 2:
+      for r in s.tableBuf: emitLine(r)
+    else:
+      let termW = try: terminalWidth() except CatchableError: 80
+      let rendered = renderMdTable(s.tableBuf, maxWidth = termW)
+      outFile.write(rendered)
+    s.tableBuf.setLen 0
+    true
+  if s.inCode:
+    if isMdFenceLine(l):
+      # close the fence: flush the buffered body, exit code mode
+      var emitted = false
+      for cl in s.codeBuf:
+        if s.firstEmit:
+          outFile.write "\n"
+          s.firstEmit = false
+        subtleWrite(outFile, "  ┃ ")
+        outFile.write(cl & "\n")
+        emitted = true
+      s.codeBuf.setLen 0
+      s.inCode = false
+      return emitted
+    s.codeBuf.add l
+    return false
+  if isMdFenceLine(l):
+    let flushed = flushTable()
+    s.inCode = true
+    return flushed
+  if isMdTableRow(l):
+    s.tableBuf.add l
+    return false
+  let flushed = flushTable()
+  let (isHdr, hdrText) = detectMdHeader(l)
+  if isHdr:
+    emitHeader(hdrText)
+  else:
+    emitLine(l)
+  result = true or flushed
+
+proc finishMd*(s: MarkdownState, outFile: File): bool {.discardable.} =
+  ## Flush any pending code block or table buffer at end of content.
+  ## Returns true if anything was written.
+  result = false
+  if s.codeBuf.len > 0:
+    for cl in s.codeBuf:
+      if s.firstEmit:
+        outFile.write "\n"
+        s.firstEmit = false
+      subtleWrite(outFile, "  ┃ ")
+      outFile.write(cl & "\n")
+    s.codeBuf.setLen 0
+    result = true
+  if s.tableBuf.len > 0:
+    if s.firstEmit:
+      outFile.write "\n"
+      s.firstEmit = false
+    if s.tableBuf.len < 2:
+      var nested = initMarkdownState(s.firstEmit)
+      for r in s.tableBuf: handleMdLine(nested, r, outFile)
+      s.firstEmit = nested.firstEmit
+    else:
+      let termW = try: terminalWidth() except CatchableError: 80
+      let rendered = renderMdTable(s.tableBuf, maxWidth = termW)
+      outFile.write(rendered)
+    s.tableBuf.setLen 0
+    result = true
+
+template AssistantTextStyle*: string = BrightWhiteFg
+  ## Active assistant-text SGR (the white-family color for LLM output).
+  ## A template so it re-reads the mode-resolved `BrightWhiteFg` var at
+  ## each use instead of snapshotting it at compile time.
+
+proc assistantTextBytes*(bytes: string): string =
+  if bytes.len == 0:
+    return ""
+  var body = bytes
+  var tail = ""
+  while body.len > 0 and body[^1] in {'\r', '\n'}:
+    tail.insert($body[^1], 0)
+    body.setLen(body.len - 1)
+  let styled = body
+    .replace(Reset, Reset & AssistantTextStyle)
+    .replace("\x1b[22m", "\x1b[22m" & AssistantTextStyle)
+  AssistantTextStyle & styled & Reset & tail
+
+proc captureMarkdownBytes(s: MarkdownState; line = ""; finish = false): string =
+  let path = tempDir() / "3code_assistant_md_" & $getCurrentProcessId()
+  let f = open(path, fmWrite)
+  defer: close(f)
+  if finish:
+    discard finishMd(s, f)
+  else:
+    discard handleMdLine(s, line, f)
+  f.flushFile
+  defer:
+    try: removeFile(path) except OSError: discard
+  result = readFile(path)
+
+proc assistantBulletBytes*(): string =
+  AssistantTextStyle & "● " & Reset
+
+proc writeAssistantBullet*(outFile: File = stdout) =
+  outFile.write assistantBulletBytes()
+
+proc stripCheckpointMarkers*(content: string): string =
+  ## Remove dmail `[checkpoint N]` lines for display. The markers stay in
+  ## the message content (the model reads them, and the session file
+  ## keeps them), but painting them puts harness bookkeeping on screen
+  ## and, worse, teaches the model to echo the marker itself (a marker in
+  ## the visible stream gets parroted back as content). Stripping is
+  ## line-based: a line whose only text is one marker drops entirely.
+  ## Multiple markers on one line (an echoed batch) all drop, keeping any
+  ## surrounding text.
+  result = content
+  while true:
+    let start = result.find("[checkpoint ")
+    if start < 0: break
+    let close = result.find(']', start)
+    if close < 0: break
+    let numStr = result[start + 12 ..< close]
+    if numStr.len == 0 or not numStr.allCharsInSet({'0'..'9'}): break
+    # Drop the marker and one adjacent newline so no blank row remains.
+    if close + 1 < result.len and result[close + 1] == '\n':
+      result.delete(start .. close + 1)
+    elif start > 0 and result[start - 1] == '\n':
+      result.delete(start - 1 .. close)
+    else:
+      result.delete(start .. close)
+
+const CheckpointOpen* = "[checkpoint "
+  ## The dmail marker tag prefix. Shared by the commit-side cut below and
+  ## the live stream's partial-marker holdback so the two never disagree
+  ## about what counts as "still growing into a marker".
+
+proc cutPartialTrailingMarker*(content: string): string =
+  ## Drop a trailing INCOMPLETE marker from already-final content: any
+  ## proper suffix that could still grow into `[checkpoint N]`, down to a
+  ## bare `[`. A stream that ends mid-marker never paints the tail (the
+  ## live partial painter holds back exactly these suffixes), so the
+  ## end-of-turn commit must not paint it either; `stripCheckpointMarkers`
+  ## only matches complete markers, and a truncated tag would otherwise
+  ## render as a stray `● [` row. Field shape (session 20260907T182657):
+  ## hundreds of echoed marker lines, stream cut at the output cap, tail
+  ## `[`. Prose like `[checkpoints]` never matches: `s` breaks the prefix
+  ## and the digit run alike.
+  result = content
+  block scan:
+    var i = result.len
+    while i > 0:
+      dec i
+      if result[i] != '[': continue
+      let tail = result[i .. ^1]
+      if tail.len <= CheckpointOpen.len:
+        # A prefix of the open (`[`, `[c`, ..., `[checkpoint ` inclusive);
+        # it can still grow into a marker, so the live painter held it
+        # back and the commit must not paint it either.
+        if CheckpointOpen.startsWith(tail):
+          result.setLen(i)
+          break scan
+      elif tail.startsWith(CheckpointOpen):
+        let digits = tail[CheckpointOpen.len .. ^1]
+        if digits.len > 0 and digits.allCharsInSet({'0'..'9'}):
+          result.setLen(i)
+        break scan
+  # Trailing whitespace after the cut would otherwise paint a blank row.
+  var last = result.len
+  while last > 0 and result[last - 1] in {' ', '\t', '\r', '\n'}: dec last
+  result.setLen(last)
+
+proc renderAssistantContentBytes*(content: string): string =
+  ## String form of `renderAssistantContent`: the assistant item body
+  ## (bullet + styled markdown) without touching a File. Used by the
+  ## controller's transcript path, which owns when the bytes hit the
+  ## terminal.
+  ##
+  ## Reproduces the LIVE streaming commit shape (`feedContent` /
+  ## `finishContent` in fatprompt/runtime.nim) line for line: every
+  ## committed source line becomes one transcript item, consecutive items
+  ## are separated by one blank row, interior blank source lines coalesce
+  ## into a single extra blank row, and leading/trailing blanks are
+  ## dropped. Keeping the two shapes in one place is what makes a resumed
+  ## replay byte-identical to how the reply rendered live; the walk below
+  ## must mirror feedContent's rules exactly.
+  # Complete markers stripped, then a truncated trailing marker cut: the
+  # live painter held that tail back, so the commit must not paint it.
+  let content = cutPartialTrailingMarker(stripCheckpointMarkers(content))
+  if content.strip.len == 0: return
+  var st = initMarkdownState()
+  # Accumulate the exact byte sequence the live stream commits, one
+  # `\r\n + body + \r\n` transcript item per committed source line
+  # (`commitPendingLine`) and one empty item per deferred paragraph break
+  # (`commitBlankLine`). One leading and trailing `\r\n` are trimmed
+  # because the transcript emitter re-adds them around the whole body.
+  var commits: seq[string] = @[]
+  var pendingBlank = false
+  for line in content.splitLines:
+    if line.strip.len == 0:
+      # Leading blanks fall while `firstEmit` still holds (the stream
+      # strips them before the first real content); interior blanks
+      # defer, coalesced, until the next committed line.
+      if not st.firstEmit:
+        pendingBlank = true
+      continue
+    let wasFirst = st.firstEmit
+    let body = captureMarkdownBytes(st, line)
+    if body.strip.len == 0:
+      # Buffered table/code row: nothing commits for this source line,
+      # so a deferred blank stays pending (the stream's blank flushes
+      # only when real bytes commit).
+      continue
+    if pendingBlank and commits.len > 0:
+      commits.add ""
+      pendingBlank = false
+    if wasFirst:
+      commits.add assistantBulletBytes() & assistantTextBytes(body)
+    else:
+      commits.add assistantTextBytes(body)
+  let finish = captureMarkdownBytes(st, finish = true)
+  if finish.strip.len > 0:
+    if pendingBlank and commits.len > 0:
+      commits.add ""
+    commits.add assistantTextBytes(finish)
+  if commits.len == 0: return
+  for c in commits:
+    # Trim each commit's tail exactly as the transcript emitter trims an
+    # item before writing it (`trimTrailingNewlines`): the markdown body
+    # carries its own `\n` line ending, and keeping it would stack an
+    # extra blank row onto every separator.
+    var body = c
+    while body.len > 0 and body[^1] in {'\r', '\n'}:
+      body.setLen(body.len - 1)
+    # An empty commit (the stream's deferred paragraph break) also writes
+    # nothing in the live emitter (`writeTranscriptItem` returns early on
+    # empty), so a paragraph break renders exactly one blank row, same as
+    # any line break.
+    if body.len == 0: continue
+    result.add "\r\n" & body & "\r\n"
+  while result.len > 0 and result[^1] in {'\r', '\n'}:
+    result.setLen(result.len - 1)
+  if result.startsWith("\r\n"): result.delete(0, 1)
+
+proc toolIcon*(kind: ActionKind): string =
+  case kind
+  of akBash: "$"
+  of akRead: "r"
+  of akWrite: "w"
+  of akPatch, akApplyPatch: "p"
+  of akPlan: "▸"
+  of akWebSearch: "⌕"
+  of akWebFetch: "⇊"
+  of akClear: "⟳"
+  of akDMail: "✉"
+  of akError: "✕"
+
+proc toolBannerBytes*(banner: string; kind: ActionKind; code: int;
+                      elapsedS = -1): string =
+  let icon = if kind == akBash and code > 0: "Ø" else: toolIcon(kind)
+  let suffix = if elapsedS >= 1: GreyFg & &"  ({elapsedS}s)" & Reset else: ""
+  let termW = try: terminalWidth() except CatchableError: 80
+  let rows = bannerWrapRows(icon & " ", banner, termW)
+  for i, row in rows:
+    result.add OffWhiteFg & row & Reset
+    if i == rows.high:
+      result.add suffix
+    result.add "\r\n"
+
+proc toolResultBytes*(kind: ActionKind; res: string; code: int; idx: int;
+                      diff = ""): string =
+  if kind == akBash:
+    var lines = res.splitLines
+    trimBoundaryBlank(lines)
+    if lines.len <= StreamMaxLines:
+      for l in lines:
+        result.add wrappedSubtleBytes(l)
+    else:
+      let tailLen = max(0, StreamMaxLines - 1)
+      let hidden = lines.len - tailLen
+      result.add GreyFg & "  ... " & $hidden & " line" &
+        (if hidden == 1: "" else: "s") & " omitted" &
+        (if idx > 0: " :show " & $idx & " for full" else: "") &
+        Reset & "\r\n"
+      for i in lines.len - tailLen ..< lines.len:
+        result.add wrappedSubtleBytes(lines[i])
+  elif kind == akRead:
+    var lines = res.splitLines
+    while lines.len > 0 and lines[^1].startsWith("... [") and
+          lines[^1].endsWith("] ..."):
+      lines.setLen(lines.len - 1)
+    result.add compactHeadTailBytes(lines.join("\n"), idx, ReadHead, ReadTail)
+  elif kind == akWrite:
+    result.add compactHeadTailBytes(diff, idx, ReadHead, ReadTail)
+  elif kind in {akWebSearch, akWebFetch}:
+    result.add compactHeadTailBytes(res, idx)
+  else:
+    if code == 0:
+      result.add wrappedSubtleBytes(res)
+    else:
+      let nl = res.find('\n')
+      let head = if nl < 0: res else: res[0 ..< nl]
+      result.add wrappedSubtleBytes(head)
+  if diff.len > 0 and kind notin {akWrite, akRead}:
+    result.add diffBytes(diff)
+
+proc toolTranscriptBytes*(banner: string; kind: ActionKind; res: string;
+                          code: int; idx: int; diff = "";
+                          elapsedS = -1): string =
+  result.add toolBannerBytes(banner, kind, code, elapsedS)
+  result.add toolResultBytes(kind, res, code, idx, diff)
+
+proc toolTranscriptBytes*(act: Action; res: string; code: int; idx: int;
+                          diff = ""; elapsedS = -1): string =
+  case act.kind
+  of akWrite:
+    result.add toolBannerBytes(bannerFor(act), act.kind, code, elapsedS)
+    if code == 0 and diff.len > 0:
+      result.add compactHeadTailBytes(diff, idx, ReadHead, ReadTail)
+    else:
+      result.add toolResultBytes(act.kind, res, code, idx, diff = "")
+  of akPatch, akApplyPatch:
+    let first = firstDiffLine(diff)
+    let banner = if first.len > 0: first else: bannerFor(act)
+    result.add toolBannerBytes(banner, act.kind, code, elapsedS)
+    if code != 0:
+      result.add toolResultBytes(act.kind, res, code, idx, diff = "")
+    elif diff.len > 0:
+      result.add diffBytesSkippingFirst(diff)
+    else:
+      result.add toolResultBytes(act.kind, res, code, idx, diff = "")
+  of akPlan:
+    result.add planTranscriptBytes(act)
+  of akClear:
+    result.add clearTranscriptBytes(act)
+  of akError:
+    result.add "✕ unknown tool: " & act.path & "\r\n"
+  else:
+    result.add toolTranscriptBytes(
+      bannerFor(act), act.kind, res, code, idx, diff, elapsedS)
+
+proc tokenLineLabel*(usage: Usage, window: int, elapsedS = -1): string =
+  ## Pure label string for the bar / receipt: "○N%  ↑input  ↻cached
+  ## ↓completion  hh:mm:ss" (no styling, no leading spaces — caller wraps
+  ## it in cyan-bright for the bar or cyan for the receipt). Empty
+  ## when there's no usage to report.
+  if usage.totalTokens <= 0: return ""
+  let ctx = contextLabel(usage.promptTokens, window)
+  var parts: seq[string]
+  if ctx.len > 0: parts.add ctx
+  let ts1 = tokenSlot("↑", usage.promptTokens)
+  if ts1.len > 0: parts.add ts1
+  let ts2 = tokenSlot("↻", usage.cachedTokens)
+  if ts2.len > 0: parts.add ts2
+  let ts3 = tokenSlot("↓", usage.completionTokens)
+  if ts3.len > 0: parts.add ts3
+  if elapsedS >= 0: parts.add clockDuration(elapsedS)
+  result = parts.join("  ")
+
+proc receiptBytes*(label: string): string =
+  ## The single canonical styling for a token receipt row (two-space
+  ## indent, cyan fg). Every receipt in the app, live or replay, goes
+  ## through here so there is exactly one color for receipts. Returns
+  ## "" for an empty label.
+  if label.len == 0: return ""
+  CyanFg & "  " & label & Reset
+
+proc profileLinesS*(p: Profile; bold = false): string =
+  ## String form of `showProfile`: provider/model/reasoning rows with
+  ## bright-white values and default (or bold cyan) labels.
+  if p.name == "": return
+  let dot = p.name.find('.')
+  let provider = if dot < 0: p.name else: p.name[0 ..< dot]
+  let labelOn = if bold: "\x1b[36m\x1b[1m" else: ""
+  let pad = if bold: "  " else: ""
+  result.add labelOn & pad & "provider  " & ansiResetCode &
+    BrightWhiteFg & provider & ansiResetCode & "\r\n"
+  result.add labelOn & pad & "model     " & ansiResetCode &
+    BrightWhiteFg & shortModel(p.model) & ansiResetCode & "\r\n"
+  if p.reasoning != "":
+    result.add labelOn & pad & "reasoning " & ansiResetCode &
+      BrightWhiteFg & p.reasoning & ansiResetCode & "\r\n"
+  if privateMode:
+    result.add labelOn & pad & "private   " & ansiResetCode &
+      BrightWhiteFg & (if privateAllowed(p): "allowed" else: "NOT allowed") &
+      ansiResetCode & "\r\n"
+
+proc showProfile*(p: Profile; bold = false) =
+  let s = profileLinesS(p, bold)
+  if s.len > 0:
+    stdout.write s
+    stdout.flushFile
+
+# Track up-navigation so "down past last" can return to blank line.
+var navigatedUp*: bool = false
+var origDown, origUp: proc(ed: var LineEditor) {.closure.}
+
+proc installEditorTweaks*() =
+  # The default Up/Down bindings move by visual row and fall through to
+  # history navigation at the boundary. Wrap those command callbacks so
+  # the UI can tell whether the user has moved into history. Make sure
+  # KEYMAP is populated (including cmd:* entries from applyShortcuts)
+  # before we try to wrap its entries. welcome() runs before the first
+  # readLineWith, so initKeyTables alone is not enough.
+  initKeyTables()
+  applyShortcuts(configuredShortcuts)
+  # Arrow keys still go through KEYMAP["up"]/"down"] (handleEscape
+  # fallback) and CommandProcsAll (SEQCMDS). Wrap all three so history
+  # navigation is tracked regardless of which path fires.
+  origUp = KEYMAP["up"]
+  origDown = KEYMAP["down"]
+  let wrapUp = proc(ed: var LineEditor) =
+    origUp(ed)
+    navigatedUp = true
+  let wrapDown = proc(ed: var LineEditor) =
+    origDown(ed)
+    if navigatedUp:
+      navigatedUp = false
+  KEYMAP["up"] = wrapUp
+  KEYMAP["down"] = wrapDown
+  KEYMAP["cmd:up"] = wrapUp
+  KEYMAP["cmd:down"] = wrapDown
+  # CommandProcs is the source applyShortcuts copies into each thread's
+  # CommandProcsAll / KEYMAP["cmd:*"], so wrapping it here survives the
+  # input thread's later applyShortcuts.
+  CommandProcs["up"] = wrapUp
+  CommandProcs["down"] = wrapDown
+  CommandProcsAll["up"] = wrapUp
+  CommandProcsAll["down"] = wrapDown
+  # also reset the flag when the line is cleared
+  let origClear = KEYMAP["cmd:clear"]
+  let wrapClear = proc(ed: var LineEditor) =
+    origClear(ed)
+    navigatedUp = false
+  KEYMAP["cmd:clear"] = wrapClear
+  CommandProcs["clear"] = wrapClear
+  CommandProcsAll["clear"] = wrapClear
+
+proc welcome*(p: Profile): minline.LineEditor =
+  termui.setSteadyCursor()
+  addExitProc(termui.restoreCursorStyle)
+  stdout.write "\n"
+  stdout.styledWriteLine fgCyan, styleBright, "  ╭─╮"
+  stdout.styledWrite fgCyan, styleBright, "   ─┤  ", resetStyle, styleBright, "3code ", resetStyle, fgCyan, styleBright, "v" & Version, resetStyle
+  subtleWriteLn(stdout, "   the economical coding agent")
+  stdout.styledWriteLine fgCyan, styleBright, "  ╰─╯"
+  stdout.write "\n"
+  if p.name != "":
+    showProfile(p, bold = true)
+    stdout.write "\n"
+    stdout.styledWrite fgCyan, styleBright, "  type a prompt. ", resetStyle
+    subtleWriteLn(stdout, ":help for commands. :q or Ctrl-D to exit.")
+  stdout.flushFile
+  installEditorTweaks()
+  result = minline.initEditor(historyFile = historyFile())
+
+proc printKnownGood*() =
+  ## List every `(provider, variant)` combo in `KnownGoodCombos` along
+  ## with its model + version tags. Powers `--good` / `3code good` so a
+  ## user can survey the curated catalog without configuring anything.
+  echo "known-good provider/variant combos:"
+  echo ""
+  var maxId = 0
+  for c in KnownGoodCombos:
+    let id = c.provider & "." & c.model
+    if id.len > maxId: maxId = id.len
+  for c in KnownGoodCombos:
+    let id = c.provider & "." & c.model
+    let v =
+      if c.version.len > 0 and c.variant.len > 0: c.version & "." & c.variant
+      elif c.version.len > 0: c.version
+      else: c.variant
+    let tag = if v.len > 0: c.family & " " & v else: c.family
+    echo "  ", id.alignLeft(maxId), "  ", tag
+  echo ""
+  echo "pass any of these to --model, e.g. 3code --model ", KnownGoodCombos[0].provider,
+       ".", KnownGoodCombos[0].model
+  echo "other combos require --experimental."
+
+const SessionListCap* = 20
+  ## Newest sessions shown by `printSessionList` / `-l` / `:sessions`.
+  ## Paths arrive newest-first from `listSessionPaths`, so the cap is a
+  ## simple slice. Listing is directory-scoped by design; the full set
+  ## lives under `sessionDir()` for anyone who needs it.
+
+proc printSessionListS*(paths: seq[string], currentPath: string,
+                        showCwd: bool, skip = 0, moreCmd = ""): string =
+  ## String form of the `:sessions` / `-l` listing. `skip` paginates (the
+  ## caller derives it from `--page`); only the displayed slice is ever
+  ## previewed. `moreCmd` names the way to get the next page: the CLI
+  ## passes a --page hint, `:sessions` passes nothing and keeps the
+  ## where-they-live hint instead.
+  let first = min(skip, paths.len)
+  let lastEx = min(skip + SessionListCap, paths.len)
+  let shown = paths[first ..< lastEx]
+  for p in shown:
+    let id = sessionIdFromPath(p)
+    let preview = previewSession(p)
+    let mark = if currentPath == p: "*" else: " "
+    let snip =
+      if preview.firstUser.len == 0: ""
+      elif preview.firstUser.len > 50: "  " & preview.firstUser[0 ..< 47] & "..."
+      else: "  " & preview.firstUser
+    let cwdStr =
+      if showCwd and preview.cwd != "": "  " & collapseHome(preview.cwd)
+      else: ""
+    result.add &"  {mark} " & id &
+      &"   ({preview.msgCount} msg" & (if preview.msgCount == 1: "" else: "s") & ")" &
+      cwdStr & snip & "\r\n"
+  if paths.len > lastEx:
+    if moreCmd.len > 0:
+      result.add &"  …  {lastEx} of {paths.len}  ({moreCmd})\r\n"
+    else:
+      let dir = collapseHome(sessionDir())
+      result.add &"  …  {lastEx} of {paths.len}  (more in {dir})\r\n"
+
+proc printSessionList*(paths: seq[string], currentPath: string, showCwd: bool,
+                       skip = 0, moreCmd = "") =
+  stdout.write printSessionListS(paths, currentPath, showCwd, skip, moreCmd)
+  stdout.flushFile
+
+proc printSearchListS*(hits: seq[SearchHit], total: int, showCwd: bool,
+                       skip = 0, moreCmd = ""): string =
+  ## String form of the `-f` / `--find` result page: session id, match
+  ## count, cwd (only when the search spanned directories), and a snippet
+  ## around the first match with 3log formatting stripped. Like the list,
+  ## only the displayed page pays for snippet extraction.
+  let first = min(skip, hits.len)
+  let lastEx = min(skip + SessionListCap, hits.len)
+  for h in hits[first ..< lastEx]:
+    let id = sessionIdFromPath(h.path)
+    let cwdStr =
+      if showCwd:
+        var c = collapseHome(h.cwd)
+        if c.len > 26: c = "…" & c[c.len - 25 .. ^1]
+        c
+      else: ""
+    let snip = hitSnippet(h, if showCwd: 48 else: 72)
+    result.add &"  {id}  {align($h.score, 3)}×" &
+      (if cwdStr.len > 0: "  " & cwdStr else: "") &
+      "  " & snip & "\r\n"
+  if total > lastEx:
+    result.add &"  …  {lastEx} of {total} session" & (if total == 1: "" else: "s")
+    if moreCmd.len > 0: result.add &"  ({moreCmd})"
+    result.add "\r\n"
+
+proc printSearchList*(hits: seq[SearchHit], total: int, showCwd: bool,
+                      skip = 0, moreCmd = "") =
+  stdout.write printSearchListS(hits, total, showCwd, skip, moreCmd)
+  stdout.flushFile
+
+proc showToolS*(arg: string, toolLog: seq[ToolRecord]): string =
+  ## String form of the `:show` body (same byte builders as the live path).
+  if toolLog.len == 0:
+    return hintLnS("no tool calls yet")
+  var n = toolLog.len
+  if arg != "":
+    try: n = parseInt(arg)
+    except ValueError:
+      return errLnS("show: not a number: " & arg)
+  if n < 1 or n > toolLog.len:
+    return errLnS(&"show: T{n} out of range (1..{toolLog.len})")
+  let rec = toolLog[n-1]
+  result = &"── T{n}  " & rec.banner & "\r\n"
+  if rec.kind == akPlan and rec.plan.len > 0:
+    result.add planResultBytes(rec.plan)
+  else:
+    result.add toolResultBytes(rec.kind, rec.output, rec.code, n)
+
+proc showTool*(arg: string, toolLog: seq[ToolRecord]) =
+  stdout.write showToolS(arg, toolLog)
+  stdout.flushFile
+
+proc listToolsS*(toolLog: seq[ToolRecord]): string =
+  ## String form of the `:log` body.
+  if toolLog.len == 0:
+    return hintLnS("no tool calls yet")
+  for i, rec in toolLog:
+    let tag = &"T{i+1}"
+    let lines = rec.output.splitLines.len
+    let mark = if rec.code == 0: "✓" else: "✗"
+    let colorOn = if rec.code == 0: "\x1b[32m" else: ""
+    result.add &"  {tag:>4}  " & colorOn & mark & ansiResetCode & " " &
+      rec.banner &
+      &"   ({lines} line" & (if lines == 1: "" else: "s") & ")" & "\r\n"
+
+proc listTools*(toolLog: seq[ToolRecord]) =
+  stdout.write listToolsS(toolLog)
+  stdout.flushFile

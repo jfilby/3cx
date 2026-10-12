@@ -1,0 +1,10 @@
+AGENTS.md
+
+# Build output
+/bin/
+/3cx
+nimcache/
+*.exe
+
+# Local session transcript
+session.json

@@ -1,0 +1,283 @@
+## Context management: when the conversation approaches the model's context
+## window, older turns are collapsed into a single synthetic recap via a
+## meta-call to the same model (with a dedicated terse system prompt). That
+## recap replaces everything except the system prompt and the last
+## `SummarizeKeepRecent` messages. Summarization is lossy and expensive, so
+## it runs at most once per turn, only when the context crosses the
+## threshold.
+
+import std/[httpclient, json, strutils]
+import util
+import types
+import prompts
+
+proc contextWindowFor*(model: string): int =
+  ## Heuristic fallback for models off the known-good table
+  ## (experimental, or a provider/model pair we haven't curated).
+  ## Substring match on well-known slugs; no known collisions in
+  ## practice. Known-good pairs should go through `contextWindowFor(p)`
+  ## instead, which consults `KnownGoodCombos` for the exact window.
+  let m = model.toLowerAscii
+  if m == "stub-model": 12_000
+  elif "kimi-k2" in m: 262_144
+  elif "qwen3-coder" in m or "qwen3_coder" in m: 262_144
+  elif "qwen" in m: 128_000
+  elif "claude" in m: 200_000
+  elif "gpt-6" in m: 1_050_000
+  elif "gpt-5" in m: 400_000
+  elif "gpt-4" in m: 128_000
+  elif "o1" in m or "o3" in m or "o4" in m: 200_000
+  elif "deepseek" in m: 128_000
+  elif "gemini" in m: 1_000_000
+  elif "llama" in m: 128_000
+  elif "glm-5.2" in m or "glm-5.3" in m: 1_000_000
+  elif "omen-alpha" in m: 500_000
+  elif "glm" in m: 200_000
+  elif "mistral" in m or "mixtral" in m: 128_000
+  elif "minimax-m3" in m: 1_000_000
+  elif "space-bunny" in m: 1_000_000
+  elif "minimax" in m: 204_800
+  elif "hy3" in m or "hunyuan" in m: 262_144
+  else: 128_000
+
+proc contextWindowFor*(p: Profile): int =
+  ## Known-good-aware context window. A curated (provider, model) pair
+  ## returns its exact advertised window; everything else falls back to
+  ## the substring heuristic in the `model: string` overload. The table
+  ## is the source of truth because provider curation (which GLM build a
+  ## provider actually serves) matters as much as the family.
+  let kg = knownGoodContextWindow(p)
+  if kg > 0: return kg
+  contextWindowFor(p.model)
+
+const
+  SummarizeKeepRecent* = 8
+  SummarizeThresholdFrac* = 0.8
+  SummarizeMaxTokens* = 500
+  SummaryPrefix* = "Earlier in this session: "
+  SummarizerSystemPrompt* = """You are summarizing an earlier coding session for later recall. Compress the messages below into one paragraph covering: files read/written, commands run and outcomes, current state (tests green? uncommitted changes? what decision was reached?). Omit everything that's been superseded. No filler."""
+  SummarizerPayloadCap = 768 * 1024
+    ## Gateways reject oversized request bodies with an opaque 400 while
+    ## the token count is still far under the context window (Zen does at
+    ## roughly a megabyte; issue #48). The summarizer meta-call must fit
+    ## that same envelope even when the conversation it summarizes does
+    ## not, so oversized message text is clipped to a per-message budget
+    ## derived from this cap.
+  SummarizeByteGuardBytes* = 1_000_000
+    ## Proactive request-size ceiling for the Zen-family gateways
+    ## (opencode/opencodego). Their byte envelope is undocumented and
+    ## route-variable — observed between roughly one and two MB
+    ## (anomalyco/opencode#35013, capocasa/3code#48) — so the guard sits
+    ## under the tightest observed envelope and fires while every known
+    ## route would still accept the request. Other providers are not
+    ## guarded: several accept multi-MB bodies and would get pointless
+    ## lossy summarization.
+  OverflowFallbackSummary* = "Earlier turns were dropped without a recap " &
+    "because the provider rejected the conversation as too large and the " &
+    "summarizer call failed as well; the recent messages below are " &
+    "everything that remains."
+
+proc clipSummarizerPayload(payload: JsonNode) =
+  ## Shrink `payload` in place until its serialized size fits
+  ## `SummarizerPayloadCap`, halving the per-message budget as needed.
+  ## Only message text is clipped; roles, ids and tool-call wrappers stay
+  ## intact so provider-side pairing validation still passes.
+  if payload == nil or payload.kind != JArray or payload.len == 0: return
+  var perMsg = max(256, SummarizerPayloadCap div payload.len)
+  while len($payload) > SummarizerPayloadCap:
+    for m in payload:
+      if m.kind != JObject: continue
+      for field in ["content", "reasoning_content"]:
+        let c = m{field}
+        if c != nil and c.kind == JString and c.getStr.len > perMsg:
+          let s = c.getStr
+          m[field] = %(utf8ByteCut(s, perMsg div 2) &
+            "\n... [clipped for size] ...\n" &
+            utf8ByteCutEnd(s, perMsg div 2))
+    if perMsg <= 256: break
+    perMsg = perMsg div 2
+
+proc applySummary*(messages: JsonNode, summary: string,
+                  keepRecent = SummarizeKeepRecent): int =
+  ## Rewrites `messages` in place to `[system, synthetic_user_summary,
+  ## ...last keepRecent]` and returns the number of messages collapsed (i.e.
+  ## removed from the middle). Returns 0 without touching `messages` if the
+  ## prerequisites are not met: array shape, a system message at index 0,
+  ## and at least `keepRecent + 4` messages to justify the call.
+  if messages == nil or messages.kind != JArray: return 0
+  if messages.len < keepRecent + 4: return 0
+  if messages[0].kind != JObject: return 0
+  if messages[0]{"role"}.getStr != "system": return 0
+  if summary.strip.len == 0: return 0
+  let system = messages[0]
+  var tailStart = messages.len - keepRecent
+  # Never start the retained suffix on a `role:tool` message: that orphans
+  # the result from its assistant `tool_calls` and Kimi/Moonshot 400 with
+  # `tool_call_id is not found`. Walk back to the owning assistant.
+  while tailStart > 1 and messages[tailStart]{"role"}.getStr == "tool":
+    dec tailStart
+  var tail = newSeq[JsonNode]()
+  for i in tailStart ..< messages.len:
+    tail.add messages[i]
+  let collapsed = tailStart - 1  # messages dropped from the middle
+  let synthetic = %*{"role": "user",
+                     "content": SummaryPrefix & summary.strip}
+  let rebuilt = newJArray()
+  rebuilt.add system
+  rebuilt.add synthetic
+  for m in tail: rebuilt.add m
+  # Drop any leftover leading tool results and pair unanswered tool_calls.
+  let paired = repairToolCallPairing(rebuilt)
+  rebuilt.elems.setLen 0
+  for m in paired: rebuilt.add m
+  # Replace `messages` contents in place so callers holding the ref see it.
+  # elems is a public exported field on JArray; this is the canonical
+  # way to clear a JArray while keeping ref identity for callers.
+  messages.elems.setLen 0
+  for m in rebuilt: messages.add m
+  collapsed
+
+proc callSummarizer(p: Profile, messages: JsonNode): string =
+  ## Fires a single meta-call to the model with a dedicated summarizer
+  ## system prompt and no tools. Returns "" on any failure.
+  if p.name == "" or p.url == "" or p.key == "" or p.model == "": return ""
+  # Build a trimmed payload: the summarizer prompt + every non-system
+  # message from the live conversation. Tool_call messages are allowed —
+  # most OpenAI-compatible providers accept them in chat completions even
+  # without a tools parameter as long as the tool/assistant pairing is
+  # intact.
+  var payload = newJArray()
+  payload.add %*{"role": "system", "content": SummarizerSystemPrompt}
+  if messages != nil and messages.kind == JArray:
+    for i in 0 ..< messages.len:
+      let m = messages[i]
+      if i == 0 and m.kind == JObject and m{"role"}.getStr == "system":
+        continue
+      payload.add m
+  # Copy before mutation: `messages` is the live history; payload entries
+  # share its JsonNode refs, so deleting fields below must not hit it.
+  var payload2 = newJArray()
+  for m in payload:
+    if m.kind == JObject:
+      var c = newJObject()
+      for k, v in m.pairs: c[k] = v
+      payload2.add c
+    else:
+      payload2.add m
+  payload = payload2
+  let useResponses = responsesApi(p)
+  # The summarizer payload is one synthetic call over the raw history, so
+  # there is no active tool loop to preserve: tbCurrentTurn strips here
+  # just like tbNone. Same wire-safety as callModel: strict providers
+  # reject unknown fields on replayed assistant messages (fireworks et
+  # al.); Responses (first-party openai) rejects `reasoning_content`
+  # outright.
+  if knownGoodThinkBack(p) != tbAllTurns or useResponses:
+    for m in payload:
+      if m.kind == JObject and m{"role"}.getStr == "assistant" and
+         m.contains("reasoning_content"):
+        m.delete("reasoning_content")
+  # Last, after the field hygiene above: clip oversized text so the
+  # meta-call itself fits the gateway's request envelope. Without this a
+  # byte-large history made BOTH the main call and this rescue call 400,
+  # which is why a stuck session could not even be summarized manually.
+  clipSummarizerPayload(payload)
+  var body: JsonNode
+  var endpoint: string
+  if useResponses:
+    # Responses API (first-party openai): same role/content messages in
+    # `input` (system is accepted), `max_output_tokens` budget, summary
+    # text extracted from output[] below.
+    body = %*{
+      "model": p.model,
+      "input": payload,
+      "max_output_tokens": SummarizeMaxTokens,
+      "stream": false
+    }
+    endpoint = p.url & "/responses"
+  else:
+    body = %*{
+      "model": p.model,
+      "messages": payload,
+      maxTokensField(p): SummarizeMaxTokens,
+      "stream": false
+    }
+    endpoint = p.url & "/chat/completions"
+  var status = 0
+  var respBody = ""
+  try:
+    let client = newHttpClient(timeout = 120_000,
+                               userAgent = ModelUserAgent,
+                               sslContext = bundledSslContext())
+    defer: client.close()
+    client.headers["Authorization"] = "Bearer " & p.key
+    client.headers["Content-Type"] = "application/json"
+    # Same Zen/Go contract as the main transport: the summarizer is a
+    # mid-conversation call, so it rides the conversation's session id
+    # (runTurns published it); without one it mints a per-call id.
+    if providerOf(p) in ["opencode", "opencodego"]:
+      client.headers["x-opencode-session"] =
+        if conversationId != "": conversationId else: oneShotSessionId()
+    let resp = guardedHttp(client.request(endpoint, httpMethod = HttpPost,
+                               body = sanitizeUtf8($body)),
+                           IOError, "fetching " & endpoint)
+    status = resp.code.int
+    respBody = resp.body
+  except CatchableError as e:
+    stderr.writeLine "3code: summarize: " & e.msg
+    return ""
+  if status != 200:
+    stderr.writeLine "3code: summarize: api " & $status
+    return ""
+  let j = try: parseJson(respBody)
+          except CatchableError as e:
+            stderr.writeLine "3code: summarize: " & e.msg
+            return ""
+  if "error" in j:
+    stderr.writeLine "3code: summarize: " & $j["error"]
+    return ""
+  if useResponses:
+    let output = j{"output"}
+    if output == nil or output.kind != JArray: return ""
+    for item in output:
+      if item{"type"}.getStr != "message": continue
+      let parts = item{"content"}
+      if parts == nil or parts.kind != JArray: continue
+      for c in parts:
+        if c{"type"}.getStr == "output_text":
+          result &= c{"text"}.getStr("")
+    return
+  let choices = j{"choices"}
+  if choices == nil or choices.kind != JArray or choices.len == 0: return ""
+  let msg = choices[0]{"message"}
+  if msg == nil or msg.kind != JObject: return ""
+  msg{"content"}.getStr("")
+
+type
+  ContextAction* = enum
+    caNone,         ## within budget, nothing to do
+    caSummarize     ## over threshold and enough history to make it worthwhile
+
+proc decideContextAction*(promptTokens, windowTokens, msgCount: int,
+                         keepRecent = SummarizeKeepRecent,
+                         threshold = SummarizeThresholdFrac): ContextAction =
+  ## Pure policy helper. Given a fresh usage reading and the current message
+  ## count, decide whether to run the lossy summarizer or do nothing.
+  if promptTokens <= 0 or windowTokens <= 0: return caNone
+  if promptTokens.float <= threshold * windowTokens.float: return caNone
+  if msgCount >= keepRecent + 4: caSummarize else: caNone
+
+proc summarizeHistory*(messages: JsonNode, p: Profile,
+                      keepRecent = SummarizeKeepRecent): int =
+  ## Collapse old turns into one synthetic user recap via a meta-model call.
+  ## Returns the number of messages dropped; 0 if we bailed (too few
+  ## messages, missing system prompt, empty profile, or the summarizer
+  ## call failed). On failure `messages` is left untouched.
+  if messages == nil or messages.kind != JArray: return 0
+  if messages.len < keepRecent + 4: return 0
+  if messages[0].kind != JObject or messages[0]{"role"}.getStr != "system":
+    return 0
+  if p.name == "": return 0
+  let summary = callSummarizer(p, messages)
+  if summary.strip.len == 0: return 0
+  applySummary(messages, summary, keepRecent)

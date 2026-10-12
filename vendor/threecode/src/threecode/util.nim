@@ -1,0 +1,1535 @@
+import std/[json, locks, net, os, sequtils, strformat, strutils, tables, unicode, times]
+import streamhttp
+import types
+import threecode/unicodewidth
+when defined(posix):
+  import std/posix except Time
+  import std/termios
+when defined(windows):
+  import std/winlean
+
+proc pidAlive*(pid: int): bool =
+  ## True if a process with `pid` is currently running.
+  ##
+  ## Used to tell a genuinely-held lock (live owner) from a stale one left
+  ## behind by a crashed or killed 3code, and by the stale-bash-dir sweep.
+  ## Pid reuse can theoretically make a recycled pid look alive, but that's
+  ## an inherent limit of pid-based locking; lock callers still refuse
+  ## rather than corrupting a live session.
+  when defined(posix):
+    # kill(pid, 0) delivers no signal; it only probes existence. Same probe
+    # the tool-cancel loop uses (streamexec.nim).
+    if posix.kill(Pid(pid), 0) == 0: return true
+    let e = osLastError()
+    # ESRCH: no such process -> dead. EPERM: exists but not ours -> alive.
+    if e.int32 == EPERM.int32: return true
+    false
+  else:
+    const
+      WinProcessQueryLimitedInfo = 0x1000'i32
+      WinStillActive = 0x00000103'i32
+    let h = winlean.openProcess(WinProcessQueryLimitedInfo, 0'i32, DWORD pid)
+    if h == INVALID_HANDLE_VALUE: return false
+    var code: int32 = 0
+    let ok = winlean.getExitCodeProcess(h, code)
+    discard winlean.closeHandle(h)
+    ok != 0'i32 and code == WinStillActive
+
+proc tempDir*(): string =
+  ## `getTempDir` that honors `$TMPDIR` on Android. Nim's stdlib
+  ## hardcodes `/data/local/tmp` under `defined(android)`, which is the
+  ## shell user's dir; an app UID (Termux) cannot write there, so every
+  ## lock/scratch file failed with ENOENT/EACCES. Termux always sets
+  ## TMPDIR to `$PREFIX/tmp`; fall back to the stdlib answer otherwise.
+  when defined(android):
+    let t = getEnv("TMPDIR")
+    if t.len > 0: t else: getTempDir()
+  else:
+    getTempDir()
+
+# ---------- Color palette ----------
+#
+# Three-tier palette designed to read on both light and dark terminal
+# backgrounds. We don't set a background color (bad form, fights the
+# user's terminal config, leaks seams in scrollback, breaks tmux /
+# transparent terms). Cyan is the brand tone and is mode-independent;
+# grey 244 (dark) is the muted FYI tone.
+#
+# The white-family colors (`BrightWhiteFg`, `OffWhiteFg`, `GreyFg`) are
+# mode-dependent: `applyPalette(colorMode)` resolves them at startup.
+# Dark defaults reproduce the prior behaviour; light inverts the family
+# (white -> black, off-white -> dark grey, dim white -> lighter dark
+# grey). Colourful colors (cyan/green/red/magenta) stay fixed in both
+# modes. See `applyPalette` / `applyColorOverrides` / `detectColorMode`.
+
+const
+  # Windows Terminal maps ANSI cyan (\e[36m) to a light blue, not cyan.
+  # Use bright cyan there so the brand tone renders as actual cyan.
+  # Campbell's bright cyan slot is the only one that is true cyan.
+  CyanFg* = (when defined(windows): "\x1b[96m" else: "\x1b[36m")
+  # Magenta is the private-mode bar tone and the warning tier (retry
+  # notices, transport errors); bright on Windows for the same reason cyan
+  # is (Campbell's regular magenta reads too dark).
+  MagentaFg* = (when defined(windows): "\x1b[95m" else: "\x1b[35m")
+  BoldOn* = "\x1b[1m"
+  BlueFg* = "\x1b[34m"
+  Reset* = "\x1b[0m"
+
+var
+  BrightWhiteFg* = "\x1b[97m"      # assistant text + `:command` help tokens
+  OffWhiteFg* = "\x1b[38;5;252m"   # high-tier near-white (tool banners)
+  GreyFg* = "\x1b[38;5;244m"       # subtle FYI tier (tool output, markers)
+
+type
+  ColorSpec* = tuple
+    brightWhite, offWhite, dimWhite, tokenBar, privateBar: string
+
+var
+  DarkPalette*: ColorSpec = (
+    brightWhite: "\x1b[97m",        # bright white
+    offWhite:    "\x1b[38;5;252m",  # near-white
+    dimWhite:    "\x1b[38;5;244m",  # grey 244
+    tokenBar:    CyanFg,             # the brand tone on the live bar
+    privateBar:  MagentaFg,          # private mode repaints the bar in this
+  )
+  LightPalette*: ColorSpec = (
+    # Invert: white -> black, off-white -> dark grey,
+    # dim white -> a lighter dark grey. Colourful colors (cyan/green/red/
+    # magenta) are unchanged, handled at their call sites.
+    brightWhite: "\x1b[30m",        # black
+    offWhite:    "\x1b[38;5;238m",  # dark grey
+    dimWhite:    "\x1b[38;5;250m",  # lighter dark grey
+    tokenBar:    CyanFg,
+    privateBar:  MagentaFg,
+  )
+
+proc paletteFor*(mode: ColorMode): ColorSpec =
+  if mode == cmLight: LightPalette else: DarkPalette
+
+var
+  TokenBarFg* = CyanFg
+  PrivateBarFg* = MagentaFg
+
+proc applyPalette*(mode: ColorMode) =
+  ## Set the white-family `var`s for `mode`. Call once at startup after
+  ## detection/config, before any colored output.
+  colorMode = mode
+  let p = paletteFor(mode)
+  BrightWhiteFg = p.brightWhite
+  OffWhiteFg = p.offWhite
+  GreyFg = p.dimWhite
+  TokenBarFg = p.tokenBar
+  PrivateBarFg = p.privateBar
+
+proc tokenBarFg*(): string =
+  ## The live token-bar color: the normal bar tone, or the private one
+  ## while private mode is on, so the mode is visible on every repaint
+  ## of the bar (and only there: scrollback receipts stay cyan, which
+  ## conveniently marks which turns ran private).
+  if privateMode: PrivateBarFg else: TokenBarFg
+
+proc resetPalettes*() =
+  ## Restore `DarkPalette` / `LightPalette` to their built-in defaults
+  ## and re-resolve the active mode. Used by tests (which mutate the
+  # palettes via `applyColorOverrides`) to leave global state clean.
+  DarkPalette  = (brightWhite: "\x1b[97m", offWhite: "\x1b[38;5;252m",
+                  dimWhite: "\x1b[38;5;244m", tokenBar: CyanFg,
+                  privateBar: MagentaFg)
+  LightPalette = (brightWhite: "\x1b[30m", offWhite: "\x1b[38;5;238m",
+                  dimWhite: "\x1b[38;5;250m", tokenBar: CyanFg,
+                  privateBar: MagentaFg)
+  applyPalette(colorMode)
+
+proc applyColorOverrides*(dark, light: Table[string, string]) =
+  ## Apply user `[colors]` config overrides on top of the mode palettes.
+  ## `dark` keys override BOTH modes (a plain config key has no suffix);
+  ## `light` keys override light mode only and win for light mode. Keys
+  ## are `bright-white`, `off-white`, `dim-white`, `token-bar`,
+  ## `private-bar`; values are ANSI escape sequences. Unknown keys are
+  ## ignored. Re-resolves the active mode last.
+  proc setSpec(t: var ColorSpec; key, val: string) =
+    case key
+    of "bright-white": t.brightWhite = val
+    of "off-white":    t.offWhite = val
+    of "dim-white":    t.dimWhite = val
+    of "token-bar":    t.tokenBar = val
+    of "private-bar":  t.privateBar = val
+    else: discard
+  var dp = DarkPalette
+  var lp = LightPalette
+  for k, v in dark:
+    dp.setSpec(k, v)
+    lp.setSpec(k, v)
+  for k, v in light:
+    lp.setSpec(k, v)
+  DarkPalette = dp
+  LightPalette = lp
+  applyPalette(colorMode)
+
+func parseHex16*(s: string): int =
+  ## Parse a 1-to-4 hex-digit colour channel value (OSC 11 emits 1, 2, or
+  ## 4 hex digits per channel) scaled to 0..255.
+  if s.len == 0: return 0
+  try:
+    result = parseHexInt(s)
+  except ValueError:
+    return 0
+  case s.len
+  of 1: result = result * 255 div 15      # 0..15
+  of 2: result = result                  # 0..255
+  of 3: result = result * 255 div 4095    # 0..4095
+  of 4: result = result * 255 div 65535   # 0..65535
+  else: result = (result * 255) div ((1 shl (4 * s.len)) - 1)
+
+func parseOscBg*(reply: string): (int, int, int) =
+  ## Extract the (r,g,b) background from an OSC 11 reply, which arrives as
+  ## `ESC ] 11 ; rgb:RRRR/GGGG/BBBB ST` (or the legacy `rgb:R/G/B` / a bare
+  ## `#rrggbb`). Returns (-1,-1,-1) when no colour can be parsed, so the
+  ## caller treats it as undetectable (stays dark). The trailing terminator
+  ## (BEL or ESC-backslash ST) and any surrounding OSC framing are stripped
+  ## before the colour spec is read.
+  let raw = reply.strip()
+  if raw.len == 0: return (-1, -1, -1)
+  var s = raw
+  # Drop a trailing BEL (0x07) or ST (ESC \).
+  if s.len > 0 and s[^1] == '\x07': s.setLen(s.len - 1)
+  elif s.len >= 2 and s[^2] == '\x1b' and s[^1] == '\\': s.setLen(s.len - 2)
+  let i = s.find("rgb:")
+  if i >= 0:
+    # Keep only hex digits and the channel separators so a stray terminator
+    # or OSC framing byte never leaks into a channel value.
+    var rest = ""
+    for c in s[i + 4 .. ^1]:
+      if c in {'0'..'9', 'a'..'f', 'A'..'F', '/'}: rest.add c
+    let parts = rest.split('/')
+    if parts.len >= 3:
+      return (parseHex16(parts[0]), parseHex16(parts[1]), parseHex16(parts[2]))
+  let j = s.find('#')
+  if j >= 0 and s.len - (j + 1) >= 6:
+    let hex = s[j + 1 .. j + 6]
+    return (parseHex16(hex[0 .. 1]), parseHex16(hex[2 .. 3]),
+            parseHex16(hex[4 .. 5]))
+  (-1, -1, -1)
+
+func luminance*(r, g, b: int): float =
+  ## Perceptual luminance (ITU-R BT.601 weights). 0..255 -> 0..1.
+  (0.299 * r.float + 0.587 * g.float + 0.114 * b.float) / 255.0
+
+when defined(windows):
+  proc detectColorModeWindows(): ColorMode
+
+proc detectColorMode*(force: ColorMode = cmAuto): ColorMode =
+  ## Resolve the active colour mode. A forced `cmDark`/`cmLight` wins
+  ## directly. `cmAuto` queries the terminal for its background colour via
+  ## OSC 11 (`ESC ] 11 ; ? BEL`), parses the `rgb:...` reply, and picks
+  ## light when the background luminance is high. On any failure (not a
+  ## tty, the terminal doesn't answer within the poll deadline, an
+  ## unparseable reply) it defaults to dark. On Windows the query goes
+  ## through the console API (`detectColorModeWindows`); Windows Terminal
+  ## (>=1.22) answers it.
+  ##
+  ## Under the tty test harness the PTY doesn't answer OSC queries, so the
+  ## query bytes would pollute captured frames; detection skips the query
+  ## there (signalled by `THREECODE_TEST_FRAME_FD`) and stays dark.
+  if force == cmDark: return cmDark
+  if force == cmLight: return cmLight
+  if getEnv("THREECODE_TEST_FRAME_FD").len > 0: return cmDark
+  when defined(posix):
+    const FdStdin {.used.} = 0.cint
+    if isatty(FdStdin) == 0: return cmDark
+    var orig: Termios
+    if tcGetAttr(FdStdin, addr orig) != 0: return cmDark
+    var rawMode = orig
+    rawMode.c_lflag = rawMode.c_lflag and not Cflag(ICANON or ECHO)
+    rawMode.c_cc[VMIN] = 0.char
+    rawMode.c_cc[VTIME] = 0.char
+    if tcSetAttr(FdStdin, TCSANOW, addr rawMode) != 0: return cmDark
+    # Drain any buffered input before the query so it isn't mistaken for
+    # the reply; restore termios no matter how we exit.
+    var drain: char
+    while posix.read(FdStdin, addr drain, 1) > 0: discard
+    try:
+      stdout.write "\x1b]11;?\x07"
+      stdout.flushFile()
+      var buf = ""
+      buf.setLen(256)
+      var total = 0
+      let deadlineMs = 150.cint
+      var elapsedMs = 0
+      const StepMs = 25.cint
+      while elapsedMs < deadlineMs:
+        var pfd: TPollfd
+        pfd.fd = FdStdin
+        pfd.events = POLLIN
+        let r = poll(addr pfd, 1.Tnfds, StepMs)
+        elapsedMs += StepMs.int
+        if r > 0 and (pfd.revents and POLLIN) != 0:
+          let n = posix.read(FdStdin, addr buf[total], buf.len - total)
+          if n > 0:
+            total += n
+            # The reply is terminated by BEL (0x07) or ST (ESC \); stop
+            # once a terminator lands so we don't block for the full window.
+            if '\x07' in buf.toOpenArray(0, total - 1) or
+               (total >= 2 and buf[total - 2] == '\x1b' and buf[total - 1] == '\\'):
+              break
+          else:
+            break
+      let reply = buf[0 ..< total]
+      let (r, g, b) = parseOscBg(reply)
+      if r >= 0:
+        if luminance(r, g, b) > 0.5: return cmLight
+        return cmDark
+      return cmDark
+    finally:
+      discard tcSetAttr(FdStdin, TCSANOW, addr orig)
+  elif defined(windows):
+    detectColorModeWindows()
+  else:
+    cmDark
+
+when defined(windows):
+  proc c_isatty(fd: cint): cint {.header: "<io.h>", importc: "_isatty".}
+  proc getConsoleMode(hConsole: Handle, lpMode: ptr int32): int32 {.stdcall,
+      dynlib: "kernel32", importc: "GetConsoleMode".}
+  proc setConsoleMode(hConsole: Handle, dwMode: int32): int32 {.stdcall,
+      dynlib: "kernel32", importc: "SetConsoleMode".}
+  proc getNumberOfConsoleInputEvents(hConsoleInput: Handle,
+      lpcNumberOfEvents: ptr int32): int32 {.stdcall,
+      dynlib: "kernel32", importc: "GetNumberOfConsoleInputEvents".}
+  proc readConsoleInputA(hConsoleInput: Handle; lpBuffer: pointer;
+      nLength: int32; lpNumberOfEventsRead: ptr int32): int32 {.stdcall,
+      dynlib: "kernel32", importc: "ReadConsoleInputA".}
+
+  proc detectColorModeWindows(): ColorMode =
+    ## Query the terminal background via OSC 11 on Windows. Windows
+    ## Terminal answers the query; legacy conhost does not. Returns
+    ## `cmLight` when the background luminance is high, else `cmDark`.
+    ## On any failure (not a console, no reply within the deadline, an
+    ## unparseable reply) it defaults to dark.
+    const
+      STD_INPUT_HANDLE = -10'i32
+      STD_OUTPUT_HANDLE = -11'i32
+      ENABLE_LINE_INPUT = 0x0002'i32
+      ENABLE_ECHO_INPUT = 0x0004'i32
+    # Only query when stdin is a real console; under a redirected stdin
+    # (test harness, ssh) there is no terminal to answer and the query
+    # bytes would leak to stdout.
+    if c_isatty(0) == 0: return cmDark
+    let hIn = getStdHandle(STD_INPUT_HANDLE)
+    let hOut = getStdHandle(STD_OUTPUT_HANDLE)
+    if hIn == 0 or hOut == 0: return cmDark
+    # Write the OSC 11 query (`ESC ] 11 ; ? BEL`).
+    let query = "\x1b]11;?\x07"
+    var written: int32 = 0
+    if writeFile(hOut, unsafeAddr query[0], query.len.int32, addr written, nil) == 0:
+      return cmDark
+    # Read the reply with a deadline. Clear line/echo input for the
+    # duration of the read so queued keys are delivered unedited; restore
+    # afterwards.
+    var oldMode: int32 = 0
+    let haveMode = getConsoleMode(hIn, addr oldMode) != 0
+    if haveMode:
+      discard setConsoleMode(hIn, oldMode and not (ENABLE_LINE_INPUT or ENABLE_ECHO_INPUT))
+    var buf: array[256, char]
+    var total = 0
+    var replyDone = false
+    let deadlineMs = 150'i32
+    var elapsedMs = 0'i32
+    const StepMs = 25'i32
+    # Consume input RECORDS with ReadConsoleInputA, never ReadFile. A
+    # console input queue holds non-character events too (focus, mouse,
+    # window-buffer-size, key-ups without a char); ReadFile waits for a
+    # KEY_EVENT that carries a character, so a single queued non-char
+    # event makes the "bounded" read block until the user happens to press
+    # a key - the startup-hangs-until-Return bug. ReadConsoleInputA removes
+    # every event type without blocking; key-down records with a char feed
+    # the reply buffer, everything else is dropped. Non-ASCII chars can't
+    # be part of an `rgb:` reply and are skipped.
+    while elapsedMs < deadlineMs:
+      var pending: int32 = 0
+      if getNumberOfConsoleInputEvents(hIn, addr pending) != 0 and
+          pending > 0:
+        var recs: array[16, array[32, uint8]]  # 16 INPUT_RECORDs, padded
+        let want = min(pending, 16'i32)
+        var got: int32 = 0
+        if readConsoleInputA(hIn, addr recs[0][0], want, addr got) != 0:
+          for r in 0 ..< got.int:
+            let rec = addr recs[r]
+            # INPUT_RECORD: WORD EventType; union at offset 4.
+            # KEY_EVENT_RECORD: bKeyDown@4, UnicodeChar@14.
+            let evType = uint16(rec[0]) or (uint16(rec[1]) shl 8)
+            if evType != 1: continue  # KEY_EVENT only
+            let keyDown = int32(rec[4]) or (int32(rec[5]) shl 8) or
+                (int32(rec[6]) shl 16) or (int32(rec[7]) shl 24)
+            let ch = uint16(rec[14]) or (uint16(rec[15]) shl 8)
+            if keyDown == 0 or ch == 0 or ch > 0x7F: continue
+            buf[total] = ch.char
+            inc total
+            if total >= buf.len: break
+            # The reply is terminated by BEL (0x07) or ST (ESC \). Stop
+            # once a terminator lands so we don't wait out the window.
+            if '\x07' in buf.toOpenArray(0, total - 1) or
+               (total >= 2 and buf[total - 2] == '\x1b' and buf[total - 1] == '\\'):
+              replyDone = true
+              break
+        if replyDone or total >= buf.len: break
+      else:
+        sleep(StepMs.int)
+      elapsedMs += StepMs
+    if haveMode:
+      # Restore only the bits this proc cleared. The full-snapshot
+      # restore used to race the input thread's console setup: if that
+      # thread added ENABLE_VIRTUAL_TERMINAL_INPUT between our save and
+      # restore, restoring the stale snapshot silently dropped it and
+      # every key for the rest of the session arrived as legacy `_getch`
+      # pair codes (no modifiers, no VT sequences). Recompute from the
+      # LIVE mode so concurrently-added bits survive.
+      var live: int32 = 0
+      if getConsoleMode(hIn, addr live) != 0:
+        var want = live and not (ENABLE_LINE_INPUT or ENABLE_ECHO_INPUT)
+        if (oldMode and ENABLE_LINE_INPUT) != 0:
+          want = want or ENABLE_LINE_INPUT
+        if (oldMode and ENABLE_ECHO_INPUT) != 0:
+          want = want or ENABLE_ECHO_INPUT
+        discard setConsoleMode(hIn, want)
+      else:
+        discard setConsoleMode(hIn, oldMode)
+    if total == 0: return cmDark
+    var reply = newString(total)
+    copyMem(reply[0].addr, buf[0].addr, total)
+    let (r, g, b) = parseOscBg(reply)
+    if r >= 0 and luminance(r, g, b) > 0.5: return cmLight
+    cmDark
+
+proc splitColorOverrides*(flat: Table[string, string]):
+    tuple[both, light: Table[string, string]] =
+  ## Split a flat `[colors]` map into `(both, light)`. A key ending in
+  ## `-light` contributes to light mode only (suffix stripped); any other
+  ## key is a plain override that applies to both modes. This is the
+  ## cascade: plain keys set both, `-light` keys set light and win there.
+  result[0] = initTable[string, string]()
+  result[1] = initTable[string, string]()
+  for k, v in flat:
+    if k.endsWith("-light"):
+      result[1][k[0 ..< k.len - 6]] = v
+    else:
+      result[0][k] = v
+
+when defined(posix):
+  var debugLogFd: cint = -1  ## raw fd: an int global keeps debugOut GC-safe
+
+  proc debugLogLine(line: string) {.gcsafe.} =
+    if debugLogFd == -2: return  # known-disabled sentinel
+    if debugLogFd == -1:
+      let path = getEnv("THREECODE_DEBUG_LOG")
+      if path.len == 0:
+        debugLogFd = -2
+        return
+      debugLogFd = posix.open(path, O_WRONLY or O_APPEND or O_CREAT, 0o600)
+      if debugLogFd < 0:
+        debugLogFd = -2
+        return
+    var buf = line & "\n"
+    discard posix.write(debugLogFd, buf[0].addr, buf.len)
+else:
+  proc debugLogLine(line: string) {.gcsafe, inline.} = discard
+
+proc debugToStderr(line: string): bool {.gcsafe, inline.} =
+  ## False when the file sink is active: then the trace stays out of the
+  ## pty so tty-test grid parsing is unaffected.
+  when defined(posix): debugLogFd < 0 else: true
+
+proc debugOut*(msg: string) =
+  if not debugEnabled: return
+  let t = epochTime().formatFloat(ffDecimal, 3)
+  debugLogLine("[dbg " & t & "] " & msg)
+  if debugToStderr(""):
+    stderr.writeLine BlueFg & "[dbg " & t & "] " & msg & Reset
+
+proc debugOut*(msg, tag: string) =
+  if not debugEnabled: return
+  let t = epochTime().formatFloat(ffDecimal, 3)
+  debugLogLine("[dbg " & t & "] " & tag & " " & msg)
+  if debugToStderr(""):
+    stderr.writeLine BlueFg & "[dbg " & t & "] " & BoldOn & tag &
+      Reset & BlueFg & " " & msg & Reset
+
+proc bundledCaFile*(): string =
+  ## Path to the `cacert.pem` we ship alongside the binary on macOS /
+  ## Windows (see `release.yml`). Returns "" when not present (Linux
+  ## release tarball, dev builds) — `newContext` will scan default
+  ## system cert locations in that case, which works on every Linux
+  ## distro.
+  when defined(macosx) or defined(windows):
+    let p = parentDir(getAppFilename()) / "cacert.pem"
+    if fileExists(p): p else: ""
+  else:
+    ""
+
+when defined(ssl):
+  import std/openssl except raiseException, newContext
+  var
+    sslCtxLock: Lock
+    sslCtxHandle {.guard: sslCtxLock.}: openssl.SslCtx
+  sslCtxLock.initLock()
+
+proc bundledSslContext*(): SslContext {.gcsafe.} =
+  ## Drop-in `SslContext` for `newHttpClient(sslContext = ...)` and
+  ## anywhere else a TLS context is consumed. macOS/Windows ship
+  ## OpenSSL whose `OPENSSLDIR` is baked to a build-runner path that
+  ## doesn't exist on user systems, so `verifyMode = CVerifyPeer`
+  ## can't scan the default location — we feed `cacert.pem` from
+  ## next to the binary. Linux passes `caFile = ""` and falls
+  ## through to the system trust store. The `streamhttp` SSE path
+  ## takes `bundledCaFile()` directly (it builds its own context
+  ## internally), so the bundle wiring lives in one place either way.
+  ##
+  ## Cached for the process lifetime: `SslContext` has no `=destroy`,
+  ## so every fresh `newContext` leaks its `SSL_CTX` plus the full
+  ## parsed CA trust store (~0.8 MB) in C heap. The summarizer calls
+  ## this per compaction, so an uncached context was a per-few-turns
+  ## RSS leak (issue #35). The raw `SslCtx` handle is shared (OpenSSL
+  ## contexts are thread-safe once built); each caller gets its own
+  ## thin `SslContext` ref so no Nim refcount is ever shared across
+  ## threads. The handle intentionally outlives its refs: it is freed
+  ## only by an explicit `destroyContext` nobody wants here. A failed
+  ## construction isn't cached, so retried calls still raise.
+  when defined(ssl):
+    withLock(sslCtxLock):
+      if sslCtxHandle == nil:
+        sslCtxHandle = newContext(verifyMode = CVerifyPeer,
+                                  caFile = bundledCaFile()).context
+      result = new SslContext
+      result.context = sslCtxHandle
+  else:
+    result = newContext(verifyMode = CVerifyPeer, caFile = bundledCaFile())
+
+proc httpStatusDetail*(msg: string): string =
+  ## Pull the offending status out of the RangeDefect httpclient raises
+  ## when a server sends a non-standard status (LinkedIn's anti-bot 999,
+  ## Cloudflare-origin 6xx): `value out of range: 999 notin 0 .. 599`.
+  ## HttpCode is `range[0..599]`, and `parseResponse` converts the status
+  ## line inside `get`/`post` itself, so the defect fires before any
+  ## caller-side status check can run.
+  let i = msg.find(": ")
+  let j = msg.find(" notin ")
+  if i >= 0 and j > i:
+    "HTTP " & msg[i+2 ..< j]
+  else:
+    "HTTP status out of range (" & msg & ")"
+
+template guardedHttp*(req: untyped; E: typedesc; what: string): untyped =
+  ## Run an httpclient request, translating the out-of-range-status
+  ## RangeDefect into `E` (the module's native error type) so callers'
+  ## `except CatchableError` arms see a normal failure, not a crash.
+  try:
+    req
+  except RangeDefect as e:
+    raise newException(E, httpStatusDetail(e.msg) & " " & what)
+
+proc connectErrorDetail*(e: ref CatchableError): string =
+  ## The message a connect raises. `nativesockets.getAddrInfo` surfaces DNS
+  ## failures as `raiseOSError(osLastError(), gai_strerror(...))`, which packs
+  ## a useless OS strerror (`Resource temporarily unavailable`) in front of the
+  ## real cause, appended as `Additional info: "..."`. Keep only the
+  ## `Additional info:` part (the actual diagnosis) and fall back to the whole
+  ## message when it isn't there.
+  let msg = e.msg.strip
+  const Marker = "Additional info: "
+  let idx = msg.find(Marker)
+  if idx >= 0:
+    result = msg[idx + Marker.len .. ^1].strip
+    if result.startsWith('"') and result.endsWith('"') and result.len >= 2:
+      result = result[1 .. ^2]
+  else:
+    result = msg
+
+proc plainHttpHost*(host: string): bool =
+  ## True when `host` can only address this machine or the LAN: loopback,
+  ## link-local, RFC1918 private ranges, IPv6 ULA/link-local, and
+  ## mDNS-style names. Plain HTTP is allowed only for these hosts
+  ## (local inference servers: Ollama and friends on
+  ## `http://192.168.64.1:8181/v1`); everything else keeps the
+  ## https-only rule so keys and prompts never cross a public network in
+  ## the clear. Resolvable names like `nas.lan` stay https-only: a name
+  ## that must resolve can be pointed anywhere.
+  let h = host.toLowerAscii
+  if h.len == 0: return false
+  if h == "localhost" or h == "::1" or h == "[::1]" or
+     h.endsWith(".localhost") or h.endsWith(".local") or
+     h.endsWith(".localdomain"):
+    return true
+  if h.startsWith('[') and h.endsWith(']'):
+    return plainHttpHost(h[1 ..< h.len - 1])
+  if h.contains(':'):
+    # IPv6. Drop a zone id (fe80::1%en0), then inspect the first group.
+    let bare = if h.contains('%'): h[0 ..< h.find('%')] else: h
+    let head = bare[0 ..< bare.find(':')]
+    if head.len == 0: return false  # leading-:: elision beyond ::1
+    let g = try: parseHexInt(head) except ValueError: return false
+    return (g and 0xffc0) == 0xfe80 or  # fe80::/10 link-local
+           (g and 0xfe00) == 0xfc00     # fc00::/7 ULA
+  # Dotted-quad IPv4: parse octets, then check loopback/private ranges.
+  let parts = h.split('.')
+  if parts.len != 4: return false
+  var o: array[4, int]
+  for i, p in parts:
+    if p.len == 0 or p.len > 3 or not p.allCharsInSet(Digits): return false
+    o[i] = parseInt(p)
+    if o[i] > 255: return false
+  o[0] == 127 or o[0] == 10 or
+    (o[0] == 172 and o[1] >= 16 and o[1] <= 31) or
+    (o[0] == 192 and o[1] == 168) or
+    (o[0] == 169 and o[1] == 254)
+
+proc endpointLabel*(host: string; port: Port; plainHttp: bool): string =
+  ## Host as shown in connect-failure messages: the bare host on the
+  ## scheme's default port, `host:port` when the URL named a specific one
+  ## (`localhost:11434 is not responding` instead of just `localhost`).
+  let defPort = if plainHttp: 80'u16 else: 443'u16
+  if port.uint16 == defPort: host else: host & ":" & $port.uint16
+
+proc connectFailMsg*(endpoint: string; plainHttp: bool;
+                     e: ref CatchableError): string =
+  ## User-facing diagnosis of a failed connect. `StreamConnectError` means
+  ## DNS or the TCP connect failed - the host was never reached - so the
+  ## message says the endpoint is not responding instead of blaming TLS;
+  ## a dead local server on plain http would otherwise surface through the
+  ## https wording as a confusing "TLS connect failed". Anything raised
+  ## after the TCP connect is genuinely TLS and keeps the TLS label.
+  if e of StreamConnectError:
+    endpoint & " is not responding (" & connectErrorDetail(e) & ")"
+  elif e of HandshakeTimeoutError:
+    e.msg  # already reads "TLS handshake timed out"
+  else:
+    (if plainHttp: "connect failed: " else: "TLS handshake failed: ") &
+      connectErrorDetail(e)
+
+proc userConfigRoot*(): string =
+  ## XDG config root for 3code: `~/.config/3code/` on Linux,
+  ## `~/Library/Application Support/3code/` on macOS, `%APPDATA%/3code/`
+  ## on Windows. Holds user-edited config and skill overrides only.
+  ##
+  ## `XDG_CONFIG_HOME` overrides the platform default on every platform
+  ## (on Linux `getConfigDir` already honors it; on Windows/macOS it is
+  ## read explicitly). This makes the config root redirectable for tests;
+  ## the platform default is unchanged when the variable is unset.
+  let xdg = getEnv("XDG_CONFIG_HOME")
+  let base = if xdg.len > 0: xdg else: getConfigDir()
+  base / "3code"
+
+proc userDataRoot*(): string =
+  ## XDG data root for 3code: `~/.local/share/3code/` on Linux,
+  ## `~/.config/3code/` on macOS, `%APPDATA%/3code/` on Windows (collapses
+  ## with config-root there — fine, the split is a Linux convention). Holds
+  ## app-managed state: sessions, history, extracted built-in skills.
+  ##
+  ## `XDG_DATA_HOME` overrides the platform default on all POSIX platforms.
+  ## Honoring it on macOS (not just Linux) matches the spec and makes the
+  ## data root redirectable for tests; the platform default is unchanged
+  ## when the variable is unset.
+  let xdg = getEnv("XDG_DATA_HOME")
+  when defined(windows):
+    # Windows default is %APPDATA% (collapses with config-root there —
+    # fine, the split is a Linux convention). XDG_DATA_HOME overrides it
+    # for the same test-redirectability reason as the POSIX branches.
+    let base = if xdg.len > 0: xdg else: getConfigDir()
+  elif defined(macosx):
+    let base = if xdg.len > 0: xdg else: getConfigDir()
+  else:
+    let base = if xdg.len > 0: xdg else: getHomeDir() / ".local" / "share"
+  base / "3code"
+
+proc resolvePath*(path: string): string =
+  if path.len == 0: return ""
+  var p = path
+  if p.startsWith("~"): p = expandTilde(p)
+  try: absolutePath(p) except CatchableError: p
+
+proc safeCwd*(): string =
+  ## The current working directory, or ``/`` when the process's cwd has
+  ## been removed or renamed out from under it. Nim's ``getCurrentDir``
+  ## raises ``OSError`` in that case (Linux ``getcwd`` returns ``ENOENT``),
+  ## which would crash the REPL. The filesystem no longer has a name for
+  ## the deleted dir, so callers that only need an absolute path label
+  ## for context, logging, or session identity get ``/`` — every dir-walk,
+  ## ``ls``, ``git`` and ``fileExists`` against it then simply finds
+  ## nothing and degrades gracefully.
+  try: getCurrentDir()
+  except OSError: "/"
+
+func utf8ByteCut*(s: string, n: int): string =
+  ## Slice `s` to at most `n` bytes, backing up to a UTF-8 codepoint
+  ## boundary so the result is valid UTF-8. Strings in JSON request bodies
+  ## must be valid UTF-8 — Pydantic-backed providers (deepinfra) reject
+  ## the body with "There was an error parsing the body" when a naive byte
+  ## slice splits a multi-byte rune (e.g. `→` chopped after two bytes).
+  if s.len <= n: return s
+  var cut = n
+  while cut > 0 and (s[cut].uint8 and 0xC0'u8) == 0x80'u8:
+    dec cut
+  s[0 ..< cut]
+
+func utf8ByteCutEnd*(s: string, n: int): string =
+  ## Take the last up-to-`n` bytes of `s`, advancing past any leading UTF-8
+  ## continuation byte so the result is valid UTF-8. Mirror of `utf8ByteCut`
+  ## for tail slices (used by `clipMiddle`).
+  if s.len <= n: return s
+  var start = s.len - n
+  while start < s.len and (s[start].uint8 and 0xC0'u8) == 0x80'u8:
+    inc start
+  s[start .. ^1]
+
+func sanitizeUtf8*(s: string): string =
+  ## Return a copy of `s` that is valid UTF-8: every invalid byte or
+  ## malformed sequence is replaced with a single U+FFFD, and every valid
+  ## codepoint (including multibyte) passes through untouched.
+  ##
+  ## Strings that cross a system boundary into a JSON request body must be
+  ## valid UTF-8. Tool output and resumed-session text can carry bytes that
+  ## aren't — e.g. a command that printed a truncated multi-byte rune left a
+  ## lone continuation byte in its result, which `std/json` emits verbatim
+  ## into the serialized body. The provider then rejects the whole body with
+  ## a 400, and since the offending message recurs in every subsequent
+  ## request (tool messages can't be dropped) the session is bricked until
+  ## the `.3log` is hand-edited. This is the boundary guard that stops that.
+  result = newStringOfCap(s.len)
+  var i = 0
+  while i < s.len:
+    let b = s[i].uint8
+    if b < 0x80:
+      result.add s[i]; inc i; continue
+    let seqLen =
+      if b shr 5 == 0b110: 2
+      elif b shr 4 == 0b1110: 3
+      elif b shr 3 == 0b11110: 4
+      else: 0 # lone continuation byte, or a lead byte > 0xF4
+    if seqLen == 0:
+      result.add "\uFFFD"; inc i; continue
+    var ok = true
+    if i + seqLen > s.len: ok = false
+    else:
+      case seqLen
+      of 2:
+        if (s[i + 1].uint8 and 0xC0'u8) != 0x80'u8: ok = false
+        elif b <= 0xC1'u8: ok = false # overlong (encodes < 0x80)
+      of 3:
+        if (s[i + 1].uint8 and 0xC0'u8) != 0x80'u8 or
+           (s[i + 2].uint8 and 0xC0'u8) != 0x80'u8: ok = false
+        elif b == 0xE0'u8 and (s[i + 1].uint8 and 0xE0'u8) == 0x80'u8:
+          ok = false # overlong
+        elif b == 0xED'u8 and (s[i + 1].uint8 and 0xE0'u8) == 0xA0'u8:
+          ok = false # surrogate (U+D800..U+DFFF)
+      of 4:
+        if (s[i + 1].uint8 and 0xC0'u8) != 0x80'u8 or
+           (s[i + 2].uint8 and 0xC0'u8) != 0x80'u8 or
+           (s[i + 3].uint8 and 0xC0'u8) != 0x80'u8: ok = false
+        elif b == 0xF0'u8 and (s[i + 1].uint8 and 0xF0'u8) == 0x80'u8:
+          ok = false # overlong
+        elif b == 0xF4'u8 and s[i + 1].uint8 > 0x8F'u8:
+          ok = false # > U+10FFFF
+        elif b > 0xF4'u8: ok = false
+      else: discard
+    if ok:
+      for k in 0 ..< seqLen: result.add s[i + k]
+      inc i, seqLen
+    else:
+      # Drop only the bad lead byte; any orphaned continuation bytes that
+      # follow get re-checked on the next iteration and each become its own
+      # U+FFFD, matching WHATWG/W3C decoder best practice (substituting one
+      # replacement char per maximal subpart of an ill-formed sequence).
+      result.add "\uFFFD"; inc i
+
+func clipMiddle*(s: string, head, tail: int): string =
+  if s.len <= head + tail: s
+  else: utf8ByteCut(s, head) & "\n... [truncated] ...\n" & utf8ByteCutEnd(s, tail)
+
+func humanBytes*(n: int): string =
+  if n < 1024: &"{n}B"
+  elif n < 1024 * 1024: &"{n.float/1024:.1f}KB"
+  else: &"{n.float/1024/1024:.2f}MB"
+
+func humanTokens*(n: int): string =
+  if n < 1000: $n
+  else: &"{n.float/1000:.1f}k"
+
+func clockDuration*(secs: int): string =
+  ## Turn-timer format: 4, 2:08, 1:12:21 (leading zero fields dropped).
+  let s = max(0, secs)
+  let h = s div 3600
+  let m = (s mod 3600) div 60
+  let r = s mod 60
+  if h > 0: &"{h}:{m:02}:{r:02}"
+  elif m > 0: &"{m}:{r:02}"
+  else: $r
+
+func humanDuration*(secs: int): string =
+  ## Second-precise but human-friendly: 0:04, 2:08, 34:07, 1h12m21s.
+  let s = max(0, secs)
+  if s < 3600:
+    let m = s div 60
+    let r = s mod 60
+    &"{m}:{r:02}"
+  else:
+    let h = s div 3600
+    let m = (s mod 3600) div 60
+    let r = s mod 60
+    &"{h}h{m:02}m{r:02}s"
+
+func detectMdHeader*(line: string): (bool, string) =
+  ## A line of `###...` followed by a space and at least one non-space
+  ## char. Returns (true, body) on match, (false, "") otherwise.
+  var i = 0
+  while i < line.len and line[i] == '#': inc i
+  if i == 0 or i > 6: return (false, "")
+  if i >= line.len or line[i] != ' ': return (false, "")
+  let body = line[i + 1 .. ^1].strip
+  if body.len == 0: return (false, "")
+  (true, body)
+
+func isMdFenceLine*(line: string): bool =
+  ## ```` ``` ```` (3+ backticks, optional language label after).
+  let s = line.strip
+  s.len >= 3 and s.startsWith("```")
+
+const MarkBoundary = {' ', '\t', '\n', '.', ',', '!', '?', ';', ':',
+                      '(', ')', '[', ']', '{', '}', '"', '\'', '/', '<', '>'}
+
+proc isAtBoundary(line: string, i: int): bool =
+  ## True if `line[i]` is whitespace/punctuation, OR `i` is out of
+  ## bounds (start/end of line). Used to guard italic markers so
+  ## `snake_case` and `5*5` don't accidentally italicize.
+  i < 0 or i >= line.len or line[i] in MarkBoundary
+
+func applyInlineMd*(line: string): string =
+  ## Strict in-line replacements for `***bold-italic***`, `**bold**`,
+  ## `*italic*` / `_italic_`, backtick-code, and `[text](url)` links.
+  ## Links become OSC 8 hyperlinks: the terminal makes the whole visible
+  ## span clickable and carries the URI itself (invisible). The target
+  ## stays visible in the text (bare `url` when the text is the url,
+  ## `text - url` otherwise) so terminals without OSC 8 support, and
+  ## regex URL detection, still work; unsupported terminals ignore the
+  ## unknown OSC per ECMA-48. Body text rides the
+  ## terminal's default foreground (no envelope SGR), so the reverts
+  ## just cancel bold / italic / underline back to default — no need
+  ## to re-engage `\x1b[2m` (we no longer dim the body).
+  ## Bold and inline code: `\x1b[1m` (bold/bright). Italic: `\x1b[3m`
+  ## plus `\x1b[4m` so it shows on terminals whose monospace font
+  ## lacks an italic face (italic alone would be invisible there).
+  ## Strict matching: opening delimiter must be immediately followed
+  ## by a non-space, closing delimiter immediately preceded by a
+  ## non-space, and the inner span must not contain the delimiter.
+  ## Italic additionally requires whitespace/punctuation flanking on
+  ## the outside, so `snake_case` and `5*5` survive untouched.
+  ## Unmatched / malformed markers pass through verbatim.
+  result = newStringOfCap(line.len + 32)
+  var i = 0
+  while i < line.len:
+    if i + 2 < line.len and line[i] == '*' and line[i + 1] == '*' and line[i + 2] == '*':
+      # `***text***` — bold + italic. Find a closing `***` triplet.
+      var j = i + 3
+      var found = -1
+      while j + 2 < line.len:
+        if line[j] == '*' and line[j + 1] == '*' and line[j + 2] == '*':
+          found = j; break
+        inc j
+      if found > i + 3:
+        let inner = line[i + 3 ..< found]
+        if inner[0] != ' ' and inner[^1] != ' ' and '*' notin inner:
+          result.add "\x1b[1m\x1b[3m\x1b[4m" & applyInlineMd(inner) &
+                     "\x1b[24m\x1b[23m\x1b[22m"
+          i = found + 3
+          continue
+    if i + 1 < line.len and line[i] == '*' and line[i + 1] == '*':
+      var j = i + 2
+      var found = -1
+      while j + 1 < line.len:
+        if line[j] == '*' and line[j + 1] == '*':
+          found = j; break
+        inc j
+      if found > i + 2:
+        let inner = line[i + 2 ..< found]
+        if inner[0] != ' ' and inner[^1] != ' ' and '*' notin inner:
+          # Bold: real bold (bright). No color change, asterisks
+          # dropped. Recurse so nested italic/code inside
+          # (e.g. `**_lazy_**`) renders.
+          result.add "\x1b[1m" & applyInlineMd(inner) & "\x1b[22m"
+          i = found + 2
+          continue
+    if line[i] == '*' and isAtBoundary(line, i - 1):
+      # Single `*italic*`. Skip past any `**` sequences while looking
+      # for the matching closing `*` so a nested bold doesn't terminate
+      # us early. Closing `*` must be followed by a boundary char.
+      var j = i + 1
+      var found = -1
+      while j < line.len:
+        if line[j] == '*':
+          if j + 1 < line.len and line[j + 1] == '*':
+            j += 2
+            continue
+          if isAtBoundary(line, j + 1):
+            found = j
+            break
+        inc j
+      if found > i + 1:
+        let inner = line[i + 1 ..< found]
+        if inner.len > 0 and inner[0] != ' ' and inner[^1] != ' ' and '*' notin inner:
+          # Italic + underline together: italic ANSI alone is invisible
+          # on terminals whose monospace font lacks an italic face;
+          # underline is universally rendered, so the combo gives a
+          # visible cue everywhere while the italic shows for terminals
+          # that do support it.
+          result.add "\x1b[3m\x1b[4m" & applyInlineMd(inner) & "\x1b[24m\x1b[23m"
+          i = found + 1
+          continue
+    if line[i] == '_' and isAtBoundary(line, i - 1):
+      var j = i + 1
+      while j < line.len and line[j] != '_':
+        inc j
+      if j < line.len and j > i + 1 and isAtBoundary(line, j + 1):
+        let inner = line[i + 1 ..< j]
+        if inner.len > 0 and inner[0] != ' ' and inner[^1] != ' ' and '_' notin inner:
+          result.add "\x1b[3m\x1b[4m" & applyInlineMd(inner) & "\x1b[24m\x1b[23m"
+          i = j + 1
+          continue
+    if line[i] == '`':
+      var j = i + 1
+      while j < line.len and line[j] != '`':
+        inc j
+      if j < line.len and j > i + 1:
+        let inner = line[i + 1 ..< j]
+        if inner[0] != ' ' and inner[^1] != ' ':
+          # Inline code: bold weight, no color shift.
+          result.add "\x1b[1m" & inner & "\x1b[22m"
+          i = j + 1
+          continue
+    if line[i] == '[':
+      # `[text](url)` inline link. Text may carry nested inline
+      # markdown; the url is emitted verbatim (never recursed into,
+      # urls legitimately contain `*` and `_`). One level of balanced
+      # parens inside the url is honored (Wikipedia-style). Anything
+      # that isn't a URI target (`#anchor`, relative paths) or has a
+      # malformed shape passes through verbatim like the other markers.
+      var j = i + 1
+      while j < line.len and line[j] != ']' and line[j] != '[':
+        inc j
+      if j < line.len and line[j] == ']' and j + 1 < line.len and
+          line[j + 1] == '(':
+        var k = j + 2
+        var depth = 0
+        while k < line.len:
+          case line[k]
+          of '(': inc depth
+          of ')':
+            if depth == 0: break
+            dec depth
+          of ' ', '\t', '\x1b', '[': break
+          else: discard
+          inc k
+        if k < line.len and line[k] == ')':
+          let text = line[i + 1 ..< j]
+          let url = line[j + 2 ..< k]
+          if url.len > 0 and ("://" in url or url.startsWith("mailto:")):
+            let vis = if text.len == 0 or text == url:
+                        url
+                      else:
+                        applyInlineMd(text) & " - " & url
+            result.add "\x1b]8;;" & url & "\x1b\\" & vis &
+                       "\x1b]8;;\x1b\\"
+            i = k + 1
+            continue
+    result.add line[i]
+    inc i
+
+func oscSpanLen*(s: string, i: int): int =
+  ## Length in bytes of the OSC escape sequence starting at `s[i]`
+  ## (`ESC ] ... ST` or `... BEL`), or 0 if `i` doesn't point at one.
+  ## OSC spans are invisible (e.g. the URI inside an OSC 8 hyperlink),
+  ## so width/wrap math must skip them like CSI sequences. A span left
+  ## unterminated at end of input runs to the end, mirroring a parser
+  ## holding a partial sequence; a bare ESC that isn't ST ends the span
+  ## without being consumed.
+  if s[i] != '\x1b' or i + 1 >= s.len or s[i + 1] != ']':
+    return 0
+  var j = i + 2
+  while j < s.len:
+    if s[j] == '\x07':
+      return j + 1 - i
+    if s[j] == '\x1b':
+      if j + 1 < s.len and s[j + 1] == '\\':
+        return j + 2 - i
+      return j - i
+    inc j
+  result = s.len - i
+
+func visibleWidth*(s: string): int =
+  ## Count visible columns in a string that may contain ANSI CSI escape
+  ## sequences (`\e[...<letter>`) or OSC sequences (`\e]...ST`, such as
+  ## OSC 8 hyperlinks). Each rune is weighted by its East Asian Width:
+  ## CJK / emoji count as 2, combining marks as 0.
+  var i = 0
+  while i < s.len:
+    let osc = oscSpanLen(s, i)
+    if osc > 0:
+      i += osc
+      continue
+    if s[i] == '\x1b' and i + 1 < s.len and s[i + 1] == '[':
+      i += 2
+      while i < s.len and s[i] notin {'A'..'Z', 'a'..'z'}:
+        inc i
+      if i < s.len: inc i
+      continue
+    let rl = if (s[i].uint8 and 0xC0'u8) != 0x80'u8: max(1, runeLenAt(s, i)) else: 1
+    if (s[i].uint8 and 0xC0'u8) != 0x80'u8:
+      inc result, runeCellWidth(s.runeAt(i))
+    inc i, rl
+
+func wrapAnsi*(s: string, width: int): seq[string] =
+  ## Greedy word-wrap on whitespace; each chunk's visible width is at
+  ## most `width`. ANSI CSI escape sequences pass through without
+  ## counting toward width. Words longer than `width` overflow on their
+  ## own line — terminal wrap takes them from there. Multiple inter-word
+  ## spaces collapse to one.
+  if width <= 0:
+    result.add s
+    return
+  let words = s.split(' ').filterIt(it.len > 0)
+  if words.len == 0:
+    result.add s
+    return
+  var line = ""
+  var lineW = 0
+  for w in words:
+    let wW = visibleWidth(w)
+    if lineW == 0:
+      line = w
+      lineW = wW
+    elif lineW + 1 + wW <= width:
+      line.add ' '
+      line.add w
+      lineW += 1 + wW
+    else:
+      result.add line
+      line = w
+      lineW = wW
+  if line.len > 0:
+    result.add line
+
+func charWrapAnsi*(s: string, width: int): seq[string] =
+  ## Character-wrap: break at exactly `width` visible columns, even
+  ## mid-word. ANSI CSI and OSC escapes pass through without counting
+  ## toward width. Lines that fit are returned as-is.
+  if width <= 0 or s.len == 0:
+    result.add s
+    return
+  var line = ""
+  var lineW = 0
+  var i = 0
+  while i < s.len:
+    let osc = oscSpanLen(s, i)
+    if osc > 0:
+      line.add s[i ..< i + osc]
+      i += osc
+      continue
+    if s[i] == '\x1b' and i + 1 < s.len and s[i + 1] == '[':
+      let start = i
+      i += 2
+      while i < s.len and s[i] notin {'A'..'Z', 'a'..'z'}:
+        inc i
+      if i < s.len: inc i
+      line.add s[start ..< i]
+      continue
+    let start = i
+    if (s[i].uint8 and 0xC0'u8) != 0x80'u8:
+      # start of a visible character
+      inc i
+      while i < s.len and (s[i].uint8 and 0xC0'u8) == 0x80'u8:
+        inc i
+      if lineW + 1 > width:
+        result.add line
+        line = s[start ..< i]
+        lineW = 1
+      else:
+        line.add s[start ..< i]
+        inc lineW
+    else:
+      inc i
+  if line.len > 0:
+    result.add line
+
+const BannerMaxRows* = 3
+
+func bannerWrapRows*(prefix, body: string; termW: int): seq[string] =
+  ## Wrap a tool banner (icon + command/path) across the terminal width,
+  ## mirroring how output lines wrap. The `prefix` (e.g. "$ ") occupies
+  ## the first row; continuation rows align under the body with a 2-space
+  ## indent. Wide terminals show the whole banner; narrow ones wrap instead
+  ## of clipping. After `BannerMaxRows` rows the remainder is dropped with an
+  ## ellipsis so an extremely long banner cannot take over the fat prompt.
+  let firstW = max(1, termW - visibleWidth(prefix))
+  let contW = max(1, termW - 2)
+  var first = true
+  for chunk in charWrapAnsi(body, if first: firstW else: contW):
+    if result.len >= BannerMaxRows:
+      result[^1] = utf8ByteCut(result[^1], max(1, result[^1].len - 1)) & "…"
+      return
+    result.add (if first: prefix else: "  ") & chunk
+    first = false
+
+func isMdTableRow*(line: string): bool =
+  ## A markdown-table row both opens and closes with a `|`. Rejects
+  ## bare prose that happens to contain a pipe.
+  let s = line.strip
+  s.len >= 2 and s[0] == '|' and s[^1] == '|'
+
+proc parseMdRow(line: string): seq[string] =
+  ## Split a `| a | b | c |` row into its trimmed cell values.
+  var s = line.strip
+  if s.len > 0 and s[0] == '|': s = s[1 .. ^1]
+  if s.len > 0 and s[^1] == '|': s = s[0 ..< ^1]
+  s.split('|').mapIt(it.strip)
+
+func isMdSepRow*(line: string): bool =
+  ## Detect the `|---|:---:|---:|` alignment-separator row between
+  ## header and body — its cells contain only `-`, `:`, and spaces.
+  let cells = parseMdRow(line)
+  if cells.len == 0: return false
+  for c in cells:
+    if c.len == 0: return false
+    for ch in c:
+      if ch notin {'-', ':', ' '}: return false
+  true
+
+func renderMdTable*(rows: seq[string], indent = "  ", maxWidth = 0): string =
+  ## Render a buffered markdown table as an aligned, box-drawn block.
+  ## Each output line is prefixed with `indent` so the table sits in
+  ## the harness's col-2 content area. Skips the alignment-separator
+  ## row but uses it as the header/body divider when present.
+  ##
+  ## When `maxWidth > 0`, the natural column widths are compressed to
+  ## fit `maxWidth` total columns: the widest column is shaved by one
+  ## visible char at a time until the row fits, never going below a
+  ## per-column minimum of `MinCol`. Cells longer than their column
+  ## are word-wrapped across multiple visual lines so the row stays
+  ## readable. If even `MinCol` per column doesn't fit (too many
+  ## columns for the terminal), the table degrades to a vertical
+  ## `label: value` rendering: readable, no overflow, but loses the
+  ## grid.
+  if rows.len == 0: return ""
+  let parsed = rows.mapIt(parseMdRow(it))
+  var nCols = 0
+  for r in parsed:
+    if r.len > nCols: nCols = r.len
+  if nCols == 0:
+    return rows.mapIt(indent & it).join("\n") & "\n"
+  var headerRow: seq[string]
+  var bodyRows: seq[seq[string]]
+  var sawSep = false
+  for i, r in parsed:
+    var padded = r
+    while padded.len < nCols: padded.add ""
+    # Apply inline markdown to each cell up front: `**bold**` and
+    # `` `code` `` get ANSI styling applied (same as paragraph text),
+    # marker characters dropped. Width math from here on uses
+    # `visibleWidth` so the ANSI escapes don't inflate column widths.
+    for j in 0 ..< padded.len:
+      padded[j] = applyInlineMd(padded[j])
+    if i == 0:
+      headerRow = padded
+    elif not sawSep and isMdSepRow(rows[i]):
+      sawSep = true
+    else:
+      bodyRows.add padded
+  var widths = newSeq[int](nCols)
+  for j, c in headerRow: widths[j] = max(widths[j], visibleWidth(c))
+  for r in bodyRows:
+    for j, c in r:
+      widths[j] = max(widths[j], visibleWidth(c))
+  let indentLen = visibleWidth(indent)
+  let chrome = 1 + 3 * nCols       # leading │ + (` cell ` + │) per col
+  const MinCol = 16
+  proc widthsTotal(ws: seq[int]): int =
+    for w in ws: result += w
+  if maxWidth > 0:
+    let minLine = indentLen + chrome + nCols * MinCol
+    if minLine > maxWidth:
+      # Too many columns to render even at minimum width. Fall back to
+      # a vertical record list: one `label: value` line per cell,
+      # blank line between records.
+      var fb = ""
+      for r in bodyRows:
+        for j, c in r:
+          let label = if j < headerRow.len and headerRow[j].len > 0:
+                        headerRow[j]
+                      else: $j
+          fb.add indent & label & ": " & c & "\n"
+        fb.add "\n"
+      return fb
+    let avail = maxWidth - indentLen - chrome
+    while widthsTotal(widths) > avail:
+      var maxIdx = 0
+      for j in 1 ..< nCols:
+        if widths[j] > widths[maxIdx]: maxIdx = j
+      if widths[maxIdx] <= MinCol: break
+      widths[maxIdx] -= 1
+  proc rowStr(r: seq[string]): string =
+    ## Render a row across as many visual lines as the tallest wrapped
+    ## cell needs. Each cell wraps via `wrapAnsi`; cells with fewer
+    ## lines pad with blanks so the right border stays aligned.
+    var cellLines = newSeq[seq[string]](nCols)
+    var maxLines = 1
+    for j in 0 ..< nCols:
+      let c = if j < r.len: r[j] else: ""
+      var lines = wrapAnsi(c, widths[j])
+      if lines.len == 0: lines = @[""]
+      cellLines[j] = lines
+      if lines.len > maxLines: maxLines = lines.len
+    var visualRows: seq[string]
+    for k in 0 ..< maxLines:
+      var cells: seq[string]
+      for j in 0 ..< nCols:
+        let txt = if k < cellLines[j].len: cellLines[j][k] else: ""
+        let pad = widths[j] - visibleWidth(txt)
+        cells.add txt & " ".repeat(max(0, pad))
+      visualRows.add indent & "│ " & cells.join(" │ ") & " │"
+    visualRows.join("\n")
+  proc sepStr(left, mid, right: string): string =
+    var bars: seq[string]
+    for w in widths: bars.add "─".repeat(w + 2)
+    indent & left & bars.join(mid) & right
+  result = ""
+  result.add sepStr("┌", "┬", "┐") & "\n"
+  result.add rowStr(headerRow) & "\n"
+  result.add sepStr("├", "┼", "┤") & "\n"
+  for i, r in bodyRows:
+    if i > 0:
+      result.add sepStr("├", "┼", "┤") & "\n"
+    result.add rowStr(r) & "\n"
+  result.add sepStr("└", "┴", "┘") & "\n"
+
+func tokenSlot*(icon: string, n: int): string =
+  ## "iconvalue" — no space between glyph and number. Slots are joined
+  ## with two spaces for visual separation. When the value is 0 the
+  ## slot is omitted entirely (returns ""); the caller strips the
+  ## preceding spacer too so no dangling gaps appear.
+  if n == 0: ""
+  else: icon & humanTokens(n)
+
+func stripPreamble*(s: string): string =
+  ## Strip `<session_context>...</session_context>` and
+  ## `<project_notes>...</project_notes>` blocks from a stored user
+  ## message so the replay UI shows the prompt the user typed, not the
+  ## auto-injected context the model needs. Only acts on a leading
+  ## block (`s.strip` starts with `<session_context>`); leaves the
+  ## string alone if either tag appears mid-message — that would be the
+  ## user's own text, not our preamble.
+  if not s.strip.startsWith("<session_context>"): return s
+  result = s
+  for tag in ["session_context", "project_notes"]:
+    let openTag = "<" & tag & ">"
+    let closeTag = "</" & tag & ">"
+    let i = result.find(openTag)
+    if i < 0: continue
+    let j = result.find(closeTag, i + openTag.len)
+    if j < 0: continue
+    result = result[0 ..< i] & result[j + closeTag.len .. ^1]
+  result = result.strip
+
+proc collapseHome*(path: string): string =
+  ## Collapse the user's home dir prefix to `~/`. Guards against the
+  ## `getHomeDir()` trailing-slash footgun that produced things like
+  ## `~e/hellodeepseek` for `/home/carlo/e/hellodeepseek`. On Windows
+  ## both sides are compared with `/` so `C:\Users\x\foo` collapses.
+  let home = getHomeDir().replace('\\', '/')
+  let norm = path.replace('\\', '/')
+  if home.len == 0 or not norm.startsWith(home):
+    return path
+  var rel = norm[home.len .. ^1]
+  while rel.startsWith("/"): rel = rel[1 .. ^1]
+  if rel.len == 0: "~" else: "~/" & rel
+
+func replaceFirst*(s, needle, repl: string): (string, bool) =
+  let idx = s.find(needle)
+  if idx < 0: return (s, false)
+  (s[0 ..< idx] & repl & s[idx + needle.len .. ^1], true)
+
+func normalizePatchLine*(line: string): string =
+  ## Fuzzy-match normalization for one search-block line: strip the
+  ## leading indentation and trailing whitespace and drop a leading
+  ## `N> ` style diff/git prompt prefix if present. Two lines that differ
+  ## only in indentation or a copied prompt artifact still compare equal.
+  var l = line.strip(false, true)
+  l = l.strip(true, false)
+  # Drop common transcript prefixes models copy by accident: git diff
+  # markers, quoted-reply markers, line-number prefixes from read output.
+  if l.len > 0 and l[0] in {'+', '-', ' '}: l = l[1 ..^ 1]
+  if l.len > 1 and l[0] == '>' and l[1] == ' ': l = l[2 ..^ 1]
+  let sp = l.find(' ')
+  if sp > 0:
+    let cand = l[0 ..< sp]
+    if cand.len in 1..6 and cand.allCharsInSet(Digits): l = l[sp + 1 ..^ 1]
+  l.strip
+
+func findFirstLineIdx*(lines: seq[string], needleLines: seq[string]): int =
+  ## Index of the first line in `lines` whose normalized form equals the
+  ## first normalized needle line, or -1. Windowed scan: every candidate
+  ## start is checked against all needle lines. Trailing blank lines (the
+  ## artifact of splitting text that ends in \n) are dropped from both
+  ## sides first so a mid-file block matches with or without a trailing
+  ## newline in the search text.
+  var nl = needleLines
+  var sl = lines
+  while nl.len > 0 and nl[^1].strip.len == 0: nl.setLen nl.len - 1
+  while sl.len > 0 and sl[^1].strip.len == 0: sl.setLen sl.len - 1
+  if nl.len == 0 or sl.len == 0: return -1
+  let head = normalizePatchLine(nl[0])
+  if head.len == 0: return -1
+  for i in 0 .. sl.len - nl.len:
+    if normalizePatchLine(sl[i]) != head: continue
+    block candidate:
+      for j in 1 ..< nl.len:
+        if normalizePatchLine(sl[i + j]) != normalizePatchLine(nl[j]):
+          break candidate
+      return i
+  -1
+
+func leadingWs(line: string): string =
+  ## The leading whitespace run of a line ("" when none).
+  let i = line.len - line.strip(leading = true).len
+  line[0 ..< i]
+
+func fuzzyReplaceFirst*(s, needle, repl: string): tuple[newText: string, ok: bool, strategy: string] =
+  ## Extended `replaceFirst` for patch search blocks. Tries, in order:
+  ##   exact        - byte-exact substring (the fast path)
+  ##   indent       - line-by-line with leading indentation ignored (models
+  ##                  re-indent context lines to the nesting level they
+  ##                  expect rather than the one they read)
+  ##   whitespace   - interior runs of whitespace collapsed on both sides
+  ## Each fuzzy strategy rebuilds the replacement from the *actual* matched
+  ## span: the replacement text keeps the model's own lines but the match
+  ## consumes the file's real bytes, so a later exact `search` on the same
+  ## region still works. Bounded work: normalization is O(n) per line and
+  ## matching scans each candidate at most once.
+  let idx = s.find(needle)
+  if idx >= 0:
+    return (s[0 ..< idx] & repl & s[idx + needle.len .. ^1], true, "exact")
+
+  let nl = needle.splitLines
+  let sl = s.splitLines
+  let start = findFirstLineIdx(sl, nl)
+  # Work on the blank-stripped view: the rebuild below joins with \n and
+  # the final trailing newline is re-appended only if the original had one.
+  var fileLines = sl
+  while fileLines.len > 0 and fileLines[^1].strip.len == 0: fileLines.setLen fileLines.len - 1
+  var needleLines = nl
+  while needleLines.len > 0 and needleLines[^1].strip.len == 0: needleLines.setLen needleLines.len - 1
+  # indent strategy: line equality after unindenting both sides. The
+  # replacement keeps the FILE's indentation: each replacement line is
+  # shifted by (file base indent - repl base indent), so an
+  # under-indented search block in a nested region neither dedents the
+  # replaced code nor double-indents the replacement.
+  if start >= 0 and start + needleLines.len <= fileLines.len:
+    block indentCheck:
+      for j in 0 ..< needleLines.len:
+        if normalizePatchLine(fileLines[start + j]) != normalizePatchLine(needleLines[j]):
+          break indentCheck
+      # Re-anchor the replacement to the file's real indentation, line
+      # by line: each replacement line keeps the matched file line's exact
+      # leading whitespace (the body follows, stripped of whatever the
+      # model's own block indented it to). Replacement lines beyond the
+      # matched span inherit the last matched line's indent. This is what
+      # makes an under-indented search block in a nested region produce
+      # correctly nested code instead of dedented (or double-indented)
+      # code.
+      var replLines = repl.splitLines
+      while replLines.len > 0 and replLines[^1].strip.len == 0:
+        replLines.setLen replLines.len - 1
+      var newLines = fileLines[0 ..< start]
+      var lastFileIndent = if start < fileLines.len:
+          leadingWs(fileLines[start]) else: ""
+      for j, rl in replLines:
+        if rl.strip.len == 0:
+          newLines.add rl
+          continue
+        if start + j < fileLines.len:
+          lastFileIndent = leadingWs(fileLines[start + j])
+        let body = rl.strip
+        newLines.add lastFileIndent & body
+      if start + needleLines.len < fileLines.len:
+        newLines.add fileLines[start + needleLines.len .. ^1]
+      var outText = newLines.join("\n")
+      if s.endsWith("\n"): outText.add "\n"
+      return (outText, true, "indent")
+  # whitespace strategy: interior whitespace runs collapsed. Has its own
+  # candidate finder because the head line itself differs by interior
+  # whitespace, so the normalized scan above never located it.
+  block wsCheck:
+    proc squash(x: string): string =
+      strutils.splitWhitespace(x).join(" ")
+    let headSq = squash(needleLines[0])
+    if headSq.len == 0: break wsCheck
+    var wsStart = -1
+    if fileLines.len >= needleLines.len:
+      for i in 0 .. fileLines.len - needleLines.len:
+        block c2:
+          for j in 0 ..< needleLines.len:
+            if squash(fileLines[i + j]) != squash(needleLines[j]):
+              break c2
+          wsStart = i
+          break
+    if wsStart < 0: break wsCheck
+    var replLines = repl.splitLines
+    while replLines.len > 0 and replLines[^1].strip.len == 0:
+      replLines.setLen replLines.len - 1
+    var newLines = fileLines[0 ..< wsStart]
+    newLines.add replLines
+    if wsStart + needleLines.len < fileLines.len:
+      newLines.add fileLines[wsStart + needleLines.len .. ^1]
+    var outText = newLines.join("\n")
+    if s.endsWith("\n"): outText.add "\n"
+    return (outText, true, "whitespace")
+  (s, false, "")
+
+func isBinaryContent*(s: string): bool =
+  ## Scan the first 512 bytes for binary indicators: any NUL byte, or
+  ## >5% non-printable control chars (excluding \t \n \r and ANSI escape
+  ## sequences). CSI, OSC, and short-form ANSI escapes are skipped so that
+  ## colourised/terminal-formatted tool output is not misclassified.
+  let scan = min(512, s.len)
+  if scan == 0: return false
+  var bad = 0
+  var k = 0
+  while k < scan:
+    let b = s[k].ord
+    if b == 0: return true
+    if b == 27 and k + 1 < scan:
+      let next = s[k + 1].ord
+      if next == ord('['):
+        # CSI: ESC [ <parameter+intermediate bytes 0x20-0x3F> <final 0x40-0x7E>
+        inc k, 2
+        while k < scan and s[k].ord notin 0x40..0x7E:
+          inc k
+        if k < scan: inc k
+        continue
+      if next in {ord(']'), ord('P'), ord('^'), ord('_')}:
+        # OSC / DCS / SOS / PM / APC: terminated by BEL (0x07) or ST (ESC \)
+        inc k, 2
+        while k < scan:
+          let tb = s[k].ord
+          if tb == 7:
+            inc k; break
+          if tb == 27 and k + 1 < scan and s[k + 1] == '\\':
+            inc k, 2; break
+          inc k
+        continue
+      # Other ESC sequences: skip ESC + 1 byte (covers ESC c, ESC M, etc.)
+      inc k, 2
+      continue
+    if b < 32 and b notin {9, 10, 13}:
+      inc bad
+    inc k
+  bad * 20 > scan
+
+func looksLikePath*(s: string): bool =
+  ## Heuristic for the path-on-its-own-line preceding a write/patch fence in
+  ## text mode. Rejects prose (whitespace inside, fence markers, headings).
+  ## Accepts anything containing `/` or `.` — paths typically have one.
+  let t = s.strip
+  if t.len == 0 or t.len > 200: return false
+  if ' ' in t or '\t' in t: return false
+  if t.startsWith("```") or t.startsWith("#"): return false
+  '/' in t or '.' in t
+
+func levenshtein*(a, b: string): int =
+  if a.len == 0: return b.len
+  if b.len == 0: return a.len
+  var prev = newSeq[int](b.len + 1)
+  var curr = newSeq[int](b.len + 1)
+  for j in 0 .. b.len: prev[j] = j
+  for i in 1 .. a.len:
+    curr[0] = i
+    for j in 1 .. b.len:
+      let cost = if a[i-1] == b[j-1]: 0 else: 1
+      curr[j] = min(min(curr[j-1] + 1, prev[j] + 1), prev[j-1] + cost)
+    swap(prev, curr)
+  prev[b.len]
+
+func levenshteinCapped*(a, b: string, cap: int): int =
+  ## Standard edit distance with an early cutoff: returns `cap+1` once the
+  ## minimum row value exceeds `cap`. Cap keeps the cost linear-ish for the
+  ## "compare against every file line" use case.
+  if a.len == 0: return b.len
+  if b.len == 0: return a.len
+  if abs(a.len - b.len) > cap: return cap + 1
+  var prev = newSeq[int](b.len + 1)
+  var curr = newSeq[int](b.len + 1)
+  for j in 0 .. b.len: prev[j] = j
+  for i in 1 .. a.len:
+    curr[0] = i
+    var rowMin = curr[0]
+    for j in 1 .. b.len:
+      let cost = if a[i-1] == b[j-1]: 0 else: 1
+      curr[j] = min(min(curr[j-1] + 1, prev[j] + 1), prev[j-1] + cost)
+      if curr[j] < rowMin: rowMin = curr[j]
+    if rowMin > cap: return cap + 1
+    swap(prev, curr)
+  prev[b.len]
+
+const UnavailableToolResult* = "tool result unavailable (session was interrupted)"
+
+proc repairToolCallPairing*(messages: JsonNode): JsonNode =
+  ## Make the chat history legal for strict OpenAI-compatible validators
+  ## (Kimi/Moonshot 400 `tool_call_id is not found`, DeepSeek unpaired
+  ## tool_calls). Drops leading/orphan `role:tool` messages whose id is
+  ## not pending from the previous assistant, and injects synthetic
+  ## results for any tool_call that never got a matching tool message.
+  ## Empty tool_call ids are filled so a streamed call that never got an
+  ## `id` delta cannot 400 on an empty `tool_call_id`.
+  if messages == nil or messages.kind != JArray: return messages
+  result = newJArray()
+  var pending: seq[string] = @[]
+  var seqn = 0
+  for m in messages:
+    if m.kind != JObject:
+      result.add m
+      continue
+    let role = m{"role"}.getStr
+    if role == "tool":
+      var id = m{"tool_call_id"}.getStr
+      var idx = pending.find(id)
+      # Streamed tool_calls can arrive with an empty id; pair the empty
+      # tool result with the first still-pending call (which we just filled).
+      if idx < 0 and id.len == 0 and pending.len > 0:
+        idx = 0
+        id = pending[0]
+        m["tool_call_id"] = %id
+      if idx >= 0:
+        pending.delete(idx)
+        result.add m
+      # else: orphan tool result (compaction split, resume, steer). Drop.
+    elif role == "assistant":
+      for id in pending:
+        result.add %*{"role": "tool", "tool_call_id": id,
+                      "content": UnavailableToolResult}
+      pending.setLen 0
+      var node = m
+      let tcs = node{"tool_calls"}
+      if tcs != nil and tcs.kind == JArray:
+        for tc in tcs:
+          if tc.kind != JObject: continue
+          var id = tc{"id"}.getStr
+          if id.len == 0:
+            inc seqn
+            id = "fill-" & $seqn
+            tc["id"] = %id
+          pending.add id
+      result.add node
+    else:
+      for id in pending:
+        result.add %*{"role": "tool", "tool_call_id": id,
+                      "content": UnavailableToolResult}
+      pending.setLen 0
+      result.add m
+  for id in pending:
+    result.add %*{"role": "tool", "tool_call_id": id,
+                  "content": UnavailableToolResult}

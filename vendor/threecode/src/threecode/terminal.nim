@@ -1,0 +1,183 @@
+## Terminal rendering for normal-terminal writes.
+##
+## This deliberately uses direct terminal operations, not a fullscreen diff.
+## Scrollback content is appended once as ordinary terminal output; only the
+## volatile fat-prompt region is cleared and repainted around those appends.
+
+import std/[locks, terminal]
+import minline
+import ./syncoutput
+
+proc SyncBegin*(): string = syncoutput.SyncBegin()
+proc SyncEnd*(): string = syncoutput.SyncEnd()
+
+## Terminal write serialization lock.
+##
+## Invariant: a thread holding this lock must never join (or otherwise block
+## on) a background thread that renders via `renderFooter` (spinner, barTick).
+## Those threads need the lock to finish their current frame and exit, so
+## joining them while holding it is a guaranteed deadlock: the holder waits
+## for the render thread to exit, the render thread waits for the lock the
+## holder holds. Any join of such a thread must go through
+## `withTerminalLockDroppedForJoin`, which releases the lock around the join.
+var terminalLock*: Lock
+initLock(terminalLock)
+var terminalLockDepth* {.threadvar.}: int
+
+proc acquireTerminalWrite*() =
+  ## Enter the single terminal-writer critical section. Reentrant so editor
+  ## redraw callbacks can hold the frame while minline performs nested writes.
+  if terminalLockDepth == 0:
+    acquire terminalLock
+  inc terminalLockDepth
+
+proc tryAcquireTerminalWrite*(): bool =
+  ## Non-blocking variant of `acquireTerminalWrite` for cross-thread
+  ## readers that must never stall on the render path (the draft flusher,
+  ## which can also be driven from a signal-triggered cleanup). Returns
+  ## false when the lock is held elsewhere; nothing is acquired then.
+  if terminalLockDepth == 0:
+    result = tryAcquire(terminalLock)
+    if result:
+      inc terminalLockDepth
+  else:
+    result = true
+    inc terminalLockDepth
+
+proc releaseTerminalWrite*() =
+  ## Leave the terminal-writer critical section acquired by
+  ## `acquireTerminalWrite`.
+  if terminalLockDepth <= 0:
+    return
+  dec terminalLockDepth
+  if terminalLockDepth == 0:
+    release terminalLock
+
+proc releaseTerminalWriteFully*(): int =
+  ## Drop the terminal write lock completely regardless of reentrant depth,
+  ## returning the depth so it can be restored by `restoreTerminalWriteDepth`.
+  ## Used around `joinThread` of a render thread (spinner/barTick): those
+  ## threads need the lock to finish their current frame and exit, so joining
+  ## them while the caller holds the lock deadlocks (caller waits for the
+  ## thread; thread waits for the lock the caller holds). Releasing fully
+  ## around the join lets the render thread drain and exit. Returns 0 when
+  ## the caller did not hold the lock (no restore needed).
+  result = terminalLockDepth
+  if result > 0:
+    terminalLockDepth = 0
+    release terminalLock
+
+proc restoreTerminalWriteDepth*(depth: int) =
+  ## Restore a terminal write lock depth previously dropped by
+  ## `releaseTerminalWriteFully`. Re-acquires the underlying lock and resets
+  ## the reentrant counter so the caller's later `releaseTerminalWrite`
+  ## calls stay balanced.
+  if depth <= 0: return
+  acquire terminalLock
+  terminalLockDepth = depth
+
+template withTerminalLockDroppedForJoin*(joinStmt: untyped) =
+  ## Run a `joinThread` of a terminal-rendering background thread
+  ## (spinner/barTick) with the calling thread's terminal write lock
+  ## temporarily fully released, restoring it afterward regardless of how
+  ## the join resolves. Those threads need the lock to finish their current
+  ## render frame and observe their stop flag; joining them while the caller
+  ## holds the lock is a guaranteed deadlock (caller waits for the thread to
+  ## exit; thread waits for the lock the caller holds). Scoping the drop
+  ## around the join statement makes the restore mandatory by syntax, like
+  ## a `withFile` block, so a future caller cannot forget to restore.
+  let savedDepth = releaseTerminalWriteFully()
+  try:
+    joinStmt
+  finally:
+    restoreTerminalWriteDepth(savedDepth)
+
+template withTerminalWriteLock*(body: untyped) =
+  ## Serialize all terminal writes. Reentrant for helpers that compose other
+  ## terminal operations within one render tick.
+  acquireTerminalWrite()
+  try:
+    body
+  finally:
+    releaseTerminalWrite()
+
+proc refreshEditorWidth(ed: var minline.LineEditor) =
+  let w = try: terminalWidth() except CatchableError: 0
+  if w > 0:
+    ed.width = w
+
+proc syncWrite*(bytes: string) =
+  ## Write one synchronized terminal update.
+  withTerminalWriteLock:
+    stdout.write SyncBegin()
+    stdout.write bytes
+    stdout.write SyncEnd()
+    stdout.flushFile
+
+proc writeRaw*(bytes: string) =
+  ## Direct terminal write owned by the terminal renderer.
+  withTerminalWriteLock:
+    stdout.write bytes
+    stdout.flushFile
+
+proc setSteadyCursor*() =
+  ## Use a steady block cursor while 3code is active.
+  writeRaw("\x1b[2 q")
+
+proc restoreCursorStyle*() {.noconv.} =
+  try:
+    writeRaw("\x1b[0 q")
+  except IOError:
+    discard
+
+proc beginEditorRedraw*(ed: var minline.LineEditor; ready: bool;
+                        footerBarBytes: string;
+                        footerRowsAboveEditor = 1) =
+  ## Start an atomic live-editor redraw frame. The caller must finish with
+  ## `finishEditorRedraw` after minline has emitted the editor bytes. The
+  ## physical cursor is hidden for the whole session (the caret is drawn
+  ## inside the editor rows), so no visibility toggling happens here.
+  acquireTerminalWrite()
+  refreshEditorWidth(ed)
+  stdout.write SyncBegin()
+  stdout.write "\r"
+  ed.redrawWrappedExternally = true
+  # `footerRowsAboveEditor` is the source of truth for reserved chrome above
+  # the editor (gap-only prompt-only startup counts as 1 even with empty
+  # footer bytes; bar/spinner add their rows). Do not key walk-up on byte
+  # length alone — that ignored the startup gap and let later overwrites
+  # land one row too high once a bar appeared.
+  let footerRows = max(0, footerRowsAboveEditor)
+  if footerRows > 0:
+    let rows = ed.renderRow + footerRows
+    if rows > 0:
+      stdout.write "\x1b[" & $rows & "A"
+  elif ready and ed.renderRow > 0:
+    # A previously-painted multi-row editor sits above us: walk up to its
+    # top row and redraw in place. Net cursor movement is zero (up N, then
+    # the trailing newline steps back down N), so this never orphans a line.
+    stdout.write "\x1b[" & $(ed.renderRow + 1) & "A"
+  # Only advance to a fresh row when we had reserved chrome above us
+  # (gap/bar, or a previously-walked-up editor). On the very first paint
+  # with no reserved footer rows the editor is already on the current row
+  # — a bare newline would strand the `❯ ` that `paintInitialPrompt`/a
+  # finished wizard just wrote on a blank line. Redraw in place instead.
+  stdout.write "\x1b[J"
+  if footerBarBytes.len > 0:
+    stdout.write footerBarBytes
+  else:
+    # Gap-only or bare editor: clear the current row. When footerRows > 0
+    # the following \r\n leaves that blank as the reserved gap above the
+    # editor (ffNone rowsAboveEditor == 1 with empty bytes).
+    stdout.write "\r\x1b[2K"
+  if footerBarBytes.len > 0 or footerRows > 0 or (ready and ed.renderRow > 0):
+    stdout.write "\r\n"
+  ed.renderRow = 0
+
+proc finishEditorRedraw*() =
+  ## Finish the live-editor redraw frame opened by `beginEditorRedraw`.
+  try:
+    stdout.write SyncEnd()
+    stdout.flushFile()
+  finally:
+    releaseTerminalWrite()

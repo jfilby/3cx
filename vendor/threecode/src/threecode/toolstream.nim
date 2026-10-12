@@ -1,0 +1,98 @@
+## Bash tool-output viewport model and transcript formatting.
+##
+## The live viewport is semantic state: command banner, streamed lines, cutoff
+## policy, and final exit code. Terminal placement belongs to engine.
+
+import std/[strformat, terminal]
+import util
+
+const
+  StreamMaxLines* = 8
+
+proc subtleWriteLn*(outFile: File, body: string) =
+  outFile.write GreyFg
+  outFile.write body
+  outFile.write Reset
+  outFile.write "\r\n"
+
+type
+  StreamingView* = object
+    maxLines*: int
+    idx*: int
+    total*: int
+    banner*: string
+    exitCode*: int
+    symbol*: string
+    buf*: seq[string]
+
+proc initStreamingView*(maxLines = StreamMaxLines, idx = 0;
+                        banner = ""): StreamingView =
+  StreamingView(maxLines: maxLines, idx: idx, banner: banner,
+                exitCode: -1, symbol: "$", buf: @[])
+
+proc omittedLine(v: StreamingView): string =
+  let hidden = max(0, v.total - (v.maxLines - 1))
+  let show =
+    if v.idx > 0: " :show " & $v.idx & " for full"
+    else: ""
+  &"... {hidden} line" & (if hidden == 1: "" else: "s") &
+    " omitted" & show
+
+proc commandIcon(v: StreamingView): string =
+  if v.exitCode > 0: "Ø" else: v.symbol
+
+proc setSymbol*(v: var StreamingView; symbol: string) =
+  v.symbol = symbol
+
+proc setExitCode*(v: var StreamingView; code: int) =
+  v.exitCode = code
+
+proc wrappedRowsAt(line: string; termW: int): seq[string] =
+  let bodyW = max(20, termW - 3)
+  for chunk in charWrapAnsi(line, bodyW):
+    result.add "  " & chunk
+
+proc visibleOutputLines(v: StreamingView): seq[string] =
+  var logical: seq[string]
+  if v.buf.len <= v.maxLines:
+    logical = v.buf
+  else:
+    logical.add v.omittedLine()
+    let tailLines = max(0, v.maxLines - 1)
+    let start = max(0, v.buf.len - tailLines)
+    for i in start..<v.buf.len:
+      logical.add v.buf[i]
+  logical
+
+proc viewportRowsAt*(v: StreamingView; termW: int): seq[string] =
+  ## Re-wrap the viewport at an explicit width. The GUI thread calls this
+  ## each tick so the rows always match the live terminal geometry — a
+  ## resize between output lines re-wraps the banner/output instead of
+  ## replaying stale pre-wrap rows (which stacked fragments into scrollback).
+  for row in bannerWrapRows(v.commandIcon & " ", v.banner, termW):
+    result.add row
+  for line in v.visibleOutputLines():
+    for row in wrappedRowsAt(line, termW):
+      result.add row
+
+proc viewportRows*(v: StreamingView): seq[string] =
+  viewportRowsAt(v, try: terminalWidth() except CatchableError: 80)
+
+proc bannerRowCountAt*(v: StreamingView; termW: int): int =
+  bannerWrapRows(v.commandIcon & " ", v.banner, termW).len
+
+proc bannerRowCount*(v: StreamingView): int =
+  bannerRowCountAt(v, try: terminalWidth() except CatchableError: 80)
+
+proc finalTranscriptRows*(banner: string; code: int; lines: openArray[string];
+                          idx: int; maxLines = StreamMaxLines): seq[string] =
+  var v = initStreamingView(maxLines, idx, banner)
+  v.exitCode = code
+  for line in lines:
+    v.buf.add line
+    inc v.total
+  v.viewportRows()
+
+proc addLine*(v: var StreamingView; line: string) =
+  inc v.total
+  v.buf.add line

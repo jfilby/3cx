@@ -1,0 +1,3559 @@
+## Multiline line editor.
+##
+## The editor stores the full input as a single ``string`` whose bytes may
+## include ``'\n'`` to mark logical line breaks. ``position`` is a byte
+## offset into that string. Cursor motion is implemented in two layers:
+##
+## * **Logical** — left/right step over runes (`'\n'` counts as one cell);
+##   home/end snap to the current logical line; word-left/right cross
+##   newlines.
+## * **Visual** — up/down move by one *visual* row (which may be the
+##   wrapped tail of a long logical line, or a previous logical line);
+##   the column is preserved as best-effort.
+##
+## After every keystroke the entire buffer is repainted in place. The
+## render walks the cursor back to the row where the prompt was first
+## drawn (we track the cursor's row offset from that anchor in
+## ``renderRow``), erases to end of screen, prints the prompt, the text
+## (wrapping at terminal width with the continuation prompt prefixed to
+## each logical line), and finally walks the cursor to the visual
+## position computed from the current ``position``.
+##
+## All terminal IO goes through the ``write``/``getCh`` procs passed to
+## ``readLineWith`` — the public ``readLine`` wires them to ``stdout`` /
+## ``getchr``. Tests drive the editor through the ``…With`` form against
+## an in-memory grid, no PTY required.
+
+import
+  critbits,
+  std/terminal,
+  unicode,
+  deques,
+  sequtils,
+  strutils,
+  tables,
+  std/exitprocs,
+  os,
+  times
+
+import signals
+import threecode/unicodewidth as ucwidth
+import threecode/syncoutput
+import threecode/clipboard
+
+# ShortcutNames is used by config.nim to validate [shortcuts] keys.
+# Keeping the dependency acyclic: minline imports nothing from config.
+const ShortcutNames* = [
+  "cancel",
+  "clear",
+  "quit-if-empty",
+  "home",
+  "end",
+  "left",
+  "right",
+  "word-left",
+  "word-right",
+  "up",
+  "down",
+  "history-previous",
+  "history-next",
+  "backspace",
+  "delete",
+  "insert",
+  "delete-word-left",
+  "delete-to-boundary-left",
+  "clear-screen",
+  "suspend",
+  "complete",
+  "reverse-complete",
+  "edit-in-editor",
+  "insert-newline",
+  "select-left",
+  "select-right",
+  "select-up",
+  "select-down",
+  "select-home",
+  "select-end",
+  "select-word-left",
+  "select-word-right",
+  "select-all",
+  "select-buffer-start",
+  "select-buffer-end",
+  "buffer-start",
+  "buffer-end",
+  "cut",
+  "copy",
+  "paste",
+  "yank",
+  "delete-word-right",
+  "delete-to-boundary-right",
+  "delete-to-eol",
+  "delete-to-bol",
+  "transpose-chars"
+]
+
+type KeySpec* = tuple[seqKey: string, times: int]
+  ## Parsed form of a single shortcut key token. `seqKey` is the internal
+  ## key name used by KEYMAP/KEYSEQS ("ctrl+c", "esc", "home", ...).
+  ## `times` is how many consecutive presses are required (1 for normal,
+  ## 2 for DoubleCtrlC / DoubleESC).
+
+when defined(posix):
+  import posix
+  import std/termios
+
+when defined(posix):
+  if isatty(stdin):
+    installResizeHandler()
+
+var terminalRestoreSuppressed* = false
+  ## Early-dispatch CLI children (sandbox / wall / stdio-relay / setup)
+  ## run with a redirected or piped stdout; the exit-proc terminal
+  ## restore would splice escape garbage into their output stream.
+
+proc restoreTerminal*() {.noconv.} =
+  ## Single point of terminal restore. Registered once as an exit proc
+  ## and called from signal handlers. Covers cursor visibility, color/style
+  ## reset, and bracketed-paste teardown.
+  if terminalRestoreSuppressed: return
+  try:
+    stdout.write "\x1b[?25h"   # show cursor
+    stdout.write "\x1b[0m"     # reset attributes (colors, bold, dim, etc.)
+    stdout.write "\x1b[?2004l" # disable bracketed paste
+    stdout.flushFile()
+  except CatchableError: discard
+
+if isatty(stdin):
+  addExitProc(restoreTerminal)
+
+# Holds one byte read ahead by `terminalHasPendingInput` that turned out
+# NOT to be an escape tail. `getchr` drains it before reading stdin, so the
+# peek never loses user input.
+var termPeeked*: int = -1
+
+# Generic push-back buffer, drained before termPeeked by every read path
+# below. `inputInterceptHook` uses it to replay bytes it consumed that
+# turned out not to be its own.
+var pushedBack*: Deque[int]
+
+# Opt-in byte interceptor (installed by terminaldbg when armed): sees each
+# byte before the editor, may consume bytes belonging to a terminal
+# response (a DSR reply to the probe), and must replay anything else via
+# `pushedBack`. Nil in production: zero cost.
+var inputInterceptHook*: proc(b: int): bool {.closure.}
+
+var pollStdinNowHook*: proc(): bool {.closure.}
+  ## Override for tests; nil means use real pollStdinNow().
+
+when defined(windows):
+  import winlean
+
+  proc putchr*(c: cint): cint {.discardable, header: "<conio.h>", importc: "_putch".}
+    ## Prints an ASCII character to stdout.
+  proc rawGetch(): cint {.header: "<conio.h>", importc: "_getch".}
+    ## Raw blocking key read; wrapped by `getchr` below.
+  proc kbhit(): cint {.header: "<conio.h>", importc: "_kbhit".}
+    ## Non-blocking "is a key waiting" probe; lets a bare ESC cancel
+    ## without `_getch` blocking on a second byte that never comes.
+
+  const STD_INPUT_HANDLE_ML = -10'i32
+
+  proc getConsoleMode(h: Handle; mode: ptr int32): int32 {.stdcall,
+      dynlib: "kernel32", importc: "GetConsoleMode".}
+  proc getNumberOfConsoleInputEvents(hConsoleInput: Handle;
+      lpcNumberOfEvents: ptr int32): int32 {.stdcall,
+      dynlib: "kernel32", importc: "GetNumberOfConsoleInputEvents".}
+  proc peekConsoleInputW(hConsoleInput: Handle; lpBuffer: pointer;
+      nLength: int32; lpNumberOfEventsRead: ptr int32): int32 {.stdcall,
+      dynlib: "kernel32", importc: "PeekConsoleInputW".}
+  proc readConsoleInputW(hConsoleInput: Handle; lpBuffer: pointer;
+      nLength: int32; lpNumberOfEventsRead: ptr int32): int32 {.stdcall,
+      dynlib: "kernel32", importc: "ReadConsoleInputW".}
+  proc waitForSingleObject(h: Handle; dwMilliseconds: int32): int32 {.
+      stdcall, dynlib: "kernel32", importc: "WaitForSingleObject".}
+
+  const
+    vtInputFlag = 0x0200'i32
+      ## ENABLE_VIRTUAL_TERMINAL_INPUT
+    keyEventRecord = 1'i32
+      ## INPUT_RECORD EventType for KEY_EVENT_RECORD. KEY_EVENT_RECORD
+      ## field offsets inside INPUT_RECORD (EventType@0, pad@2, union@4):
+      ## bKeyDown@4, wRepeatCount@8, wVirtualKeyCode@10, UnicodeChar@14,
+      ## dwControlKeyState@16. Same layout the color probe in util.nim
+      ## parses; verified against 64-bit ABI padding.
+    shiftPressed = 0x0010'i32
+    leftAltPressed = 0x0002'i32
+    rightAltPressed = 0x0001'i32
+    leftCtrlPressed = 0x0008'i32
+    rightCtrlPressed = 0x0004'i32
+    vkHome = 0x24'i32
+    vkEnd = 0x23'i32
+    vkPrior = 0x21'i32
+    vkNext = 0x22'i32
+    vkLeft = 0x25'i32
+    vkUp = 0x26'i32
+    vkRight = 0x27'i32
+    vkDown = 0x28'i32
+    vkInsert = 0x2D'i32
+    vkDelete = 0x2E'i32
+    vkEscape = 0x1B'i32
+
+  type ConsoleRecord = array[32, uint8]
+    ## One INPUT_RECORD, size-padded for direct field access.
+
+  proc recordKeyDown(rec: ptr ConsoleRecord): bool =
+    (int32(rec[4]) or (int32(rec[5]) shl 8) or (int32(rec[6]) shl 16) or
+        (int32(rec[7]) shl 24)) != 0
+
+  proc recordVk(rec: ptr ConsoleRecord): int32 =
+    int32(rec[10]) or (int32(rec[11]) shl 8)
+
+  proc recordChar(rec: ptr ConsoleRecord): int32 =
+    int32(rec[14]) or (int32(rec[15]) shl 8)
+
+  proc recordModifiers(rec: ptr ConsoleRecord): int32 =
+    int32(rec[16]) or (int32(rec[17]) shl 8) or (int32(rec[18]) shl 16) or
+        (int32(rec[19]) shl 24)
+
+  proc navSeq(vk: int32; mods: int32): seq[int] =
+    ## CSI translation for a charless navigation key, matching the
+    ## KEYSEQS grammar: `CSI 1;<mod><dir>` / `CSI <n>;<mod>~`, with the
+    ## `;1` omitted when no modifier is held.
+    let m = 1 +
+        (if (mods and shiftPressed) != 0: 1 else: 0) +
+        (if (mods and (leftAltPressed or rightAltPressed)) != 0: 2 else: 0) +
+        (if (mods and (leftCtrlPressed or rightCtrlPressed)) != 0: 4 else: 0)
+    if vk == vkEscape: return @[27]
+    var body: string
+    case vk
+    of vkUp: body = "A"
+    of vkDown: body = "B"
+    of vkRight: body = "C"
+    of vkLeft: body = "D"
+    of vkHome: body = "H"
+    of vkEnd: body = "F"
+    of vkInsert: body = "2~"
+    of vkDelete: body = "3~"
+    of vkPrior: body = "5~"
+    of vkNext: body = "6~"
+    else: return @[]
+    if m > 1:
+      if body.len == 1:
+        body = "1;" & $m & body      # CSI 1;<mod><letter>
+      else:
+        body = body[0 ..< ^1] & ';' & $m & body[^1 .. ^1]  # CSI n;<mod>~
+    result = @[27, '['.ord]
+    for ch in body: result.add ch.ord
+
+  var lastCtlDown: int32 = -1
+    ## Char of the most recent control-char key-DOWN whose key-UP has
+    ## not been seen yet. conhost under VT input delivers control chars
+    ## in three shapes - paired down+up (Enter), down-only (a CSI's ESC
+    ## passed through as char records), up-only (Ctrl-C, whose down is
+    ## consumed by conhost's ctrl-C handling) - so a byte is emitted on
+    ## the DOWN, and on an UP only when no matching DOWN preceded it.
+
+  proc recordVtBytes(rec: ptr ConsoleRecord): seq[int] =
+    ## One KEY_EVENT record translated to the VT byte grammar the
+    ## editor decodes. Printables ride their key-DOWN; control chars
+    ## follow `lastCtlDown`'s pairing rule; charless navigation keys
+    ## become CSI sequences with modifier params. Key-ups of
+    ## printables, modifier-only presses and non-key events carry no
+    ## bytes.
+    if int32(uint16(rec[0])) != keyEventRecord: return @[]
+    let ch = recordChar(rec)
+    let down = recordKeyDown(rec)
+    if ch != 0 and ch >= 32:
+      if not down: return @[]
+      let mods = recordModifiers(rec)
+      if (mods and (leftAltPressed or rightAltPressed)) != 0:
+        return @[27, ch.int]
+      if ch > 0x7F:
+        # Console chars are UTF-16; the editor decodes UTF-8.
+        result = @[]
+        for b in toUTF8(cast[Rune](ch)):
+          result.add b.ord
+        return result
+      return @[ch.int]
+    if ch != 0 and ch < 32:
+      if down:
+        lastCtlDown = ch
+        return @[ch.int]
+      if ch == lastCtlDown:
+        lastCtlDown = -1              # this up closes its down: already sent
+        return @[]
+      return @[ch.int]                # up without a down (conhost quirk)
+    if ch == 0 and down:
+      # Charless Ctrl+<letter>: some conhost builds deliver the control
+      # code only as the virtual key with Ctrl held (no UnicodeChar).
+      # Reconstruct it; `lastCtlDown` keeps a later char-carrying up
+      # from doubling the byte.
+      let vk = recordVk(rec)
+      let mods = recordModifiers(rec)
+      if vk >= 0x41 and vk <= 0x5A and
+          (mods and (leftCtrlPressed or rightCtrlPressed)) != 0 and
+          (mods and (leftAltPressed or rightAltPressed)) == 0:
+        lastCtlDown = vk - 0x41 + 1
+        return @[(vk - 0x41 + 1).int]
+    if ch != 0: return @[]            # printable on a key-up: already sent
+    navSeq(recordVk(rec), recordModifiers(rec))
+
+  var vtPending: Deque[int]
+    ## Translated console bytes not yet returned by `getchr`. Owned by
+    ## whichever thread drives the editor (the fat prompt's input thread
+    ## in the app); records are consumed in batches and the bytes handed
+    ## out one at a time, mirroring a POSIX read stream.
+
+  proc consoleVtInputOn(): bool =
+    var mode: int32 = 0
+    getConsoleMode(getStdHandle(STD_INPUT_HANDLE_ML), addr mode) != 0 and
+        (mode and vtInputFlag) != 0
+
+  proc consoleVtByteReady*(): bool =
+    ## Honest "would `getchr` return a byte right now" probe for the
+    ## VT-input console path: pending translated bytes, or a queued
+    ## key-down record that carries bytes. Charless records (key-ups,
+    ## modifier presses, focus/mouse events) do not count - `ReadFile`
+    ## under VT input wedges on exactly those as queue head, which is
+    ## why this reader never lets `ReadFile` see the queue at all.
+    ## Records are peeked one at a time: INPUT_RECORD is 20 bytes, so a
+    ## batched buffer needs the exact ABI stride to stay aligned.
+    if vtPending.len > 0: return true
+    var pending: int32 = 0
+    let h = getStdHandle(STD_INPUT_HANDLE_ML)
+    if h == 0 or getNumberOfConsoleInputEvents(h, addr pending) == 0 or
+        pending <= 0:
+      return false
+    for r in 0 ..< min(pending, 16):
+      var rec: ConsoleRecord
+      var got: int32 = 0
+      if peekConsoleInputW(h, addr rec[0], 1, addr got) == 0 or got == 0:
+        return false
+      if recordVtBytes(addr rec).len > 0: return true
+      discard readConsoleInputW(h, addr rec[0], 1, addr got)
+    false
+
+  proc consoleFillVt(timeoutMs: int32): bool =
+    ## Wait up to `timeoutMs` for console records (-1 = forever), consume
+    ## pending records with `ReadConsoleInputW` and translate them into
+    ## `vtPending`. True when at least one byte became available. Records
+    ## are consumed one per call: a batched read would need the exact
+    ## INPUT_RECORD ABI stride to stay aligned.
+    while vtPending.len == 0:
+      let h = getStdHandle(STD_INPUT_HANDLE_ML)
+      if h == 0: return false
+      discard waitForSingleObject(h, timeoutMs)
+      while vtPending.len == 0:
+        var queued: int32 = 0
+        if getNumberOfConsoleInputEvents(h, addr queued) == 0 or queued <= 0:
+          break  # ReadConsoleInputW blocks on an empty buffer
+        var rec: ConsoleRecord
+        var got: int32 = 0
+        if readConsoleInputW(h, addr rec[0], 1, addr got) == 0 or got == 0:
+          break
+        for b in recordVtBytes(addr rec):
+          vtPending.addLast b
+      if vtPending.len > 0: return true
+      if timeoutMs >= 0: return false
+    true
+
+  var stdinKindChecked = false
+  var stdinIsConsole = true
+    ## Whether stdin is a real console. `_kbhit`/`_getch` only work on a
+    ## console; on a pipe ("echo q | 3code.exe") `_kbhit` always returns
+    ## 0 and `_getch` blocks forever, so piped input could never be read
+    ## (and EOF never seen). Detect once and switch to the handle-based
+    ## path for pipes.
+
+  proc stdinConsole(): bool =
+    if not stdinKindChecked:
+      stdinKindChecked = true
+      let h = getStdHandle(STD_INPUT_HANDLE_ML)
+      var mode: int32 = 0
+      stdinIsConsole = h != 0 and getConsoleMode(h, addr mode) != 0
+    stdinIsConsole
+
+  proc pipeByteReady(): bool =
+    ## Non-blocking "is a byte waiting" probe for a piped stdin,
+    ## mirroring what `_kbhit` does for a console. PeekNamedPipe returns
+    ## the unread byte count without blocking.
+    var avail: int32 = 0
+    peekNamedPipe(getStdHandle(STD_INPUT_HANDLE_ML), nil, 0, nil,
+                  addr avail, nil) and avail > 0
+
+  proc getchr*(): cint =
+    ## Retrieves an ASCII character from stdin. Drains `termPeeked` first
+    ## (a byte stashed by `terminalHasPendingInput` that was not an escape
+    ## tail) so it is not lost; mirrors the POSIX branch's contract.
+    if termPeeked >= 0:
+      result = termPeeked.cint
+      termPeeked = -1
+      return result
+    if not stdinConsole():
+      # Piped stdin: read one byte straight off the handle. ReadFile
+      # blocks until a byte or EOF (write end closed -> returns 0),
+      # neither of which `_getch` can report on a pipe.
+      var ch: char
+      var got: int32 = 0
+      if readFile(getStdHandle(STD_INPUT_HANDLE_ML), addr ch, 1,
+                  addr got, nil) != 0 and got == 1:
+        return ch.ord.cint
+      return -1
+    # ENABLE_VIRTUAL_TERMINAL_INPUT is on (set by the fat prompt's input
+    # thread): read the console's key records with `ReadConsoleInputW`
+    # and translate them to the VT grammar in-process. `ReadFile` would
+    # translate too (and `_getch` strips modifiers on some consoles), but
+    # a `ReadFile` under VT input called while the record-queue head is
+    # charless (a key-up) wedges forever - later keys pile up behind it
+    # and never wake it - and any bytes it has already translated sit in
+    # a kernel-side buffer invisible to every readiness probe. Owning
+    # the record-to-byte step makes reads and probes agree and can never
+    # wedge: `ReadConsoleInputW` consumes records of every type.
+    if stdinConsole() and consoleVtInputOn():
+      if vtPending.len == 0 and not consoleFillVt(-1):
+        return -1.cint
+      return vtPending.popFirst().cint
+    rawGetch()
+else:
+  proc putchr*(c: cint) {.header: "stdio.h", importc: "putchar"} =
+    ## Prints an ASCII character to stdout.
+    stdout.write(c.chr)
+    stdout.flushFile()
+
+  proc getchr*(): cint =
+    ## Retrieves an ASCII character from stdin.
+    ##
+    ## Open-coded raw-mode read (rather than `terminal.getch`) for two
+    ## reasons: (1) we deliberately leave `c_oflag` alone so OPOST/ONLCR
+    ## stay on — the spinner and bar-tick threads emit bare ``\n``
+    ## expecting CRLF translation, and a SIGWINCH that interrupted
+    ## `terminal.getch`'s `readChar` would bypass its `tcSetAttr` restore
+    ## and leave OPOST permanently disabled, which manifests as the dim
+    ## prompt drifting right by the bar payload's width on every repaint
+    ## after a resize. (2) `try/finally` around the read guarantees the
+    ## original termios is restored on signal interruption.
+    ##
+    ## Drains `termPeeked` first: `terminalHasPendingInput` reads one byte
+    ## ahead to classify ESC tails, and a non-tail byte is stashed here so
+    ## it is returned to the caller rather than lost.
+    stdout.flushFile()
+    when defined(posix):
+      if termPeeked >= 0:
+        result = termPeeked.cint
+        termPeeked = -1
+        return result
+      let fd = getFileHandle(stdin)
+      var oldMode: Termios
+      if fd.tcGetAttr(addr oldMode) != 0:
+        return getch().ord.cint
+      var newMode = oldMode
+      newMode.c_iflag = newMode.c_iflag and not Cflag(BRKINT or ICRNL or
+        INPCK or ISTRIP or IXON)
+      newMode.c_cflag = (newMode.c_cflag and not Cflag(CSIZE or PARENB)) or CS8
+      newMode.c_lflag = newMode.c_lflag and not Cflag(ECHO or ICANON or
+        IEXTEN or ISIG)
+      newMode.c_cc[VMIN] = 1.char
+      newMode.c_cc[VTIME] = 0.char
+      if fd.tcSetAttr(TCSAFLUSH, addr newMode) != 0:
+        return getch().ord.cint
+      try:
+        var ch: char
+        if posix.read(fd.cint, addr ch, 1) == 1:
+          return ch.ord.cint
+        return -1
+      finally:
+        discard fd.tcSetAttr(TCSADRAIN, addr oldMode)
+    else:
+      return getch().ord.cint
+
+# Types
+
+type
+  Key* = int
+  KeySeq* = seq[Key]
+  KeyCallback* = proc(ed: var LineEditor) {.closure.}
+  SubmitCallback* = proc(ed: var LineEditor) {.closure.}
+  HasPendingInputProc* = proc(): bool {.closure.}
+  LineError* = ref Exception
+  LineEditorError* = ref Exception
+  LineEditorMode* = enum
+    mdInsert
+    mdReplace
+  Line* = object
+    text*: string
+    position*: int
+  LineHistory* = object
+    ## Two pieces of state, deliberately separate:
+    ##
+    ## * ``entries`` is the persistent, on-disk log. New submissions are
+    ##   appended (after dedup + skip-empty); the file mirrors it byte for
+    ##   byte at all times.
+    ## * The navigation view (``cursor``, ``drafts``, ``cursorPos``) is
+    ##   pure in-memory state for the current ``readLine`` call. ``cursor``
+    ##   is ``-1`` when the user is on their own draft, otherwise the
+    ##   index into ``entries`` they're viewing. Edits the user makes
+    ##   while parked on any view are stashed in ``drafts``/``cursorPos``
+    ##   so navigating Up then Down brings them back exactly where they
+    ##   left off (text + cursor). The view is wiped on submit.
+    file*: string
+    entries*: Deque[string]
+    max*: int
+    cursor*: int
+    drafts*: Table[int, string]
+    cursorPos*: Table[int, int]
+  WriteProc* = proc(s: string) {.closure.}
+  GetChProc* = proc(): int {.closure.}
+  WidthProc* = proc(): int {.closure.}
+  LineEditor* = object
+    completionCallback*: proc(ed: LineEditor): seq[string] {.closure.}
+    onMutate*: proc(ed: var LineEditor) {.closure.}
+    onSubmit*: SubmitCallback
+    onCancelDeferredSubmit*: proc(ed: var LineEditor) {.closure.}
+    preRedraw*: proc(ed: var LineEditor) {.closure.}
+    postRedraw*: proc(ed: var LineEditor) {.closure.}
+    preMutate*: proc(ed: var LineEditor) {.closure.}
+    postMutate*: proc(ed: var LineEditor) {.closure.}
+    painter*: proc(ed: var LineEditor) {.closure.}
+      ## When set, `fullRedraw` hands the repaint to this proc instead of
+      ## the standalone erase-and-repaint below. The fat prompt installs a
+      ## row-diffing painter here (same one every other volatile repaint
+      ## uses) so typing into a long wrapped prompt rewrites only the rows
+      ## that changed instead of blanking the whole editor block per
+      ## keystroke. It must honor `preRedraw`/`postRedraw` itself.
+    prevRowSpans*: seq[string]
+      ## The row spans this editor last painted. Set by every repaint
+      ## (standalone and wrapped alike); the diffing `painter` compares
+      ## against it so typing one character rewrites one row.
+    editInEditor*: proc(ed: var LineEditor) {.closure.}
+      ## Invoked on Alt+E / Ctrl+X Ctrl+E when set; the callback owns
+      ## terminal suspend/restore and buffer replacement.
+    redrawWrappedExternally*: bool
+    submitIcon*: string ## Icon written at end of text before submit newline (set before readLineWith).
+    renderSuffix*: string ## Transient suffix rendered after the buffer, not part of submitted text.
+    renderSuffixCursor*: bool ## Place caret after renderSuffix instead of inside editable text.
+    pendingCaret*: bool ## Hide native caret and show a drawn glyph (renderSuffix) as the caret.
+    prefillText*: string
+    history*: LineHistory
+    line*: Line
+    mode*: LineEditorMode
+    prompt*: string
+    contPrompt*: string
+    promptW*: int
+    contPromptW*: int
+    width*: int
+    renderRow*: int
+    write*: WriteProc
+    getCh*: GetChProc
+    hasPendingInput*: HasPendingInputProc
+    getWidth*: WidthProc
+    echoRows*: int
+    submitted*: bool
+    deferSubmit*: bool
+    canceled*: bool
+    eof*: bool
+    hidechars*: bool
+    maskWhen*: proc(text: string): bool {.closure.}
+      ## Optional per-keystroke secret detection for otherwise visible
+      ## reads (the wizard's multipurpose first field: provider name, url,
+      ## or key). Consulted by the redraw path on the live buffer: the
+      ## moment it answers true the line repaints masked, so at most the
+      ## pre-detection prefix is ever echoed. Nil on plain reads.
+    escPutback*: int           ## byte stashed by `handleEscape` when an Alt chord's letter has no KEYMAP binding; drained by the readLine loop so it prints as normal input after the cancel.
+    lastKeyName*: string      ## last dispatched key name (for double-press counting)
+    keyCount*: int            ## consecutive presses of lastKeyName (0 after a different key)
+    wizardMode*: bool         ## true while a modal provider wizard owns the editor; alters ctrl+c/ctrl+d/esc
+    complPrefix*: string       ## original prefix before first completion
+    complMatches*: seq[string] ## current match list
+    complIndex*: int           ## current match index (-1 = none)
+    selAnchor*: int            ## selection anchor byte offset; -1 = no selection
+    lastKill*: string          ## last cut/copied text, for yank
+    clipboardWrite*: proc(s: string) {.closure.}
+      ## Set by the host app: publishes `s` to the system clipboard
+      ## (OSC 52). Nil in tests and standalone use: cut/copy still
+      ## populate `lastKill` for yank, they just don't reach the OS.
+  InputCancelled* = object of CatchableError
+  WizardSwitched* = object of CatchableError
+    ## Raised by `readLineWith` when `getCh` returns the `wizardSentinel`
+    ## (-2). The input thread catches this at its outer loop and starts
+    ## a wizard `readLineWith` instead. Only the input thread can raise
+    ## and catch this — main-thread callers never see it.
+
+const
+  CTRL*        = {0 .. 31}
+  DIGIT*       = {48 .. 57}
+  LETTER*      = {65 .. 122}
+  UPPERLETTER* = {65 .. 90}
+  LOWERLETTER* = {97 .. 122}
+  PRINTABLE*   = {32 .. 126}
+  wizardSentinel* = -2
+    ## Returned by the input thread's `getCh` to signal that the
+    ## persistent `readLineWith` should yield to a modal wizard
+    ## `readLineWith`. `readLineWith` raises `WizardSwitched` when
+    ## it sees this; -1 keeps its existing EOFError meaning.
+when defined(windows):
+  const
+    ESCAPES* = {0, 22, 224, 27}
+else:
+  const
+    ESCAPES* = {27}
+
+const MaxBufferBytes* = 512 * 1024
+  ## Hard cap on the editor buffer. Generous by any human measure (8x the
+  ## @file inline cap; whole-file prompts pasted verbatim fit), yet the
+  ## bound is real: the per-keystroke repaint walks every visual row, so
+  ## an unbounded paste would grow the render model without limit. Inserts
+  ## that would cross the cap are cut at a rune boundary and belled.
+
+const EscapeTailPollMs* = 50
+  ## Wait long enough for terminal multi-byte escape tails that can be
+  ## split from the leading ESC by the terminal/PTY stack. Too short a
+  ## window misclassifies modified keys as bare Escape and leaves their
+  ## tail bytes to be printed as normal input. Combined with
+  ## `isEscapeTailByte` peeking, 50ms covers PTY/SSH burst delivery while
+  ## a bare ESC (user pressed Escape, then started typing) cancels
+  ## instantly: the peek rejects printable tail bytes.
+
+type HookRawFn = proc(ed: var LineEditor, env: pointer) {.nimcall.}
+
+template callHook*(hook, ed: untyped) =
+  ## Invoke a closure-typed editor hook, skipping the call when the hook
+  ## is nil. Written as a template (not an `if hook != nil: hook(ed)`)
+  ## because Nim 2.2.10's `{.closure.}` codegen for that exact pattern
+  ## tests only the env field and assumes the fn field is non-zero when
+  ## env is non-zero; a torn write (one word nil, the other the prior
+  ## value) makes that assumption false and the subsequent call jumps to
+  ## nil. The template casts the closure's first word to a plain
+  ## `{.nimcall.}` proc pointer, tests it, and calls through it; the
+  ## plain-proc calling convention is what the underlying thunk expects
+  ## on x86-64 (args in rdi, rsi), so the call lands in the right place.
+  ## `readLineWith` deliberately does not nil its hook fields on exit
+  ## (see the defer there) so the next readLineWith can overwrite them
+  ## without a window where a concurrent fullRedraw in the other thread
+  ## would observe nil and SIGSEGV through this template's call site.
+  let rawArr = cast[ptr UncheckedArray[pointer]](unsafeAddr hook)
+  let fnWord = rawArr[0]
+  if fnWord != nil:
+    let fn = cast[HookRawFn](fnWord)
+    let env = rawArr[1]
+    fn(ed, env)
+
+proc isEscapeTailByte*(b: int): bool =
+  ## True when `b` can validly be the second byte of a terminal escape
+  ## sequence (the byte immediately following a leading ESC). This
+  ## includes Alt+<key> chords, which terminals send as ``ESC <byte>``
+  ## bursts: a printable letter is a valid tail because it is the letter
+  ## half of an Alt chord (e.g. Alt+F = ``ESC f``). A bare Escape (user
+  ## pressed Escape, then started typing) has no tail byte within the
+  ## ``EscapeTailPollMs`` poll window, so it cancels before we ever peek.
+  ##
+  ## CSI (ESC [), SS3 (ESC O), Alt+Enter (ESC CR), and the digit/~
+  ## continuations used by xterm/kitty function keys are the other tails.
+  ## ``handleEscape`` decides what to do with an Alt chord whose letter
+  ## has no KEYMAP binding: it cancels like a bare Escape and puts the
+  ## letter back so it is not swallowed.
+  b == 13 or b == 8 or (b >= 32 and b <= 126)
+
+# ---------- Pure helpers (testable without IO) ----------
+
+proc visualCols*(s: string): int =
+  ## Number of cells `s` would occupy when printed. Skips ANSI CSI
+  ## sequences `ESC [ ... <final>` so escape codes embedded in a
+  ## colored prompt don't inflate the count. Wide CJK / emoji count as
+  ## two cells; combining marks as zero.
+  var i = 0
+  while i < s.len:
+    let b = s[i]
+    if b == '\x1b' and i + 1 < s.len and s[i + 1] == '[':
+      var j = i + 2
+      while j < s.len and (s[j] in {'0'..'9'} or s[j] == ';' or s[j] == '?'):
+        inc j
+      if j < s.len: inc j  # consume final byte
+      i = j
+    else:
+      let rl = max(1, runeLenAt(s, i))
+      inc result, runeCellWidth(s.runeAt(i))
+      i += rl
+
+proc runeStartBefore(text: string, p: int): int =
+  ## Returns the byte offset of the rune that ends at `p` (i.e. position
+  ## one rune to the left of `p`).
+  if p <= 0: return 0
+  var q = p - 1
+  while q > 0 and (byte(text[q]) and 0xC0'u8) == 0x80'u8:
+    dec q
+  q
+
+proc runeLenSafe(text: string, i: int): int =
+  if i >= text.len: return 0
+  let n = runeLenAt(text, i)
+  if n <= 0: 1 else: n
+
+proc expectedSeqLen(lead: int): int =
+  if lead < 0x80: 0
+  elif lead < 0xC2: 0
+  elif lead < 0xE0: 2
+  elif lead < 0xF0: 3
+  elif lead < 0xF8: 4
+  else: 0
+
+type LineSpan* = tuple[start, stop: int]
+
+proc promptWrap*(promptW, width: int): tuple[head, firstCol: int] =
+  ## Physical layout of a prompt that may be wider than the terminal
+  ## row. The prompt is written verbatim (color escapes and all), so a
+  ## terminal wider-than-row prompt hard-wraps over `head` full rows and
+  ## the buffer text continues at `firstCol` on the next one. Those
+  ## fragment rows are real painted rows the editor must erase on every
+  ## repaint; a prompt narrower than the width owns no rows of its own.
+  if width <= 0 or promptW < width:
+    (0, promptW)
+  else:
+    (promptW div width, promptW mod width)
+
+proc lineSpans*(text: string; promptW, contW, width: int): seq[LineSpan] =
+  ## Visual line byte spans under greedy word-wrap: break at whitespace when
+  ## possible, char-wrap words longer than the width. ``stop`` excludes the
+  ## trailing break spaces and the terminating newline; the renderer re-adds
+  ## the newline/continuation. ``\n`` always starts a new span.
+  let head = promptWrap(promptW, width).head
+  for _ in 0 ..< head:
+    result.add (0, 0)
+  result.add (0, 0)
+  if width <= 0:
+    result[0].stop = text.len
+    return
+  var col = promptWrap(promptW, width).firstCol
+  var i = 0
+  var lastBreak = -1   # byte offset of the last space available as a break
+  var contentEnd = 0   # byte offset just past the last non-space on this line
+  var lineEnd = 0      # contentEnd at the last space boundary (for word-wrap)
+  while i < text.len:
+    let rl = runeLenSafe(text, i)
+    if text[i] == '\n':
+      result[result.high].stop = contentEnd
+      result.add (i + rl, i + rl)
+      col = contW
+      lastBreak = -1
+      contentEnd = i + rl
+      i += rl
+      continue
+    let rw = runeCellWidth(text.runeAt(i))
+    if col + rw > width:
+      if text[i] == ' ':
+        # A space that overflows is itself the break, and only that one
+        # space collapses into it. The rest of the run is typed content:
+        # it renders on the next row (via the caret slice while trailing,
+        # via the span once text follows) and the caret steps over it,
+        # instead of every trailing space vanishing into the wrap.
+        result[result.high].stop = contentEnd
+        let s = i + runeLenSafe(text, i)
+        result.add (s, s)
+        i = s
+        col = contW
+        lastBreak = -1
+        contentEnd = s
+        continue
+      if lastBreak >= 0 and lastBreak < i:
+        # Word-wrap: the line ends at the last non-space content; the next
+        # line starts after the space run beginning at lastBreak.
+        result[result.high].stop = lineEnd
+        var s = lastBreak
+        while s < text.len and text[s] == ' ':
+          s += runeLenSafe(text, s)
+        result.add (s, s)
+        i = s
+        col = contW
+        lastBreak = -1
+        contentEnd = s
+        continue
+      # Char-wrap an over-long word.
+      result[result.high].stop = contentEnd
+      result.add (i, i)
+      col = contW
+      lastBreak = -1
+      contentEnd = i
+      if contW + rw > width:
+        # The rune overflows even alone on a continuation row (terminal
+        # narrower than the continuation prompt plus the rune): keep it
+        # on this row and let the column run past the margin. Without
+        # consuming it the walk re-tests the same byte forever.
+        contentEnd = min(i + rl, text.len)
+        inc col, rw
+        i += rl
+      continue
+    if text[i] == ' ':
+      lastBreak = i
+      lineEnd = contentEnd
+    else:
+      # Clamped: a truncated final rune (invalid UTF-8 at end of buffer,
+      # raw paste bytes) claims more bytes than exist, and an unclamped
+      # span stop would send every renderer's slice past text.len.
+      contentEnd = min(i + rl, text.len)
+    inc col, rw
+    i += rl
+  result[result.high].stop = contentEnd
+
+proc cursorVisual*(text: string, position, promptW, contW, width: int): (int, int) =
+  ## (visualRow, visualCol) of the cursor when ``text[0 ..< position]``
+  ## has been rendered into a ``width``-wide grid with ``promptW`` cells
+  ## reserved before the first logical line and ``contW`` cells reserved
+  ## before each subsequent logical line. Rows are physical: a prompt
+  ## wider than the row contributes its wrapped fragment rows too, and
+  ## the first content row starts at the wrapped prompt's tail column
+  ## instead of ``promptW``.
+  if width <= 0: return (0, 0)
+  let p = min(max(position, 0), text.len)
+  var row = 0
+  let allSpans = lineSpans(text, promptW, contW, width)
+  let head = promptWrap(promptW, width).head
+  let firstCol = promptWrap(promptW, width).firstCol
+  for si, sp in allSpans:
+    if si < head:
+      # Wrapped prompt fragment rows hold no buffer text.
+      inc row
+      continue
+    if p <= sp.start and not (si == head and p == 0):
+      # Cursor sits in the gap between spans (on a break or newline); it
+      # belongs at the start of this span.
+      return (row, if si == head: firstCol else: contW)
+    if p <= sp.stop:
+      var col = if si == head: firstCol else: contW
+      var i = sp.start
+      while i < p:
+        inc col, runeCellWidth(text.runeAt(i))
+        i += runeLenSafe(text, i)
+      return (row, col)
+    # p is past sp.stop — check if it's in trailing spaces of this span
+    # before the next span starts (or past the end of text). Trailing
+    # spaces are excluded from rendered spans; walk every character from
+    # span start through p so the cursor column accounts for unrendered
+    # characters (e.g. a trailing space the user just typed).
+    if si + 1 >= allSpans.len or p < allSpans[si + 1].start:
+      var col = if si == head: firstCol else: contW
+      var i = sp.start
+      while i < p:
+        inc col, runeCellWidth(text.runeAt(i))
+        i += runeLenSafe(text, i)
+      return (row, col)
+    inc row
+  let lastRow = max(0, row - 1)
+  (lastRow, if lastRow == head: firstCol else: contW)
+
+proc drawnCaretVisual*(text: string; caretAt, promptW, contW,
+                        width: int): (int, int) =
+  ## Visual position of the DRAWN caret for a caret offset into ``text``.
+  ## ``cursorVisual`` reports the margin itself (column == width, the
+  ## cell a terminal's physical cursor parks on in deferred wrap); the
+  ## drawn caret instead belongs one row down, at the next row's first
+  ## content column, so the char that filled the last cell prints
+  ## normally and the caret indicates where the next one will land.
+  ## Callers that only place the physical cursor keep ``cursorVisual``.
+  let (r, c) = cursorVisual(text, caretAt, promptW, contW, width)
+  if width > 0 and c >= width:
+    (r + 1, contW)
+  else:
+    (r, c)
+
+proc totalRows*(text: string, promptW, contW, width: int): int =
+  ## Number of visual rows the rendered buffer occupies, always ``>= 1``.
+  ## Content rows only: the transient caret row a margin caret adds (see
+  ## ``drawnCaretVisual``) is live editor chrome, not buffer geometry.
+  if width <= 0: return 1
+  lineSpans(text, promptW, contW, width).len
+
+var CaretCellFg* = "\x1b[38;5;252m"
+  ## Foreground the drawn caret cell paints in: the mode-resolved
+  ## white-family tone (the `OffWhiteFg` tier). Without it the reversed
+  ## cell takes the terminal's default foreground, so the caret's color
+  ## is the terminal theme's, not ours (Windows Terminal's Campbell
+  ## default fg #CCCCCC reads dark grey next to our 252 off-white).
+  ## The app re-resolves this next to `applyPalette` at startup.
+
+const CaretCellOff* = "\x1b[27m\x1b[39m"  ## reverse off, fg back to default
+
+template CaretCellOn*: string = CaretCellFg & "\x1b[7m"
+  ## Foreground + reverse video on: the drawn caret cell. The editor row
+  ## around it is always unstyled, so `CaretCellOff` restoring the DEFAULT
+  ## foreground (not some saved one) keeps the row's remaining bytes plain.
+
+const SelCellOn* = "\x1b[7m"
+  ## Selection cells: plain reverse video. Unlike the caret this is not a
+  ## palette-resolved fg, so a selection reads as the terminal's own
+  ## highlight color, the same cue every other selection on the screen
+  ## (scrollback, browser) uses.
+const SelCellOff* = "\x1b[27m"
+
+proc selSliceBytes*(text: string; sp: LineSpan; selStart, selStop: int): string =
+  ## The span's slice with the byte range ``[selStart, selStop)`` reversed
+  ## for selection highlight. The range is clamped to the span; a range that
+  ## does not intersect renders the plain slice. Wide runes are kept whole:
+  ## the boundary walk extends a partial rune to its full width so a
+  ## selection never paints half a CJK cell.
+  if selStop <= sp.start or selStart >= sp.stop or selStart == selStop:
+    return text[sp.start ..< sp.stop]
+  var a = max(selStart, sp.start)
+  var b = min(selStop, sp.stop)
+  # Keep whole runes at both boundaries.
+  while a > sp.start and a < text.len and (byte(text[a]) and 0xC0'u8) == 0x80'u8:
+    dec a
+  while b < sp.stop and b < text.len and (byte(text[b]) and 0xC0'u8) == 0x80'u8:
+    inc b
+  result = ""
+  if a > sp.start:
+    result.add text[sp.start ..< a]
+  result.add SelCellOn
+  result.add text[a ..< b]
+  result.add SelCellOff
+  if b < sp.stop:
+    result.add text[b ..< sp.stop]
+
+proc caretSliceBytes*(text: string; sp: LineSpan; caretAt: int;
+                       width: int): string =
+  ## The span's slice ``text[sp.start ..< sp.stop]`` with the drawn caret
+  ## embedded: the rune at the caret reversed, the row's first rune when
+  ## the caret sits at or before its start (line break / wrap gap), or a
+  ## reverse space appended past the content (end of text, trailing break
+  ## spaces). ``width`` the row width; ``width <= 0`` means single row,
+  ## never wrap. A caret at the right margin never reaches this proc as
+  ## an appended cell: ``drawnCaretVisual`` routes it to the row below, so
+  ## the appended reverse space only ever lands where it fits. Shared by
+  ## the span model and the full-repaint renderer so the two can never
+  ## disagree about where the caret draws.
+  if caretAt >= sp.stop:
+    # The break-spaces between sp.stop and the caret are invisible cells
+    # the caret still steps over: cursorVisual counts them, so the paint
+    # must too or the drawn caret freezes in place while the user types
+    # spaces (the caret only caught up on the next non-space).
+    return text[sp.start ..< caretAt] & CaretCellOn & " " & CaretCellOff
+  if caretAt <= sp.start:
+    # The drawn caret can belong to a row whose span does not contain
+    # its byte: deferred wrap moves it one row down past a break-space
+    # gap, and that row's span may be empty or start past the caret.
+    # Reverse the span's first rune, or a lone caret cell when the span
+    # holds no whole rune; every slice must stay well formed either way
+    # (a stop below start is a RangeDefect, not an empty string).
+    let rl = min(runeLenSafe(text, sp.start), sp.stop - sp.start)
+    if rl <= 0:
+      return CaretCellOn & " " & CaretCellOff
+    return CaretCellOn & text[sp.start ..< sp.start + rl] & CaretCellOff &
+      text[sp.start + rl ..< sp.stop]
+  let rl = min(runeLenSafe(text, caretAt), sp.stop - caretAt)
+  return text[sp.start ..< caretAt] & CaretCellOn &
+    text[caretAt ..< caretAt + rl] & CaretCellOff &
+    text[caretAt + rl ..< sp.stop]
+
+proc rowSliceBytes*(text: string; sp: LineSpan; caretAt: int;
+                    selA, selB: int; width: int): string =
+  ## The span's slice with BOTH the selection highlight and the drawn
+  ## caret applied. The caret is a single cell (its own palette fg plus
+  ## reverse); the selection is plain reverse. A caret inside a selection
+  ## still reads as the caret: its cell re-emits the caret style. This is
+  ## the one slice builder the renderers use, so the span model and the
+  ## full-repaint bytes can never disagree about either highlight.
+  if caretAt < 0:
+    if selA >= 0:
+      return selSliceBytes(text, sp, selA, selB)
+    return text[sp.start ..< sp.stop]
+  if selA < 0:
+    return caretSliceBytes(text, sp, caretAt, width)
+  # Both highlights land in this span. The caret cell keeps its own style;
+  # the selection reverses everything else in [selA, selB).
+  if caretAt >= sp.stop:
+    # Caret past the content: selection styles the slice, the caret
+    # cell (and any break spaces it steps over) follow.
+    result = selSliceBytes(text, sp, selA, selB)
+    if caretAt > sp.stop:
+      result.add text[sp.stop ..< caretAt]
+    result.add CaretCellOn & " " & CaretCellOff
+    return result
+  # Caret at or inside the span: find the caret cell's byte range.
+  var caretStart = caretAt
+  var caretStop = caretAt
+  if caretAt <= sp.start:
+    caretStart = sp.start
+    let rl = min(runeLenSafe(text, sp.start), sp.stop - sp.start)
+    caretStop = sp.start + max(1, rl)
+  else:
+    let rl = min(runeLenSafe(text, caretAt), sp.stop - caretAt)
+    caretStop = caretAt + max(1, rl)
+  result = ""
+  if caretStart > sp.start:
+    result.add selSliceBytes(text, (sp.start, caretStart), selA, selB)
+  result.add CaretCellOn
+  if caretStop > caretStart and caretStop <= min(sp.stop, text.len):
+    result.add text[caretStart ..< caretStop]
+  else:
+    result.add " "
+  result.add CaretCellOff
+  if sp.stop > caretStop:
+    result.add selSliceBytes(text, (caretStop, sp.stop), selA, selB)
+
+proc caretRowOf*(text: string; caretAt: int; promptW, contW,
+                 width: int): int =
+  ## The visual row the drawn caret belongs on, or -1 for none. ``caretAt``
+  ## is a byte offset into ``text`` itself (pass the combined render text
+  ## when the suffix can carry the caret). A caret at the right margin
+  ## belongs one row below the cell that filled it (``drawnCaretVisual``),
+  ## which may be past the last content row: the renderer appends the
+  ## caret-only row ``renderRowSpans``/``renderBuffer`` emit.
+  if caretAt < 0: return -1
+  drawnCaretVisual(text, caretAt, promptW, contW, width)[0]
+
+proc caretByteOffset*(ed: LineEditor): int =
+  ## Byte offset of the caret within the combined render text
+  ## (``line.text & renderSuffix``), or -1 when no drawn caret applies.
+  ## The deferred-submit state is exempt: its suffix marker glyph is the
+  ## caret, and a second drawn cell would double the caret. Standalone
+  ## callers (no installed painter) keep the physical-cursor contract:
+  ## only the interactive app hides the cursor and draws the cell.
+  if ed.pendingCaret or ed.painter == nil: return -1
+  let combined = ed.line.text & ed.renderSuffix
+  if ed.renderSuffixCursor: combined.len
+  else: min(max(ed.line.position, 0), ed.line.text.len)
+
+proc selRange*(ed: LineEditor): tuple[a, b: int] =
+  ## The selection's ordered byte range, or (-1, -1) when none. The
+  ## anchor is one end; the cursor (`line.position`) is the other.
+  if ed.selAnchor < 0: return (-1, -1)
+  let a = ed.selAnchor
+  let b = ed.line.position
+  (min(a, b), max(a, b))
+
+proc hasSelection*(ed: LineEditor): bool =
+  ed.selAnchor >= 0 and ed.selAnchor != ed.line.position
+
+proc renderRowSpans*(ed: var LineEditor): seq[string] =
+  ## The editor's painted cell content per visual row, top-down (no cursor
+  ## controls). Both the full repaint and the diff painter use it, so the
+  ## two can never drift. Index 0 is the editor's top row. The caret is a
+  ## drawn reverse-video cell on its row; the physical terminal cursor
+  ## stays hidden for the whole session, so a repaint can never flicker it.
+  if ed.getWidth != nil:
+    let w = ed.getWidth()
+    if w > 0:
+      ed.width = w
+  let width = max(2, ed.width)
+  let pw = if ed.promptW > 0: ed.promptW else: visualCols(ed.prompt)
+  let cw = if ed.contPromptW > 0: ed.contPromptW else: visualCols(ed.contPrompt)
+  ed.promptW = pw
+  ed.contPromptW = cw
+  result = @[]
+  let combined = ed.line.text & ed.renderSuffix
+  let caretAt = ed.caretByteOffset()
+  # Same (text, position) pair the physical-cursor positioning derives:
+  # the suffix carries the caret only when renderSuffixCursor says so.
+  let caretRow = caretRowOf(
+    if ed.renderSuffixCursor: combined else: ed.line.text,
+    caretAt, pw, cw, width)
+  let (selA, selB) = ed.selRange()
+  let head = promptWrap(pw, width).head
+  for _ in 0 ..< head:
+    result.add ""          # prompt fragment row: cells the terminal wrapped
+  for li, sp in lineSpans(combined, pw, cw, width):
+    if li < head:
+      continue             # fragment rows emitted above
+    let prefix = if li == head: ed.prompt else: ed.contPrompt
+    let rowCaret = if li == caretRow: caretAt else: -1
+    result.add prefix & rowSliceBytes(combined, sp, rowCaret, selA, selB,
+      width)
+  if caretRow == result.len and caretAt >= 0:
+    # The caret sits at the right margin past every content row: it gets
+    # a row of its own below the content (continuation prompt + caret
+    # cell, no buffer text). This is not a line break: nothing wraps
+    # onto the row until a typed char actually lands there, which is the
+    # row's first content cell, exactly where the caret waits.
+    result.add ed.contPrompt & caretSliceBytes(combined,
+      (caretAt, caretAt), caretAt, width)
+
+proc renderBuffer*(text, prompt, cont: string, width: int,
+                    caretAt = -1, sel: tuple[a, b: int] = (-1, -1)): string =
+  ## Bytes that paint the buffer. Visual rows are joined with ``"\r\n"``
+  ## and no trailing newline is emitted. The prompt is written verbatim
+  ## (so callers can include color escapes); its display width is taken
+  ## via ``visualCols``. Same for the continuation prompt. ``caretAt >= 0``
+  ## draws the caret cell into its row (see ``caretSliceBytes``); the
+  ## offset indexes ``text`` itself.
+  let promptW = visualCols(prompt)
+  let contW = visualCols(cont)
+  if width <= 0:
+    return prompt & (if caretAt >= 0:
+      caretSliceBytes(text, (start: 0, stop: text.len), caretAt, 0)
+      else: text)
+  var rowCount = 0
+  let caretRow = caretRowOf(text, caretAt, promptW, contW, width)
+  let head = promptWrap(promptW, width).head
+  result = prompt
+  for li, sp in lineSpans(text, promptW, contW, width):
+    inc rowCount
+    if li > head:
+      result.add "\r\n" & cont
+    elif li > 0:
+      # The wrapped prompt's last fragment shares a row with the first
+      # content span; the terminal cursor is already at that column.
+      discard
+    let rowCaret = if li == caretRow: caretAt else: -1
+    result.add rowSliceBytes(text, sp, rowCaret, sel.a, sel.b, width)
+  if caretRow == rowCount and caretAt >= 0:
+    # Margin caret past every content row: the caret-only row below the
+    # content (see renderRowSpans).
+    result.add "\r\n" & cont &
+      caretSliceBytes(text, (caretAt, caretAt), caretAt, width)
+
+# History
+#
+# Two responsibilities, kept separate:
+#
+# 1. Persistence — `entries` is the on-disk log. `historyAdd` is the only
+#    mutator: it skips empty submissions, dedupes against the previous
+#    entry, evicts the oldest when at capacity, and rewrites the file.
+# 2. Navigation — Up/Down walk a view over `entries` plus a virtual
+#    "draft" slot at index -1 that holds the in-progress text the user
+#    had typed before they started navigating. The view is `cursor` plus
+#    the `drafts`/`cursorPos` tables. Both tables are keyed by the same
+#    int as `cursor`, so -1 reaches the user's own draft and 0..N-1 reach
+#    in-memory edits to history entries. Submit clears the view.
+
+proc encodeHistEntry(s: string): string =
+  ## Encode an entry for the on-disk history file: ``\`` -> ``\\``,
+  ## newline -> ``\n``. Keeps each entry on a single physical line so
+  ## the file stays human-readable (`cat ~/.local/share/.../history`).
+  result = newStringOfCap(s.len + 8)
+  for ch in s:
+    case ch
+    of '\\': result.add "\\\\"
+    of '\n': result.add "\\n"
+    of '\r': discard
+    else: result.add ch
+
+proc decodeHistEntry(s: string): string =
+  result = newStringOfCap(s.len)
+  var i = 0
+  while i < s.len:
+    if s[i] == '\\' and i + 1 < s.len:
+      case s[i + 1]
+      of '\\': result.add '\\'; i += 2
+      of 'n': result.add '\n'; i += 2
+      else: result.add s[i]; inc i
+    else:
+      result.add s[i]; inc i
+
+proc clearNav(h: var LineHistory) =
+  h.cursor = -1
+  h.drafts.clear()
+  h.cursorPos.clear()
+
+proc persist(h: LineHistory) =
+  if h.file == "": return
+  let dir = parentDir(h.file)
+  if dir.len > 0:
+    createDir(dir)
+  let encoded = toSeq(h.entries.items).mapIt(encodeHistEntry(it)).join("\n")
+  h.file.writeFile(encoded)
+
+proc historyInit*(size = 256, file: string = ""): LineHistory =
+  result.file = file
+  result.entries = initDeque[string](size)
+  result.max = size
+  result.cursor = -1
+  result.drafts = initTable[int, string]()
+  result.cursorPos = initTable[int, int]()
+  if file == "": return
+  if result.file.fileExists:
+    let lines = result.file.readFile.split("\n")
+    for line in lines:
+      if line == "": continue
+      let entry = decodeHistEntry(line)
+      # On load, drop consecutive duplicates so a previously-buggy file
+      # converges to a clean state on first run.
+      if result.entries.len > 0 and result.entries[result.entries.len - 1] == entry:
+        continue
+      if result.entries.len >= result.max:
+        discard result.entries.popFirst
+      result.entries.addLast entry
+  else:
+    result.file.writeFile("")
+    when defined(posix):
+      # chmod 0600 — history holds every typed prompt, pasted secrets included.
+      discard posix.chmod(result.file.cstring, 0o600)
+
+proc historyAdd*(ed: var LineEditor) =
+  ## Append the just-submitted line to the persistent log. Empty
+  ## submissions and consecutive duplicates are dropped — they're noise
+  ## when scrolling back. Writes the file atomically each time.
+  let s = ed.line.text
+  if s == "": return
+  let h = addr ed.history
+  if h[].entries.len > 0 and h[].entries[h[].entries.len - 1] == s:
+    return
+  while h[].entries.len >= h[].max:
+    discard h[].entries.popFirst
+  h[].entries.addLast s
+  persist(h[])
+
+proc historyFlush*(ed: var LineEditor) =
+  ## Reset the navigation view. Called once per submitted line so the
+  ## next ``readLine`` starts fresh on the user's draft slot.
+  ed.history.clearNav()
+
+proc historyResetNav*(ed: var LineEditor) =
+  ## Drop the navigation view without a submit. Modal (wizard) readers
+  ## call this up front: they run on the main prompt's editor and would
+  ## otherwise see the prompt's history entries on Up/Down.
+  ed.history.clearNav()
+
+proc historyRemove*(ed: var LineEditor, s: string) =
+  ## Remove the most recent matching entry from the persistent log.
+  ## Used to pull a secret (an api key pasted into a command line) back
+  ## out of the history file after the fact.
+  if s == "": return
+  let h = addr ed.history
+  for i in countdown(h[].entries.len - 1, 0):
+    if h[].entries[i] == s:
+      var kept = initDeque[string](h[].max)
+      for j, e in h[].entries:
+        if j != i: kept.addLast e
+      h[].entries = kept
+      persist(h[])
+      return
+
+# ---------- Render ----------
+
+proc emitMoveDown(ed: var LineEditor, n: int) =
+  if n <= 0: return
+  ed.write "\x1b[" & $n & "B"
+
+proc redrawBytes*(ed: var LineEditor; synchronized = true): string =
+  ## Build a full editor repaint and update ``ed.renderRow`` to the
+  ## cursor's new visual row. Callers that share a render lock with
+  ## other terminal chrome can embed these bytes in a larger atomic
+  ## frame; ``fullRedraw`` is the ordinary standalone writer.
+  var resized = false
+  if ed.getWidth != nil:
+    let w = ed.getWidth()
+    if w > 0:
+      resized = w != ed.width
+      ed.width = w
+  let width = max(2, ed.width)
+  let pw = if ed.promptW > 0: ed.promptW else: visualCols(ed.prompt)
+  let cw = if ed.contPromptW > 0: ed.contPromptW else: visualCols(ed.contPrompt)
+  ed.promptW = pw
+  ed.contPromptW = cw
+  # Hidden reads, and visible reads whose `maskWhen` flags the buffer as
+  # a secret, draw one `*` per buffer byte — the same stand-in the
+  # incremental echo writes — so a repaint (backspace, arrow, resize, the
+  # mask flipping on mid-line) can never spell the cleartext onto the
+  # screen. Byte-for-byte length match keeps every caret/selection offset
+  # valid against the masked stand-in.
+  let renderedText =
+    if ed.hidechars or (ed.maskWhen != nil and ed.maskWhen(ed.line.text)):
+      repeat('*', ed.line.text.len) & ed.renderSuffix
+    else:
+      ed.line.text & ed.renderSuffix
+  let total = totalRows(renderedText, pw, cw, width)
+  let cursorText =
+    if ed.renderSuffixCursor: renderedText
+    else: ed.line.text
+  let cursorPos =
+    if ed.renderSuffixCursor: renderedText.len
+    else: ed.line.position
+  let caretAt = ed.caretByteOffset()
+  # The drawn caret (installed painter) rests where its cell was painted,
+  # one row past the content when the caret sits at the right margin; the
+  # standalone physical-cursor contract keeps `cursorVisual` (margin col
+  # clamps at the terminal into deferred wrap, classic readline parking).
+  let (targetRow, targetCol) =
+    if caretAt >= 0: drawnCaretVisual(cursorText, caretAt, pw, cw, width)
+    else: cursorVisual(cursorText, cursorPos, pw, cw, width)
+  var buf = ""
+  if synchronized:
+    buf.add syncoutput.SyncBegin()
+  var walkUp = ed.renderRow
+  if resized:
+    # A width change reflows the already-painted editor rows (on terminals
+    # that reflow; others freeze them), so the tracked `renderRow` and the
+    # fresh `targetRow` are two different guesses at the caret's distance
+    # from the block top. Walk the taller of the two: it always reaches
+    # the block top or higher, never landing mid-block (which left stale
+    # rows above the live entry line). The old `+ 1` here over-walked
+    # even when both counts agreed, blanking the committed row above the
+    # prompt on every width change.
+    walkUp = max(ed.renderRow, targetRow)
+  if walkUp > 0:
+    buf.add "\x1b[" & $walkUp & "A"
+  buf.add "\r\x1b[J"
+  buf.add renderBuffer(renderedText, ed.prompt, ed.contPrompt, width,
+    caretAt, ed.selRange())
+  if total - 1 > targetRow:
+    buf.add "\x1b[" & $(total - 1 - targetRow) & "A"
+  elif targetRow > total - 1:
+    # The caret waits on its own row below the content: claim it (the
+    # leading `\r` disarms a pending wrap on a full-width content row)
+    # so the physical cursor rests where `renderRow` says it does.
+    buf.add "\r"
+    for _ in 0 ..< targetRow - (total - 1):
+      buf.add "\n"
+  buf.add "\r"
+  if targetCol > 0:
+    buf.add "\x1b[" & $targetCol & "C"
+  if synchronized:
+    buf.add syncoutput.SyncEnd()
+  ed.renderRow = targetRow
+  result = buf
+
+proc renderedRows*(ed: LineEditor): int =
+  ## Visual rows currently owned by the editor, including any transient
+  ## suffix such as the buffered-submit hourglass, and the caret-only
+  ## row a margin caret currently occupies (it is painted chrome the
+  ## walk-up geometry must erase like any other editor row).
+  let width = max(2, ed.width)
+  let pw = if ed.promptW > 0: ed.promptW else: visualCols(ed.prompt)
+  let cw = if ed.contPromptW > 0: ed.contPromptW else: visualCols(ed.contPrompt)
+  let combined = ed.line.text & ed.renderSuffix
+  result = totalRows(combined, pw, cw, width)
+  let caretAt = ed.caretByteOffset()
+  if caretAt >= 0:
+    result = max(result, caretRowOf(combined, caretAt, pw, cw, width) + 1)
+
+proc fullRedraw*(ed: var LineEditor) =
+  ## Wipe the previously rendered area, repaint prompt + buffer, place
+  ## the cursor at the visual position derived from ``ed.line.position``.
+  ## Updates ``ed.renderRow`` to match.
+  ##
+  ## All bytes for the repaint are coalesced into a single ``write``
+  ## call so the underlying ``stdout.flushFile`` runs once per keystroke
+  ## (was: ~5 flushes per redraw, visible on Windows conhost as flicker
+  ## because conhost paints between flushes). The whole thing is also
+  ## wrapped in DEC 2026 synchronized-output (``CSI ? 2026 h/l``) so
+  ## conhost treats the repaint as one atomic frame; terminals that
+  ## don't recognize the mode ignore it silently.
+  if ed.painter != nil:
+    callHook(ed.painter, ed)
+    return
+  callHook(ed.preRedraw, ed)
+  let synchronized = not ed.redrawWrappedExternally
+  let bytes = ed.redrawBytes(synchronized = synchronized)
+  ed.prevRowSpans = ed.renderRowSpans()
+  ed.write bytes
+  ed.redrawWrappedExternally = false
+  callHook(ed.postRedraw, ed)
+
+proc parkAtEnd(ed: var LineEditor) =
+  ## After submit, leave the cursor at column 0 of the row directly
+  ## below the rendered input — the contract every external transition
+  ## is written against.
+  let width = max(2, ed.width)
+  let total = totalRows(ed.line.text, ed.promptW, ed.contPromptW, width)
+  let endRow = total - 1
+  if ed.renderRow > endRow:
+    # The caret waited on its own row below the content (a margin
+    # caret): blank that transient row and step back onto the content's
+    # last row, so the submit newline lands directly below the rendered
+    # input rather than below a leftover caret row.
+    ed.write "\r\x1b[K"
+    let up = ed.renderRow - endRow
+    if up > 0:
+      ed.write "\x1b[" & $up & "A"
+    ed.renderRow = endRow
+  if ed.renderRow < endRow:
+    emitMoveDown(ed, endRow - ed.renderRow)
+  if ed.submitIcon.len > 0:
+    ed.write ed.submitIcon
+  ed.write "\r\n"
+  ed.echoRows = total
+  ed.renderRow = 0
+
+# ---------- Edit ops (multiline-aware) ----------
+
+proc clearSelection*(ed: var LineEditor) =
+  ed.selAnchor = -1
+
+proc selectionText*(ed: LineEditor): string =
+  ## The selected bytes, or "" when there is no selection.
+  if not ed.hasSelection(): return ""
+  let (a, b) = ed.selRange()
+  ed.line.text[a ..< b]
+
+proc deleteSelection*(ed: var LineEditor) =
+  ## Remove the selected range and park the cursor at its start. No-op
+  ## without a selection. Does not redraw: callers fold this into their
+  ## own mutation + repaint.
+  if not ed.hasSelection(): return
+  let (a, b) = ed.selRange()
+  ed.line.text = ed.line.text[0 ..< a] & ed.line.text[b .. ^1]
+  ed.line.position = a
+  ed.selAnchor = -1
+
+proc back*(ed: var LineEditor, n = 1) =
+  ## Step the cursor left by ``n`` runes / newlines.
+  ed.clearSelection()
+  for _ in 0 ..< n:
+    if ed.line.position <= 0: break
+    if ed.line.text[ed.line.position - 1] == '\n':
+      dec ed.line.position
+    else:
+      ed.line.position = runeStartBefore(ed.line.text, ed.line.position)
+  fullRedraw(ed)
+
+proc forward*(ed: var LineEditor, n = 1) =
+  ed.clearSelection()
+  for _ in 0 ..< n:
+    if ed.line.position >= ed.line.text.len: break
+    if ed.line.text[ed.line.position] == '\n':
+      inc ed.line.position
+    else:
+      ed.line.position += runeLenSafe(ed.line.text, ed.line.position)
+  fullRedraw(ed)
+
+proc deletePrevious*(ed: var LineEditor) =
+  if ed.hasSelection():
+    ed.deleteSelection()
+    callHook(ed.onMutate, ed)
+    fullRedraw(ed)
+    return
+  if ed.line.position <= 0: return
+  let start =
+    if ed.line.text[ed.line.position - 1] == '\n': ed.line.position - 1
+    else: runeStartBefore(ed.line.text, ed.line.position)
+  ed.line.text = ed.line.text[0 ..< start] &
+                 ed.line.text[ed.line.position .. ^1]
+  ed.line.position = start
+  callHook(ed.onMutate, ed)
+  fullRedraw(ed)
+
+proc deleteNext*(ed: var LineEditor) =
+  if ed.hasSelection():
+    ed.deleteSelection()
+    callHook(ed.onMutate, ed)
+    fullRedraw(ed)
+    return
+  if ed.line.position >= ed.line.text.len: return
+  let stop =
+    if ed.line.text[ed.line.position] == '\n': ed.line.position + 1
+    else: ed.line.position + runeLenSafe(ed.line.text, ed.line.position)
+  ed.line.text = ed.line.text[0 ..< ed.line.position] &
+                 ed.line.text[stop .. ^1]
+  callHook(ed.onMutate, ed)
+  fullRedraw(ed)
+
+proc runeBoundaryAtOrBefore(s: string; n: int): int =
+  ## Largest offset ``<= n`` that does not split a UTF-8 rune of ``s``.
+  result = min(n, s.len)
+  while result > 0 and result < s.len and
+      (byte(s[result]) and 0xC0'u8) == 0x80'u8:
+    dec result
+
+proc capNotice(ed: var LineEditor) =
+  if ed.write != nil: ed.write "\a"
+
+proc insertText*(ed: var LineEditor, s: string) =
+  ## Insert ``s`` at the current position. Replace mode overwrites runes
+  ## within the current logical line; newlines in ``s`` always insert.
+  ## The insert is capped at ``MaxBufferBytes``: what does not fit is cut
+  ## at a rune boundary and the terminal is belled, so a runaway paste
+  ## lands whole up to the cap instead of growing the buffer forever.
+  if s.len == 0: return
+  var s = s
+  let room = MaxBufferBytes - ed.line.text.len
+  if room <= 0:
+    capNotice(ed)
+    return
+  if s.len > room:
+    s.setLen runeBoundaryAtOrBefore(s, room)
+    capNotice(ed)
+  if ed.hasSelection(): ed.deleteSelection()
+  if ed.mode == mdInsert or s.contains('\n'):
+    ed.line.text = ed.line.text[0 ..< ed.line.position] & s &
+                   ed.line.text[ed.line.position .. ^1]
+    ed.line.position += s.len
+    callHook(ed.onMutate, ed)
+    fullRedraw(ed)
+    return
+  # Replace mode: overwrite runes within the current logical line.
+  var p = ed.line.position
+  var i = 0
+  while i < s.len:
+    let rl = runeLenSafe(s, i)
+    if p < ed.line.text.len and ed.line.text[p] != '\n':
+      let oldRl = runeLenSafe(ed.line.text, p)
+      ed.line.text = ed.line.text[0 ..< p] & s[i ..< i + rl] &
+                     ed.line.text[p + oldRl .. ^1]
+    else:
+      ed.line.text = ed.line.text[0 ..< p] & s[i ..< i + rl] &
+                     ed.line.text[p .. ^1]
+    p += rl
+    i += rl
+  ed.line.position = p
+  callHook(ed.onMutate, ed)
+  fullRedraw(ed)
+
+proc printChar*(ed: var LineEditor, c: int) =
+  ed.insertText($c.chr)
+
+proc insertNewline*(ed: var LineEditor) =
+  ed.insertText("\n")
+
+proc changeLine*(ed: var LineEditor, s: string) =
+  ## Replace the entire buffer (history recall, prefill, external
+  ## editor). Same hard cap as typing: oversized content is cut at a
+  ## rune boundary and belled rather than loaded unchecked.
+  ed.selAnchor = -1
+  var s = s
+  if s.len > MaxBufferBytes:
+    s.setLen runeBoundaryAtOrBefore(s, MaxBufferBytes)
+    capNotice(ed)
+  ed.line.text = s
+  ed.line.position = s.len
+  callHook(ed.onMutate, ed)
+  fullRedraw(ed)
+
+proc clearLine*(ed: var LineEditor) =
+  ## Empty the buffer.
+  ed.selAnchor = -1
+  ed.changeLine("")
+
+proc goToStart*(ed: var LineEditor) =
+  ## Move to the start of the current logical line.
+  ed.clearSelection()
+  var p = ed.line.position
+  while p > 0 and ed.line.text[p - 1] != '\n':
+    dec p
+  ed.line.position = p
+  fullRedraw(ed)
+
+proc goToEnd*(ed: var LineEditor) =
+  ## Move to the end of the current logical line.
+  ed.clearSelection()
+  var p = ed.line.position
+  while p < ed.line.text.len and ed.line.text[p] != '\n':
+    inc p
+  ed.line.position = p
+  fullRedraw(ed)
+
+proc goToBufferStart*(ed: var LineEditor) =
+  ed.clearSelection()
+  ed.line.position = 0
+  fullRedraw(ed)
+
+proc goToBufferEnd*(ed: var LineEditor) =
+  ed.clearSelection()
+  ed.line.position = ed.line.text.len
+  fullRedraw(ed)
+
+proc isWordChar(b: char): bool {.inline.} =
+  b != ' ' and b != '\t' and b != '\n'
+
+proc wordLeft*(ed: var LineEditor) =
+  ed.clearSelection()
+  var p = ed.line.position
+  while p > 0 and not isWordChar(ed.line.text[p - 1]):
+    dec p
+  while p > 0 and isWordChar(ed.line.text[p - 1]):
+    dec p
+  ed.line.position = p
+  fullRedraw(ed)
+
+proc wordRight*(ed: var LineEditor) =
+  ed.clearSelection()
+  var p = ed.line.position
+  let n = ed.line.text.len
+  while p < n and isWordChar(ed.line.text[p]):
+    inc p
+  while p < n and not isWordChar(ed.line.text[p]):
+    inc p
+  ed.line.position = p
+  fullRedraw(ed)
+
+proc deleteWordLeft*(ed: var LineEditor) =
+  if ed.hasSelection():
+    ed.deleteSelection()
+    callHook(ed.onMutate, ed)
+    fullRedraw(ed)
+    return
+  let stop = ed.line.position
+  var p = ed.line.position
+  while p > 0 and not isWordChar(ed.line.text[p - 1]):
+    dec p
+  while p > 0 and isWordChar(ed.line.text[p - 1]):
+    dec p
+  if p == stop: return
+  ed.line.text = ed.line.text[0 ..< p] & ed.line.text[stop .. ^1]
+  ed.line.position = p
+  callHook(ed.onMutate, ed)
+  fullRedraw(ed)
+
+proc deleteToBoundaryLeft*(ed: var LineEditor) =
+  ## Delete back to the most recent non-alphanumeric boundary. Like
+  ## readline's ``backward-kill-word``: first skip any non-word chars
+  ## (``/``, ``.``, etc.) immediately to the left, then delete the
+  ## alphanumeric run. This peels one path segment per press
+  ## (``/usr/local/bin`` -> ``/usr/local/`` -> ``/usr/``) instead of
+  ## stalling when the cursor lands right after a delimiter.
+  if ed.hasSelection():
+    ed.deleteSelection()
+    callHook(ed.onMutate, ed)
+    fullRedraw(ed)
+    return
+  var p = ed.line.position
+  let stop = ed.line.position
+  while p > 0:
+    let c = ed.line.text[p - 1]
+    if c.isAlphanumeric or c == '_': break
+    dec p
+  while p > 0:
+    let c = ed.line.text[p - 1]
+    if not (c.isAlphanumeric or c == '_'): break
+    dec p
+  if p == stop: return
+  ed.line.text = ed.line.text[0 ..< p] & ed.line.text[stop .. ^1]
+  ed.line.position = p
+  callHook(ed.onMutate, ed)
+  fullRedraw(ed)
+
+proc visualUp*(ed: var LineEditor) =
+  ## Move up by one visual row, preserving the visual column as best as
+  ## possible. If already on the top visual row of the buffer, fall back
+  ## to ``historyPrevious`` (Emacs convention).
+
+  ed.clearSelection()
+  let width = max(2, ed.width)
+  let pw = ed.promptW
+  let cw = ed.contPromptW
+  let (curR, curC) = cursorVisual(ed.line.text, ed.line.position, pw, cw, width)
+  if curR <= promptWrap(pw, width).head:
+    return  # caller decides whether to invoke history
+  var bestP = ed.line.position
+  var bestDiff = high(int)
+  var i = 0
+  while i <= ed.line.text.len:
+    let (r, c) = cursorVisual(ed.line.text, i, pw, cw, width)
+    if r == curR - 1:
+      let d = abs(c - curC)
+      if d < bestDiff:
+        bestDiff = d
+        bestP = i
+    elif r >= curR:
+      break
+    if i < ed.line.text.len:
+      if ed.line.text[i] == '\n': inc i
+      else: i += runeLenSafe(ed.line.text, i)
+    else:
+      inc i
+  ed.line.position = bestP
+  fullRedraw(ed)
+
+proc visualDown*(ed: var LineEditor) =
+  ed.clearSelection()
+  let width = max(2, ed.width)
+  let pw = ed.promptW
+  let cw = ed.contPromptW
+  let (curR, curC) = cursorVisual(ed.line.text, ed.line.position, pw, cw, width)
+  let total = totalRows(ed.line.text, pw, cw, width)
+  if curR >= total - 1: return
+  var bestP = ed.line.position
+  var bestDiff = high(int)
+  var seenTarget = false
+  var i = 0
+  while i <= ed.line.text.len:
+    let (r, c) = cursorVisual(ed.line.text, i, pw, cw, width)
+    if r == curR + 1:
+      seenTarget = true
+      let d = abs(c - curC)
+      if d < bestDiff:
+        bestDiff = d
+        bestP = i
+    elif r > curR + 1:
+      break
+    if i < ed.line.text.len:
+      if ed.line.text[i] == '\n': inc i
+      else: i += runeLenSafe(ed.line.text, i)
+    else:
+      inc i
+  if seenTarget:
+    ed.line.position = bestP
+    fullRedraw(ed)
+
+# ---------- Selection ops ----------
+
+template selectMotion(ed: LineEditor, body: untyped): untyped =
+  ## Run a cursor motion as a selection extension: the first press
+  ## anchors at the current cursor, every motion then moves the cursor
+  ## and keeps the anchor put. A motion that lands back on the anchor
+  ## drops the selection (a zero-width selection is no selection).
+  if ed.selAnchor < 0: ed.selAnchor = ed.line.position
+  body
+  if ed.selAnchor == ed.line.position: ed.selAnchor = -1
+  fullRedraw(ed)
+
+proc selectLeft*(ed: var LineEditor) =
+  selectMotion(ed):
+    if ed.line.position > 0:
+      if ed.line.text[ed.line.position - 1] == '\n':
+        dec ed.line.position
+      else:
+        ed.line.position = runeStartBefore(ed.line.text, ed.line.position)
+
+proc selectRight*(ed: var LineEditor) =
+  selectMotion(ed):
+    if ed.line.position < ed.line.text.len:
+      if ed.line.text[ed.line.position] == '\n':
+        inc ed.line.position
+      else:
+        ed.line.position += runeLenSafe(ed.line.text, ed.line.position)
+
+proc selectWordLeft*(ed: var LineEditor) =
+  selectMotion(ed):
+    var p = ed.line.position
+    while p > 0 and not isWordChar(ed.line.text[p - 1]):
+      dec p
+    while p > 0 and isWordChar(ed.line.text[p - 1]):
+      dec p
+    ed.line.position = p
+
+proc selectWordRight*(ed: var LineEditor) =
+  selectMotion(ed):
+    var p = ed.line.position
+    let n = ed.line.text.len
+    while p < n and isWordChar(ed.line.text[p]):
+      inc p
+    while p < n and not isWordChar(ed.line.text[p]):
+      inc p
+    ed.line.position = p
+
+proc selectHome*(ed: var LineEditor) =
+  selectMotion(ed):
+    var p = ed.line.position
+    while p > 0 and ed.line.text[p - 1] != '\n':
+      dec p
+    ed.line.position = p
+
+proc selectEnd*(ed: var LineEditor) =
+  selectMotion(ed):
+    var p = ed.line.position
+    while p < ed.line.text.len and ed.line.text[p] != '\n':
+      inc p
+    ed.line.position = p
+
+proc selectUp*(ed: var LineEditor) =
+  ## Extend the selection one visual row up (no history fall-through:
+  ## a selection gesture never recalls history).
+  if ed.selAnchor < 0: ed.selAnchor = ed.line.position
+  let width = max(2, ed.width)
+  let pw = ed.promptW
+  let cw = ed.contPromptW
+  let (curR, curC) = cursorVisual(ed.line.text, ed.line.position, pw, cw, width)
+  if curR > promptWrap(pw, width).head:
+    var bestP = ed.line.position
+    var bestDiff = high(int)
+    var i = 0
+    while i <= ed.line.text.len:
+      let (r, c) = cursorVisual(ed.line.text, i, pw, cw, width)
+      if r == curR - 1:
+        let d = abs(c - curC)
+        if d < bestDiff:
+          bestDiff = d
+          bestP = i
+      elif r >= curR:
+        break
+      if i < ed.line.text.len:
+        if ed.line.text[i] == '\n': inc i
+        else: i += runeLenSafe(ed.line.text, i)
+      else:
+        inc i
+    ed.line.position = bestP
+  if ed.selAnchor == ed.line.position: ed.selAnchor = -1
+  fullRedraw(ed)
+
+proc selectDown*(ed: var LineEditor) =
+  if ed.selAnchor < 0: ed.selAnchor = ed.line.position
+  let width = max(2, ed.width)
+  let pw = ed.promptW
+  let cw = ed.contPromptW
+  let (curR, curC) = cursorVisual(ed.line.text, ed.line.position, pw, cw, width)
+  let total = totalRows(ed.line.text, pw, cw, width)
+  if curR < total - 1:
+    var bestP = ed.line.position
+    var bestDiff = high(int)
+    var seenTarget = false
+    var i = 0
+    while i <= ed.line.text.len:
+      let (r, c) = cursorVisual(ed.line.text, i, pw, cw, width)
+      if r == curR + 1:
+        seenTarget = true
+        let d = abs(c - curC)
+        if d < bestDiff:
+          bestDiff = d
+          bestP = i
+      elif r > curR + 1:
+        break
+      if i < ed.line.text.len:
+        if ed.line.text[i] == '\n': inc i
+        else: i += runeLenSafe(ed.line.text, i)
+      else:
+        inc i
+    if seenTarget:
+      ed.line.position = bestP
+  if ed.selAnchor == ed.line.position: ed.selAnchor = -1
+  fullRedraw(ed)
+
+proc selectAll*(ed: var LineEditor) =
+  if ed.line.text.len == 0: return
+  ed.selAnchor = 0
+  ed.line.position = ed.line.text.len
+  fullRedraw(ed)
+
+proc selectBufferStart*(ed: var LineEditor) =
+  if ed.selAnchor < 0: ed.selAnchor = ed.line.position
+  ed.line.position = 0
+  if ed.selAnchor == ed.line.position: ed.selAnchor = -1
+  fullRedraw(ed)
+
+proc selectBufferEnd*(ed: var LineEditor) =
+  if ed.selAnchor < 0: ed.selAnchor = ed.line.position
+  ed.line.position = ed.line.text.len
+  if ed.selAnchor == ed.line.position: ed.selAnchor = -1
+  fullRedraw(ed)
+
+proc copySelection*(ed: var LineEditor) =
+  ## Copy the selection to the kill ring and the system clipboard.
+  ## Keeps the selection and the cursor: copy is non-destructive.
+  if not ed.hasSelection(): return
+  ed.lastKill = ed.selectionText()
+  if ed.clipboardWrite != nil:
+    ed.clipboardWrite(ed.lastKill)
+  else:
+    ed.write clipboard.clipboardWriteOsc52(ed.lastKill)
+
+proc cutSelection*(ed: var LineEditor) =
+  if not ed.hasSelection(): return
+  ed.lastKill = ed.selectionText()
+  if ed.clipboardWrite != nil:
+    ed.clipboardWrite(ed.lastKill)
+  else:
+    ed.write clipboard.clipboardWriteOsc52(ed.lastKill)
+  ed.deleteSelection()
+  callHook(ed.onMutate, ed)
+  fullRedraw(ed)
+
+proc pasteClipboard*(ed: var LineEditor) =
+  ## Insert the system clipboard at the cursor, replacing any
+  ## selection. Falls back to the kill ring when the platform has no
+  ## clipboard reader (the common case on bare X11 without xclip).
+  var s = clipboard.clipboardRead()
+  if s.len == 0 and ed.lastKill.len > 0:
+    s = ed.lastKill
+  if s.len == 0: return
+  ed.insertText(s)
+
+proc pasteText*(ed: var LineEditor, s: string) =
+  ## Insert `s` at the cursor, replacing any selection (the clipboard
+  ## path; `yank` routes through here too).
+  if s.len == 0: return
+  ed.insertText(s)
+
+proc yank*(ed: var LineEditor) =
+  ## Insert the last cut/copied text (Emacs C-y).
+  if ed.lastKill.len == 0: return
+  ed.insertText(ed.lastKill)
+
+proc deleteWordRight*(ed: var LineEditor) =
+  ## Delete the word (and trailing spaces) right of the cursor.
+  if ed.hasSelection():
+    ed.deleteSelection()
+    callHook(ed.onMutate, ed)
+    fullRedraw(ed)
+    return
+  let start = ed.line.position
+  var p = ed.line.position
+  let n = ed.line.text.len
+  while p < n and not isWordChar(ed.line.text[p]):
+    inc p
+  while p < n and isWordChar(ed.line.text[p]):
+    inc p
+  if p == start: return
+  ed.line.text = ed.line.text[0 ..< start] & ed.line.text[p .. ^1]
+  ed.line.position = start
+  callHook(ed.onMutate, ed)
+  fullRedraw(ed)
+
+proc deleteToBoundaryRight*(ed: var LineEditor) =
+  ## Delete forward to the next non-alphanumeric boundary: the forward
+  ## twin of `deleteToBoundaryLeft`, peeling one path segment per press.
+  if ed.hasSelection():
+    ed.deleteSelection()
+    callHook(ed.onMutate, ed)
+    fullRedraw(ed)
+    return
+  let start = ed.line.position
+  var p = ed.line.position
+  let n = ed.line.text.len
+  while p < n:
+    let c = ed.line.text[p]
+    if c.isAlphanumeric or c == '_': break
+    inc p
+  while p < n:
+    let c = ed.line.text[p]
+    if not (c.isAlphanumeric or c == '_'): break
+    inc p
+  if p == start: return
+  ed.line.text = ed.line.text[0 ..< start] & ed.line.text[p .. ^1]
+  ed.line.position = start
+  callHook(ed.onMutate, ed)
+  fullRedraw(ed)
+
+proc deleteToEol*(ed: var LineEditor) =
+  ## Delete from the cursor to the end of the current logical line.
+  if ed.hasSelection():
+    ed.deleteSelection()
+    callHook(ed.onMutate, ed)
+    fullRedraw(ed)
+    return
+  var p = ed.line.position
+  while p < ed.line.text.len and ed.line.text[p] != '\n':
+    inc p
+  if p == ed.line.position: return
+  ed.line.text = ed.line.text[0 ..< ed.line.position] &
+                 ed.line.text[p .. ^1]
+  callHook(ed.onMutate, ed)
+  fullRedraw(ed)
+
+proc deleteToBol*(ed: var LineEditor) =
+  ## Delete from the start of the current logical line to the cursor.
+  if ed.hasSelection():
+    ed.deleteSelection()
+    callHook(ed.onMutate, ed)
+    fullRedraw(ed)
+    return
+  var p = ed.line.position
+  while p > 0 and ed.line.text[p - 1] != '\n':
+    dec p
+  if p == ed.line.position: return
+  ed.line.text = ed.line.text[0 ..< p] & ed.line.text[ed.line.position .. ^1]
+  ed.line.position = p
+  callHook(ed.onMutate, ed)
+  fullRedraw(ed)
+
+proc transposeChars*(ed: var LineEditor) =
+  ## Swap the rune before the cursor with the one under it (Emacs C-t).
+  ## At end of line swaps the last two runes before the cursor.
+  if ed.hasSelection():
+    ed.deleteSelection()
+    callHook(ed.onMutate, ed)
+    fullRedraw(ed)
+    return
+  let n = ed.line.text.len
+  if ed.line.position == 0: return
+  # Rune boundaries around the cursor: `left` is the rune before it,
+  # `right` the rune at it. At end of buffer the swap is the last two
+  # runes before the cursor (Emacs behavior).
+  var rightStart = ed.line.position
+  if rightStart >= n:
+    rightStart = runeStartBefore(ed.line.text, rightStart)
+    if rightStart <= 0: return
+  var leftStart = runeStartBefore(ed.line.text, rightStart)
+  if leftStart == rightStart: return
+  let leftLen = rightStart - leftStart
+  let rightLen = min(runeLenSafe(ed.line.text, rightStart), n - rightStart)
+  ed.line.text = ed.line.text[0 ..< leftStart] &
+    ed.line.text[rightStart ..< rightStart + rightLen] &
+    ed.line.text[leftStart ..< leftStart + leftLen] &
+    ed.line.text[rightStart + rightLen .. ^1]
+  ed.line.position = rightStart + rightLen
+  callHook(ed.onMutate, ed)
+  fullRedraw(ed)
+
+proc loadView(ed: var LineEditor, idx: int) =
+  ## Pull the buffer + cursor for view ``idx`` into the editor.
+  ## ``idx == -1`` is the user's draft; ``0..entries.len-1`` is a
+  ## history entry. Pending edits (``drafts[idx]``) win over the
+  ## persistent text; absent entries fall back to the canonical text
+  ## with the cursor parked at the end.
+  let text =
+    if idx == -1:
+      ed.history.drafts.getOrDefault(-1, "")
+    elif ed.history.drafts.hasKey(idx):
+      ed.history.drafts[idx]
+    else:
+      ed.history.entries[idx]
+  let pos =
+    if ed.history.cursorPos.hasKey(idx): ed.history.cursorPos[idx]
+    else: text.len
+  ed.line.text = text
+  ed.line.position = clamp(pos, 0, text.len)
+  fullRedraw(ed)
+
+proc stashView(ed: var LineEditor) =
+  ## Save the live buffer into the slot we're about to leave so coming
+  ## back finds it intact.
+  ed.history.drafts[ed.history.cursor] = ed.line.text
+  ed.history.cursorPos[ed.history.cursor] = ed.line.position
+
+proc historyPrevious*(ed: var LineEditor) =
+  ## Step one entry older. From the draft slot (cursor == -1) this lands
+  ## on the newest entry. Already at the oldest? Do nothing — including
+  ## not stashing, so a no-op Up doesn't perturb anything.
+  if ed.history.entries.len == 0: return
+  let target =
+    if ed.history.cursor == -1: ed.history.entries.len - 1
+    elif ed.history.cursor > 0: ed.history.cursor - 1
+    else: return
+  ed.stashView()
+  ed.history.cursor = target
+  ed.loadView(target)
+
+proc historyNext*(ed: var LineEditor) =
+  ## Step one entry newer. Past the last entry, fall back to the
+  ## user's draft. On the draft already? No-op.
+  if ed.history.cursor == -1: return
+  let target =
+    if ed.history.cursor < ed.history.entries.len - 1: ed.history.cursor + 1
+    else: -1
+  ed.stashView()
+  ed.history.cursor = target
+  ed.loadView(target)
+
+proc lineText*(ed: LineEditor): string = ed.line.text
+
+# Key Names
+var KEYNAMES* {.threadvar.}: array[0 .. 31, string]
+
+KEYNAMES[1]    = "ctrl+a"
+KEYNAMES[2]    = "ctrl+b"
+KEYNAMES[3]    = "ctrl+c"
+KEYNAMES[4]    = "ctrl+d"
+KEYNAMES[5]    = "ctrl+e"
+KEYNAMES[6]    = "ctrl+f"
+KEYNAMES[7]    = "ctrl+g"
+KEYNAMES[8]    = "ctrl+h"
+KEYNAMES[9]    = "ctrl+i"
+KEYNAMES[9]    = "tab"
+KEYNAMES[10]   = "ctrl+j"
+KEYNAMES[11]   = "ctrl+k"
+KEYNAMES[12]   = "ctrl+l"
+KEYNAMES[13]   = "ctrl+m"
+KEYNAMES[14]   = "ctrl+n"
+KEYNAMES[15]   = "ctrl+o"
+KEYNAMES[16]   = "ctrl+p"
+KEYNAMES[17]   = "ctrl+q"
+KEYNAMES[18]   = "ctrl+r"
+KEYNAMES[19]   = "ctrl+s"
+KEYNAMES[20]   = "ctrl+t"
+KEYNAMES[21]   = "ctrl+u"
+KEYNAMES[22]   = "ctrl+v"
+KEYNAMES[23]   = "ctrl+w"
+KEYNAMES[24]   = "ctrl+x"
+KEYNAMES[25]   = "ctrl+y"
+KEYNAMES[26]   = "ctrl+z"
+
+var KEYSEQS* {.threadvar.}: CritBitTree[KeySeq]
+
+# Navigation keys, VT encoding (CSI 1;<mod> <dir> for arrows/home/end,
+# CSI 2/3;<mod> ~ for insert/delete). The modifier number is
+# 1 + (shift 1 | alt 2 | ctrl 4). Every platform decodes this one
+# grammar: POSIX terminals send it natively, and the Windows input
+# thread enables ENABLE_VIRTUAL_TERMINAL_INPUT so the console does too.
+# Legacy conhost (no VT input) delivers `_getch` 0/224-prefixed pairs
+# instead; `handleEscape` maps those pair codes onto the same command
+# names, so both console modes dispatch identically.
+KEYSEQS["up"]         = @[27, 91, 65]
+KEYSEQS["down"]       = @[27, 91, 66]
+KEYSEQS["right"]      = @[27, 91, 67]
+KEYSEQS["left"]       = @[27, 91, 68]
+KEYSEQS["home"]       = @[27, 91, 72]
+KEYSEQS["end"]        = @[27, 91, 70]
+KEYSEQS["insert"]     = @[27, 91, 50, 126]
+KEYSEQS["delete"]     = @[27, 91, 51, 126]
+KEYSEQS["shift+left"]  = @[27, 91, 49, 59, 50, 68]
+KEYSEQS["shift+right"] = @[27, 91, 49, 59, 50, 67]
+KEYSEQS["shift+up"]    = @[27, 91, 49, 59, 50, 65]
+KEYSEQS["shift+down"]  = @[27, 91, 49, 59, 50, 66]
+KEYSEQS["shift+home"]  = @[27, 91, 49, 59, 50, 72]
+KEYSEQS["shift+end"]   = @[27, 91, 49, 59, 50, 70]
+KEYSEQS["ctrl+shift+left"]  = @[27, 91, 49, 59, 54, 68]
+KEYSEQS["ctrl+shift+right"] = @[27, 91, 49, 59, 54, 67]
+KEYSEQS["ctrl+shift+home"]  = @[27, 91, 49, 59, 54, 72]
+KEYSEQS["ctrl+shift+end"]   = @[27, 91, 49, 59, 54, 70]
+KEYSEQS["ctrl+left"]   = @[27, 91, 49, 59, 53, 68]
+KEYSEQS["ctrl+right"]  = @[27, 91, 49, 59, 53, 67]
+KEYSEQS["ctrl+home"]   = @[27, 91, 49, 59, 53, 72]
+KEYSEQS["ctrl+end"]    = @[27, 91, 49, 59, 53, 70]
+KEYSEQS["ctrl+delete"]  = @[27, 91, 51, 59, 53, 126]
+KEYSEQS["shift+delete"]  = @[27, 91, 51, 59, 50, 126]
+
+var KEYMAP* {.threadvar.}: CritBitTree[KeyCallback]
+
+KEYMAP["backspace"] = proc(ed: var LineEditor) = ed.deletePrevious()
+KEYMAP["delete"]    = proc(ed: var LineEditor) = ed.deleteNext()
+KEYMAP["insert"]    = proc(ed: var LineEditor) =
+  ed.mode = if ed.mode == mdInsert: mdReplace else: mdInsert
+KEYMAP["down"]      = proc(ed: var LineEditor) =
+  ## Down — visual row first; if already at the last visual row, fall
+  ## through to history-next (matches readline / Emacs feel).
+  let pw = ed.promptW; let cw = ed.contPromptW
+  let width = max(2, ed.width)
+  let (curR, _) = cursorVisual(ed.line.text, ed.line.position, pw, cw, width)
+  let total = totalRows(ed.line.text, pw, cw, width)
+  if curR >= total - 1: ed.historyNext()
+  else: ed.visualDown()
+KEYMAP["up"]        = proc(ed: var LineEditor) =
+  let pw = ed.promptW; let cw = ed.contPromptW
+  let width = max(2, ed.width)
+  let (curR, _) = cursorVisual(ed.line.text, ed.line.position, pw, cw, width)
+  if curR <= promptWrap(pw, width).head: ed.historyPrevious()
+  else: ed.visualUp()
+KEYMAP["ctrl+n"]    = proc(ed: var LineEditor) = ed.historyNext()
+KEYMAP["ctrl+p"]    = proc(ed: var LineEditor) = ed.historyPrevious()
+KEYMAP["left"]      = proc(ed: var LineEditor) = ed.back()
+KEYMAP["right"]     = proc(ed: var LineEditor) = ed.forward()
+KEYMAP["ctrl+b"]    = proc(ed: var LineEditor) = ed.back()
+KEYMAP["ctrl+f"]    = proc(ed: var LineEditor) = ed.forward()
+KEYMAP["ctrl+u"]    = proc(ed: var LineEditor) = ed.clearLine()
+KEYMAP["ctrl+a"]    = proc(ed: var LineEditor) = ed.goToStart()
+KEYMAP["ctrl+e"]    = proc(ed: var LineEditor) = ed.goToEnd()
+KEYMAP["home"]      = proc(ed: var LineEditor) = ed.goToStart()
+KEYMAP["end"]       = proc(ed: var LineEditor) = ed.goToEnd()
+KEYMAP["ctrl+w"]    = proc(ed: var LineEditor) = ed.deleteWordLeft()
+KEYMAP["alt+b"]     = proc(ed: var LineEditor) = ed.wordLeft()
+KEYMAP["alt+f"]     = proc(ed: var LineEditor) = ed.wordRight()
+KEYMAP["alt+h"]     = proc(ed: var LineEditor) = ed.deleteToBoundaryLeft()
+KEYMAP["ctrl+c"]    = proc(ed: var LineEditor) =
+  if ed.line.text.len > 0:
+    ed.clearLine()
+  else:
+    ed.canceled = true
+    raise newException(InputCancelled, "")
+KEYMAP["ctrl+d"]    = proc(ed: var LineEditor) =
+  ## Ctrl-D on an empty line asks to exit (EOFError). With text present
+  ## it is a no-op: it never edits and never cancels a turn.
+  if ed.line.text.len == 0:
+    ed.eof = true
+    raise newException(EOFError, "")
+KEYMAP["ctrl+l"]    = proc(ed: var LineEditor) =
+  ed.write "\x1b[H\x1b[2J"
+  ed.renderRow = 0
+  fullRedraw(ed)
+when defined(posix):
+  KEYMAP["ctrl+z"]  = proc(ed: var LineEditor) =
+    ed.write "\n\e[?2004l"
+    # The interactive app keeps the physical cursor hidden all session
+    # (the caret is drawn in the editor rows); the suspended shell needs
+    # a real one. Standalone callers never hid it, so they skip both.
+    if ed.painter != nil:
+      ed.write "\x1b[?25h"
+    resetAttributes()
+    stdout.flushFile()
+    # Suspend and block until resumed, then repaint. requestBackground
+    # returns only after SIGCONT, so this redraw runs in the foreground
+    # after the shell's job-control output, not before the stop.
+    requestBackground()
+    ed.write "\e[?2004h"
+    if ed.painter != nil:
+      ed.write "\x1b[?25l"
+    ed.renderRow = 0
+    fullRedraw(ed)
+
+# Command dispatch tables. After `initKeyTables()` populates defaults,
+# `applyShortcuts()` rebuilds the dispatch and sequence maps from the
+# user's `[shortcuts]` config. Commands map to shared KEYMAP entries
+# with a "cmd:" prefix so display tweaks can wrap them independently.
+var DISPATCH* {.threadvar.}: CritBitTree[seq[string]]
+  ## key-name -> ordered list of command names bound to that key.
+var SEQCMDS* {.threadvar.}: seq[(KeySeq, string)]
+  ## key sequences for editing commands (arrows, home/end, ...).
+var ESCMAP* {.threadvar.}: seq[(string, int)]
+  ## "esc" key binding: list of (command, times) for the bare ESC key.
+var KEYTIMES* {.threadvar.}: Table[string, int]
+  ## key-name -> consecutive presses required (1 unless DoubleCtrlC etc.).
+var cancelWatchSnapshot*: set[uint8] = {3'u8, 27'u8}
+  ## Bytes the in-turn cancel watchers recognise. Updated by applyShortcuts
+  ## so the watcher thread (which has empty thread-local DISPATCH) still
+  ## sees the user's cancel/clear bindings.
+
+proc cancelWatchBytes*(): set[uint8]
+
+proc cmdCancel(ed: var LineEditor) =
+  ed.canceled = true
+  raise newException(InputCancelled, "")
+
+proc cmdClear(ed: var LineEditor) =
+  if ed.line.text.len == 0: return
+  if not ed.hidechars and ed.history.file.len > 0:
+    ed.historyAdd()
+  ed.clearLine()
+
+proc cmdQuitIfEmpty(ed: var LineEditor) =
+  if ed.wizardMode: return
+  if ed.line.text.len == 0:
+    ed.eof = true
+    raise newException(EOFError, "")
+
+proc cmdHome(ed: var LineEditor) = ed.goToStart()
+proc cmdEnd(ed: var LineEditor) = ed.goToEnd()
+proc cmdLeft(ed: var LineEditor) = ed.back()
+proc cmdRight(ed: var LineEditor) = ed.forward()
+proc cmdWordLeft(ed: var LineEditor) = ed.wordLeft()
+proc cmdWordRight(ed: var LineEditor) = ed.wordRight()
+proc cmdUp(ed: var LineEditor) =
+  let pw = ed.promptW; let cw = ed.contPromptW
+  let width = max(2, ed.width)
+  let (curR, _) = cursorVisual(ed.line.text, ed.line.position, pw, cw, width)
+  if curR <= promptWrap(pw, width).head: ed.historyPrevious()
+  else: ed.visualUp()
+proc cmdDown(ed: var LineEditor) =
+  let pw = ed.promptW; let cw = ed.contPromptW
+  let width = max(2, ed.width)
+  let (curR, _) = cursorVisual(ed.line.text, ed.line.position, pw, cw, width)
+  let total = totalRows(ed.line.text, pw, cw, width)
+  if curR >= total - 1: ed.historyNext()
+  else: ed.visualDown()
+proc cmdHistoryPrevious(ed: var LineEditor) = ed.historyPrevious()
+proc cmdHistoryNext(ed: var LineEditor) = ed.historyNext()
+proc cmdBackspace(ed: var LineEditor) = ed.deletePrevious()
+proc cmdDelete(ed: var LineEditor) = ed.deleteNext()
+proc cmdInsert(ed: var LineEditor) =
+  ed.mode = if ed.mode == mdInsert: mdReplace else: mdInsert
+proc cmdDeleteWordLeft(ed: var LineEditor) = ed.deleteWordLeft()
+proc cmdDeleteToBoundaryLeft(ed: var LineEditor) = ed.deleteToBoundaryLeft()
+proc cmdClearScreen(ed: var LineEditor) =
+  ed.write "\x1b[H\x1b[2J"
+  ed.renderRow = 0
+  fullRedraw(ed)
+proc completeLine*(ed: var LineEditor) {.nimcall.}
+proc reverseCompleteLine*(ed: var LineEditor) {.nimcall.}
+proc cmdComplete(ed: var LineEditor) =
+  ed.completeLine()
+proc cmdReverseComplete(ed: var LineEditor) = ed.reverseCompleteLine()
+proc cmdEditInEditor(ed: var LineEditor) =
+  if ed.editInEditor != nil: ed.editInEditor(ed)
+proc cmdSelectLeft(ed: var LineEditor) = ed.selectLeft()
+proc cmdSelectRight(ed: var LineEditor) = ed.selectRight()
+proc cmdSelectUp(ed: var LineEditor) = ed.selectUp()
+proc cmdSelectDown(ed: var LineEditor) = ed.selectDown()
+proc cmdSelectHome(ed: var LineEditor) = ed.selectHome()
+proc cmdSelectEnd(ed: var LineEditor) = ed.selectEnd()
+proc cmdSelectWordLeft(ed: var LineEditor) = ed.selectWordLeft()
+proc cmdSelectWordRight(ed: var LineEditor) = ed.selectWordRight()
+proc cmdSelectAll(ed: var LineEditor) = ed.selectAll()
+proc cmdSelectBufferStart(ed: var LineEditor) = ed.selectBufferStart()
+proc cmdSelectBufferEnd(ed: var LineEditor) = ed.selectBufferEnd()
+proc cmdBufferStart(ed: var LineEditor) = ed.goToBufferStart()
+proc cmdBufferEnd(ed: var LineEditor) = ed.goToBufferEnd()
+proc cmdCut(ed: var LineEditor) = ed.cutSelection()
+proc cmdCopy(ed: var LineEditor) = ed.copySelection()
+proc cmdPaste(ed: var LineEditor) = ed.pasteClipboard()
+proc cmdYank(ed: var LineEditor) = ed.yank()
+proc cmdDeleteWordRight(ed: var LineEditor) = ed.deleteWordRight()
+proc cmdDeleteToBoundaryRight(ed: var LineEditor) = ed.deleteToBoundaryRight()
+proc cmdDeleteToEol(ed: var LineEditor) = ed.deleteToEol()
+proc cmdDeleteToBol(ed: var LineEditor) = ed.deleteToBol()
+proc cmdTransposeChars(ed: var LineEditor) = ed.transposeChars()
+when defined(posix):
+  proc cmdSuspend(ed: var LineEditor) =
+    ed.write "\n\e[?2004l"
+    if ed.painter != nil:
+      ed.write "\x1b[?25h"
+    resetAttributes()
+    stdout.flushFile()
+    requestBackground()
+    ed.write "\e[?2004h"
+    if ed.painter != nil:
+      ed.write "\x1b[?25l"
+    ed.renderRow = 0
+    fullRedraw(ed)
+
+var
+  DefaultShortcuts*: Table[string, string] = {
+    # ESC and CtrlC clear a non-empty line (discarding the text into
+    # history) and only cancel when the line is empty. So a cancel key
+    # pressed mid-turn with a typed draft edits the draft instead of
+    # interrupting the turn. Up/Down move by visual row and fall through
+    # to history at the boundary; CtrlP/CtrlN are history-only.
+    "cancel": "ESC CtrlC",
+    "clear": "ESC CtrlC",
+    "quit-if-empty": "CtrlD",
+    "home": "Home CtrlA",
+    "end": "End CtrlE",
+    "left": "Left CtrlB",
+    "right": "Right CtrlF",
+    "word-left": "AltB CtrlLeft",
+    "word-right": "AltF CtrlRight",
+    "up": "Up",
+    "down": "Down",
+    "history-previous": "CtrlP",
+    "history-next": "CtrlN",
+    "backspace": "Backspace",
+    "delete": "Delete",
+    "insert": "Insert",
+    "delete-word-left": "CtrlW",
+    "delete-to-boundary-left": "AltH",
+    "clear-screen": "CtrlL",
+    "suspend": "CtrlZ",
+    "complete": "Tab",
+    "reverse-complete": "ShiftTab",
+    "edit-in-editor": "AltE CtrlX CtrlE",
+    "insert-newline": "",
+    "select-left": "ShiftLeft",
+    "select-right": "ShiftRight",
+    "select-up": "ShiftUp",
+    "select-down": "ShiftDown",
+    "select-home": "ShiftHome",
+    "select-end": "ShiftEnd",
+    "select-word-left": "CtrlShiftLeft",
+    "select-word-right": "CtrlShiftRight",
+    "select-all": "",
+    "select-buffer-start": "CtrlShiftHome",
+    "select-buffer-end": "CtrlShiftEnd",
+    "buffer-start": "",
+    "buffer-end": "",
+    "cut": "CtrlX",
+    "copy": "AltW",
+    "paste": "CtrlV",
+    "yank": "CtrlY",
+    "delete-word-right": "AltD CtrlDelete",
+    "delete-to-boundary-right": "",
+    "delete-to-eol": "CtrlK",
+    "delete-to-bol": "",
+    "transpose-chars": "CtrlT"
+  }.toTable
+
+var CommandProcs*: Table[string, KeyCallback]
+var CommandProcsAll* {.threadvar.}: Table[string, KeyCallback]
+
+proc normalizeKeyToken(token: string): string =
+  ## Convert a user shortcut token ("CtrlC", "Ctrl+C", "ESC", "Home",
+  ## "DoubleESC") into the internal key name DISPATCH/KEYMAP uses.
+  var t = token.strip.toLowerAscii.replace("+", "")
+  if t.startsWith("double"):
+    t = t[6 .. ^1]
+  if t == "esc" or t == "escape":
+    return "esc"
+  if t == "ctrlc": return "ctrl+c"
+  if t == "ctrld": return "ctrl+d"
+  if t == "ctrla": return "ctrl+a"
+  if t == "ctrle": return "ctrl+e"
+  if t == "ctrlb": return "ctrl+b"
+  if t == "ctrlf": return "ctrl+f"
+  if t == "ctrlg": return "ctrl+g"
+  if t == "ctrlh": return "ctrl+h"
+  if t == "ctrlj": return "ctrl+j"
+  if t == "ctrlk": return "ctrl+k"
+  if t == "ctrll": return "ctrl+l"
+  if t == "ctrlm": return "ctrl+m"
+  if t == "ctrln": return "ctrl+n"
+  if t == "ctrlp": return "ctrl+p"
+  if t == "ctrlu": return "ctrl+u"
+  if t == "ctrlv": return "ctrl+v"
+  if t == "ctrlw": return "ctrl+w"
+  if t == "ctrlt": return "ctrl+t"
+  if t == "ctrlx": return "ctrl+x"
+  if t == "ctrly": return "ctrl+y"
+  if t == "ctrlz": return "ctrl+z"
+  if t == "altb": return "alt+b"
+  if t == "alte": return "alt+e"
+  if t == "altf": return "alt+f"
+  if t == "alth": return "alt+h"
+  if t == "altd": return "alt+d"
+  if t == "altw": return "alt+w"
+  if t == "shift-tab" or t == "shifttab": return "shift-tab"
+  if t == "shiftleft": return "shift+left"
+  if t == "shiftright": return "shift+right"
+  if t == "shiftup": return "shift+up"
+  if t == "shiftdown": return "shift+down"
+  if t == "shifthome": return "shift+home"
+  if t == "shiftend": return "shift+end"
+  if t == "shiftdelete": return "shift+delete"
+  if t == "ctrlleft": return "ctrl+left"
+  if t == "ctrlright": return "ctrl+right"
+  if t == "ctrlup": return "ctrl+up"
+  if t == "ctrldown": return "ctrl+down"
+  if t == "ctrlhome": return "ctrl+home"
+  if t == "ctrlend": return "ctrl+end"
+  if t == "ctrldelete": return "ctrl+delete"
+  if t == "ctrlshiftleft": return "ctrl+shift+left"
+  if t == "ctrlshiftright": return "ctrl+shift+right"
+  if t == "ctrlshiftup": return "ctrl+shift+up"
+  if t == "ctrlshiftdown": return "ctrl+shift+down"
+  if t == "ctrlshifthome": return "ctrl+shift+home"
+  if t == "ctrlshiftend": return "ctrl+shift+end"
+  if t == "backspace": return "backspace"
+  if t == "tab": return "tab"
+  if t == "insert": return "insert"
+  if t == "delete": return "delete"
+  if t == "home": return "home"
+  if t == "end": return "end"
+  if t == "up": return "up"
+  if t == "down": return "down"
+  if t == "left": return "left"
+  if t == "right": return "right"
+  raise newException(ValueError, token)
+
+proc parseShortcutSpec*(spec: string): seq[KeySpec] =
+  ## Parse a space-separated shortcut value into internal key specs.
+  ## Empty string returns an empty sequence (unbind). Unknown tokens
+  ## raise ValueError with the offending token.
+  if spec.strip.len == 0: return
+  for token in strutils.splitWhitespace(spec):
+    let double = token.toLowerAscii.startsWith("double")
+    let keyName = normalizeKeyToken(token)
+    result.add (seqKey: keyName, times: if double: 2 else: 1)
+
+proc defaultBindings*(): Table[string, string] = DefaultShortcuts
+
+proc applyShortcuts*(shortcuts: Table[string, string]) =
+  ## Build DISPATCH/SEQCMDS/ESCMAP from a command -> spec table.
+  ## Start from the built-in defaults, then apply overrides/unbinds.
+  ## Must be called after `initKeyTables()`.
+  var merged = DefaultShortcuts
+  for cmd, spec in shortcuts:
+    if spec.strip.len == 0:
+      if merged.hasKey(cmd): merged.del(cmd)
+    else:
+      merged[cmd] = spec
+  DISPATCH = CritBitTree[seq[string]]()
+  KEYTIMES = initTable[string, int]()
+  for cmd, spec in merged:
+    for ks in parseShortcutSpec(spec):
+      if DISPATCH.hasKey(ks.seqKey):
+        var cmds = DISPATCH[ks.seqKey]
+        if cmd notin cmds: cmds.add(cmd)
+        DISPATCH[ks.seqKey] = cmds
+      else:
+        DISPATCH[ks.seqKey] = @[cmd]
+      KEYTIMES[ks.seqKey] = max(KEYTIMES.getOrDefault(ks.seqKey, 1), ks.times)
+  # Build ESCMAP and SEQCMDS from DISPATCH.
+  ESCMAP = @[]
+  SEQCMDS = @[]
+  var escTimes = 1
+  if "cancel" in merged:
+    for ks in parseShortcutSpec(merged["cancel"]):
+      if ks.seqKey == "esc": escTimes = max(escTimes, ks.times)
+  if "clear" in merged:
+    for ks in parseShortcutSpec(merged["clear"]):
+      if ks.seqKey == "esc": escTimes = max(escTimes, ks.times)
+  for keyName, cmds in DISPATCH:
+    if keyName == "esc":
+      for cmd in cmds:
+        ESCMAP.add (cmd, escTimes)
+      continue
+    if KEYSEQS.hasKey(keyName):
+      # One entry per sequence; handleEscape dispatches via the key name
+      # so multiple commands on the same key (if a user binds them) run
+      # through runCommandsForKey rather than the first CritBit match.
+      SEQCMDS.add (KEYSEQS[keyName], keyName)
+  # Install command callbacks into KEYMAP so the dispatcher can invoke
+  # them by name. Editing commands are looked up directly by command
+  # name; "esc" keys run ESCMAP separately in handleEscape.
+  if CommandProcs.len == 0:
+    CommandProcs = initTable[string, KeyCallback]()
+    CommandProcs["cancel"] = cmdCancel
+    CommandProcs["clear"] = cmdClear
+    CommandProcs["quit-if-empty"] = cmdQuitIfEmpty
+    CommandProcs["home"] = cmdHome
+    CommandProcs["end"] = cmdEnd
+    CommandProcs["left"] = cmdLeft
+    CommandProcs["right"] = cmdRight
+    CommandProcs["word-left"] = cmdWordLeft
+    CommandProcs["word-right"] = cmdWordRight
+    CommandProcs["up"] = cmdUp
+    CommandProcs["down"] = cmdDown
+    CommandProcs["history-previous"] = cmdHistoryPrevious
+    CommandProcs["history-next"] = cmdHistoryNext
+    CommandProcs["backspace"] = cmdBackspace
+    CommandProcs["delete"] = cmdDelete
+    CommandProcs["insert"] = cmdInsert
+    CommandProcs["delete-word-left"] = cmdDeleteWordLeft
+    CommandProcs["delete-to-boundary-left"] = cmdDeleteToBoundaryLeft
+    CommandProcs["clear-screen"] = cmdClearScreen
+    CommandProcs["complete"] = cmdComplete
+    CommandProcs["reverse-complete"] = cmdReverseComplete
+    CommandProcs["edit-in-editor"] = cmdEditInEditor
+    CommandProcs["insert-newline"] = proc(ed: var LineEditor) =
+      ed.insertNewline()
+    CommandProcs["select-left"] = cmdSelectLeft
+    CommandProcs["select-right"] = cmdSelectRight
+    CommandProcs["select-up"] = cmdSelectUp
+    CommandProcs["select-down"] = cmdSelectDown
+    CommandProcs["select-home"] = cmdSelectHome
+    CommandProcs["select-end"] = cmdSelectEnd
+    CommandProcs["select-word-left"] = cmdSelectWordLeft
+    CommandProcs["select-word-right"] = cmdSelectWordRight
+    CommandProcs["select-all"] = cmdSelectAll
+    CommandProcs["select-buffer-start"] = cmdSelectBufferStart
+    CommandProcs["select-buffer-end"] = cmdSelectBufferEnd
+    CommandProcs["buffer-start"] = cmdBufferStart
+    CommandProcs["buffer-end"] = cmdBufferEnd
+    CommandProcs["cut"] = cmdCut
+    CommandProcs["copy"] = cmdCopy
+    CommandProcs["paste"] = cmdPaste
+    CommandProcs["yank"] = cmdYank
+    CommandProcs["delete-word-right"] = cmdDeleteWordRight
+    CommandProcs["delete-to-boundary-right"] = cmdDeleteToBoundaryRight
+    CommandProcs["delete-to-eol"] = cmdDeleteToEol
+    CommandProcs["delete-to-bol"] = cmdDeleteToBol
+    CommandProcs["transpose-chars"] = cmdTransposeChars
+  CommandProcsAll = CommandProcs
+  when not defined(posix):
+    CommandProcsAll["suspend"] = proc(ed: var LineEditor) = discard
+  for cmd, cb in CommandProcsAll:
+    KEYMAP["cmd:" & cmd] = cb
+  cancelWatchSnapshot = cancelWatchBytes()
+
+proc runCommandsForKey*(ed: var LineEditor, keyName: string): bool =
+  ## Run the commands bound to `keyName`. Returns true if at least one
+  ## command was dispatched. Raises InputCancelled / EOFError as the
+  ## commands dictate.
+  if not DISPATCH.hasKey(keyName): return false
+  let cmds = DISPATCH[keyName]
+  # Consecutive-press requirement: DoubleCtrlC / DoubleESC set times=2.
+  let minTimes = KEYTIMES.getOrDefault(keyName, 1)
+  if ed.lastKeyName == keyName: inc ed.keyCount
+  else: ed.keyCount = 1
+  ed.lastKeyName = keyName
+  if ed.keyCount < minTimes:
+    # Swallow the pending press; repaint so the user sees feedback.
+    fullRedraw(ed)
+    return true
+  # Deterministic order: clear before cancel so a key bound to both
+  # (ESC and CtrlC by default) clears when the line has text and cancels
+  # when empty. A key bound only to cancel always cancels.
+  var ordered: seq[string] = @[]
+  if "clear" in cmds: ordered.add "clear"
+  if "cancel" in cmds: ordered.add "cancel"
+  for cmd in cmds:
+    if cmd != "clear" and cmd != "cancel": ordered.add cmd
+  var ran = false
+  for cmd in ordered:
+    case cmd
+    of "cancel":
+      cmdCancel(ed); ran = true
+    of "clear":
+      if ed.line.text.len > 0:
+        cmdClear(ed); ran = true; break
+    of "quit-if-empty":
+      if ed.line.text.len == 0:
+        cmdQuitIfEmpty(ed); ran = true
+    else:
+      if CommandProcsAll.hasKey(cmd):
+        CommandProcsAll[cmd](ed); ran = true
+  result = ran
+
+var configuredShortcuts*: Table[string, string]
+  ## Command -> spec table set by config.nim after parsing the
+  ## [shortcuts] section. Read-only after startup; every thread that
+  ## calls initKeyTables() picks it up, so the input thread and wizard
+  ## share the same bindings without locks.
+
+proc runEscCommands(ed: var LineEditor) =
+  ## Run ESCMAP commands. Default: ESC clears a non-empty line (adding
+  ## the text to history) and cancels only an empty one. Double-ESC
+  ## requires two presses. Unbound ESC still cancels (historical).
+  if runCommandsForKey(ed, "esc"): return
+  cmdCancel(ed)
+
+proc cancelWatchBytes*(): set[uint8] =
+  ## Derive the set of raw bytes the cancel watchers should recognise
+  ## from the currently active shortcuts. Includes ESC (27) when either
+  ## cancel or clear is bound to ESC, and the first byte of any bound
+  ## single-byte key.
+  result = {}
+  for keyName, cmds in DISPATCH:
+    if keyName == "esc":
+      if "cancel" in cmds or "clear" in cmds:
+        result.incl(27'u8)
+    elif keyName == "ctrl+c":
+      if "cancel" in cmds or "clear" in cmds:
+        result.incl(3'u8)
+    elif keyName == "ctrl+d":
+      if "quit-if-empty" in cmds:
+        result.incl(4'u8)
+  # Fallback: if dispatch is empty (before init), keep the legacy bytes.
+  if result == {}:
+    result = {3'u8, 27'u8}
+
+proc initKeyTables*() =
+  ## ``KEYNAMES``, ``KEYSEQS`` and ``KEYMAP`` are thread-local because
+  ## display code may temporarily override callbacks. New input threads
+  ## therefore must populate their own copies before reading keys.
+  if KEYMAP.hasKey("ctrl+c") and KEYSEQS.hasKey("left"):
+    # Main thread already has the module-level KEYMAP entries, so the
+    # populate path is skipped. cmd:* entries still come from applyShortcuts.
+    if not KEYMAP.hasKey("cmd:up"):
+      applyShortcuts(configuredShortcuts)
+    return
+  KEYNAMES[1]    = "ctrl+a"
+  KEYNAMES[2]    = "ctrl+b"
+  KEYNAMES[3]    = "ctrl+c"
+  KEYNAMES[4]    = "ctrl+d"
+  KEYNAMES[5]    = "ctrl+e"
+  KEYNAMES[6]    = "ctrl+f"
+  KEYNAMES[7]    = "ctrl+g"
+  KEYNAMES[8]    = "ctrl+h"
+  KEYNAMES[9]    = "tab"
+  KEYNAMES[10]   = "ctrl+j"
+  KEYNAMES[11]   = "ctrl+k"
+  KEYNAMES[12]   = "ctrl+l"
+  KEYNAMES[13]   = "ctrl+m"
+  KEYNAMES[14]   = "ctrl+n"
+  KEYNAMES[15]   = "ctrl+o"
+  KEYNAMES[16]   = "ctrl+p"
+  KEYNAMES[17]   = "ctrl+q"
+  KEYNAMES[18]   = "ctrl+r"
+  KEYNAMES[19]   = "ctrl+s"
+  KEYNAMES[20]   = "ctrl+t"
+  KEYNAMES[21]   = "ctrl+u"
+  KEYNAMES[22]   = "ctrl+v"
+  KEYNAMES[23]   = "ctrl+w"
+  KEYNAMES[24]   = "ctrl+x"
+  KEYNAMES[25]   = "ctrl+y"
+  KEYNAMES[26]   = "ctrl+z"
+
+  KEYSEQS["up"]         = @[27, 91, 65]
+  KEYSEQS["down"]       = @[27, 91, 66]
+  KEYSEQS["right"]      = @[27, 91, 67]
+  KEYSEQS["left"]       = @[27, 91, 68]
+  KEYSEQS["home"]       = @[27, 91, 72]
+  KEYSEQS["end"]        = @[27, 91, 70]
+  KEYSEQS["insert"]     = @[27, 91, 50, 126]
+  KEYSEQS["delete"]     = @[27, 91, 51, 126]
+  KEYSEQS["shift+left"]  = @[27, 91, 49, 59, 50, 68]
+  KEYSEQS["shift+right"] = @[27, 91, 49, 59, 50, 67]
+  KEYSEQS["shift+up"]    = @[27, 91, 49, 59, 50, 65]
+  KEYSEQS["shift+down"]  = @[27, 91, 49, 59, 50, 66]
+  KEYSEQS["shift+home"]  = @[27, 91, 49, 59, 50, 72]
+  KEYSEQS["shift+end"]   = @[27, 91, 49, 59, 50, 70]
+  KEYSEQS["ctrl+shift+left"]  = @[27, 91, 49, 59, 54, 68]
+  KEYSEQS["ctrl+shift+right"] = @[27, 91, 49, 59, 54, 67]
+  KEYSEQS["ctrl+shift+home"]  = @[27, 91, 49, 59, 54, 72]
+  KEYSEQS["ctrl+shift+end"]   = @[27, 91, 49, 59, 54, 70]
+  KEYSEQS["ctrl+left"]   = @[27, 91, 49, 59, 53, 68]
+  KEYSEQS["ctrl+right"]  = @[27, 91, 49, 59, 53, 67]
+  KEYSEQS["ctrl+home"]   = @[27, 91, 49, 59, 53, 72]
+  KEYSEQS["ctrl+end"]    = @[27, 91, 49, 59, 53, 70]
+  KEYSEQS["ctrl+delete"]  = @[27, 91, 51, 59, 53, 126]
+  KEYSEQS["shift+delete"]  = @[27, 91, 51, 59, 50, 126]
+
+  KEYMAP["backspace"] = proc(ed: var LineEditor) = ed.deletePrevious()
+  KEYMAP["delete"]    = proc(ed: var LineEditor) = ed.deleteNext()
+  KEYMAP["insert"]    = proc(ed: var LineEditor) =
+    ed.mode = if ed.mode == mdInsert: mdReplace else: mdInsert
+  KEYMAP["down"]      = proc(ed: var LineEditor) =
+    let pw = ed.promptW; let cw = ed.contPromptW
+    let width = max(2, ed.width)
+    let (curR, _) = cursorVisual(ed.line.text, ed.line.position, pw, cw, width)
+    let total = totalRows(ed.line.text, pw, cw, width)
+    if curR >= total - 1: ed.historyNext()
+    else: ed.visualDown()
+  KEYMAP["up"]        = proc(ed: var LineEditor) =
+    let pw = ed.promptW; let cw = ed.contPromptW
+    let width = max(2, ed.width)
+    let (curR, _) = cursorVisual(ed.line.text, ed.line.position, pw, cw, width)
+    if curR <= promptWrap(pw, width).head: ed.historyPrevious()
+    else: ed.visualUp()
+  KEYMAP["ctrl+n"]    = proc(ed: var LineEditor) = ed.historyNext()
+  KEYMAP["ctrl+p"]    = proc(ed: var LineEditor) = ed.historyPrevious()
+  KEYMAP["left"]      = proc(ed: var LineEditor) = ed.back()
+  KEYMAP["right"]     = proc(ed: var LineEditor) = ed.forward()
+  KEYMAP["ctrl+b"]    = proc(ed: var LineEditor) = ed.back()
+  KEYMAP["ctrl+f"]    = proc(ed: var LineEditor) = ed.forward()
+  KEYMAP["ctrl+u"]    = proc(ed: var LineEditor) = ed.clearLine()
+  KEYMAP["ctrl+a"]    = proc(ed: var LineEditor) = ed.goToStart()
+  KEYMAP["ctrl+e"]    = proc(ed: var LineEditor) = ed.goToEnd()
+  KEYMAP["home"]      = proc(ed: var LineEditor) = ed.goToStart()
+  KEYMAP["end"]       = proc(ed: var LineEditor) = ed.goToEnd()
+  KEYMAP["ctrl+w"]    = proc(ed: var LineEditor) = ed.deleteWordLeft()
+  KEYMAP["alt+b"]     = proc(ed: var LineEditor) = ed.wordLeft()
+  KEYMAP["alt+f"]     = proc(ed: var LineEditor) = ed.wordRight()
+  KEYMAP["alt+h"]     = proc(ed: var LineEditor) = ed.deleteToBoundaryLeft()
+  KEYMAP["ctrl+c"]    = proc(ed: var LineEditor) =
+    # Ctrl-C clears the line if text is present, otherwise cancels
+    # (at idle: nothing to cancel; during a turn / in the wizard:
+    # aborts the turn / wizard).
+    if ed.line.text.len > 0:
+      ed.clearLine()
+    else:
+      ed.canceled = true
+      raise newException(InputCancelled, "")
+  KEYMAP["ctrl+d"]    = proc(ed: var LineEditor) =
+    if ed.wizardMode:
+      # Ctrl-D is ignored in the provider wizard: it neither clears a
+      # char nor aborts. The user aborts with Ctrl-C or ESC on an empty
+      # line.
+      return
+    # Ctrl-D on an empty line asks to exit (EOFError). With text
+    # present it is a no-op: it never edits and never cancels a turn.
+    if ed.line.text.len == 0:
+      ed.eof = true
+      raise newException(EOFError, "")
+  KEYMAP["ctrl+l"]    = proc(ed: var LineEditor) =
+    ed.write "\x1b[H\x1b[2J"
+    ed.renderRow = 0
+    fullRedraw(ed)
+  when defined(posix):
+    KEYMAP["ctrl+z"]  = proc(ed: var LineEditor) =
+      ed.write "\n\e[?2004l"
+      if ed.painter != nil:
+        ed.write "\x1b[?25h"
+      resetAttributes()
+      stdout.flushFile()
+      requestBackground()
+      ed.write "\e[?2004h"
+      if ed.painter != nil:
+        ed.write "\x1b[?25l"
+      ed.renderRow = 0
+      fullRedraw(ed)
+  applyShortcuts(configuredShortcuts)
+
+# ---------- Completion ----------
+
+proc complCurrentWord(ed: LineEditor): string =
+  let position = ed.line.position
+  let words = ed.line.text[0 ..< position].split({' ', '\n'})
+  if words.len > 0: words[^1] else: ""
+
+proc complAdvance(ed: var LineEditor; offset: int) =
+  ## Move completion by `offset` steps (+1 forward, -1 backward).
+  ## Initialises state on first call; cycles on subsequent calls.
+  if ed.completionCallback.isNil: return
+  let word = ed.complCurrentWord()
+  # Fresh cycle: user just typed a new prefix
+  if ed.complIndex < 0 or ed.complIndex >= ed.complMatches.len or word != ed.complMatches[ed.complIndex]:
+    ed.complPrefix = word
+    ed.complMatches = ed.completionCallback(ed)
+      .filterIt(it.toLowerAscii.startsWith(ed.complPrefix.toLowerAscii))
+    if ed.complMatches.len == 0:
+      ed.complIndex = -1
+      return
+    ed.complIndex = 0
+    if ed.complPrefix.len > 0:
+      for _ in 0 ..< ed.complPrefix.len: ed.deletePrevious()
+    ed.insertText(ed.complMatches[0])
+    return
+  # Continue existing cycle
+  if ed.complMatches.len == 0: return
+  let oldIdx = ed.complIndex
+  ed.complIndex = (ed.complIndex + offset + ed.complMatches.len) mod ed.complMatches.len
+  for _ in 0 ..< ed.complMatches[oldIdx].len: ed.deletePrevious()
+  ed.insertText(ed.complMatches[ed.complIndex])
+
+proc completeLine*(ed: var LineEditor) =
+  ## Tab: insert the first match; each further Tab cycles forward. The
+  ## keystroke that breaks the cycle is NOT intercepted: it flows through
+  ## the normal readLineWith dispatch on the next iteration, so Enter
+  ## submits and any other key acts immediately on the completed line.
+  ed.complAdvance(+1)
+
+proc reverseCompleteLine*(ed: var LineEditor) =
+  ed.complAdvance(-1)
+
+# ---------- Bracketed paste ----------
+
+proc readBracketedPaste(ed: var LineEditor): string =
+  # Read characters until the bracketed paste end sequence ESC [ 201 ~
+  # The previous implementation built the entire string and used
+  # `endsWith` on each iteration, which can be inefficient for large
+  # pastes. Here we detect the terminator by checking the last five
+  # characters directly, avoiding a full scan each loop.
+  # Accumulation stops at MaxBufferBytes (the insert itself is capped
+  # too): the bytes are still drained so the pty queue empties, but a
+  # runaway paste can never grow memory without bound. The terminator
+  # is tracked in its own tail window so detection survives the cap.
+  const endSeq = "\e[201~"
+  const endLen = endSeq.len
+  var tail = ""
+  var capped = false
+  while true:
+    let b = ed.getCh()
+    if b < 0:
+      return result
+    if not capped:
+      if result.len >= MaxBufferBytes:
+        capped = true
+      else:
+        result.add b.chr
+    tail.add b.chr
+    if tail.len > endLen:
+      tail = tail[tail.len - endLen ..< tail.len]
+    if tail == endSeq:
+      # Remove the terminator and return the paste content. Only the
+      # uncapped run can end with it: past the cap nothing was appended.
+      if not capped and result.len >= endLen:
+        result.setLen(result.len - endLen)
+      return result
+
+proc stdinHasByteNow*(): bool =
+  ## Return true if stdin has at least one byte available right now
+  ## (0ms poll). Used to detect paste bursts: when bytes arrive with
+  ## no inter-byte gap, we're in a paste, and a newline should be
+  ## treated as part of the paste rather than as submit.
+  if pollStdinNowHook != nil:
+    return pollStdinNowHook()
+  when defined(posix):
+    if isatty(0.cint) != 0:
+      var pfd: TPollfd
+      pfd.fd = 0.cint
+      pfd.events = POLLIN
+      let r = poll(addr pfd, 1.Tnfds, 0.cint)
+      return r > 0 and (pfd.revents and POLLIN) != 0
+  when defined(windows):
+    # Pipe stdin: byte-burst probe so a piped newline submits on arrival
+    # rather than waiting for a later key that never comes.
+    if not stdinConsole():
+      return pipeByteReady()
+  false
+
+# Terminal reply sequences (`CSI ... final`) the editor must never see:
+# DSR cursor reports (final 'R', both `CSI row;col R` and the DECXCPR
+# `CSI ? row;col R` form) and primary/secondary DA replies (final 'c').
+# They arrive unsolicited whenever anything queries the terminal while the
+# persistent reader owns stdin; without filtering they surface as phantom
+# keystrokes (the terminaldbg probe hit this live).
+var replyCaptureHook*: proc(bytes: string) {.closure.}
+
+template consumeTerminalReplyImpl*(readByteExpr: untyped): string =
+  ## With the leading ESC already read, consume a terminal reply sequence
+  ## if one follows. Returns the reply bytes, or "" when the input is
+  ## anything else — consumed bytes are replayed via `pushedBack`, and the
+  ## leading ESC is left for the caller to return. `readByteExpr` is an
+  ## expression yielding the next byte (int, -1 on none); callers gate on
+  ## `stdinHasByteNow()` before each read so it never blocks mid-burst.
+  var replyAcc {.gensym.} = ""
+  block scan:
+    if not stdinHasByteNow(): break scan
+    let b1 = readByteExpr
+    if b1 < 0: break scan
+    if b1 != '['.ord:
+      pushedBack.addFirst(b1)  # Alt chord / SS3: replay, not ours
+      break scan
+    replyAcc = "\x1b["
+    var isReply {.gensym.} = false
+    while replyAcc.len < 24 and stdinHasByteNow():
+      let c = readByteExpr
+      if c < 0: break
+      replyAcc.add c.chr
+      if c.chr in {'R', 'c'}:
+        isReply = true
+        break
+      if not (c.chr in {'0'..'9'} or c.chr in {';', '?'}):
+        break  # some other CSI final byte: not a reply we own
+    # A reply is `CSI [?] digits[;digits...] R|c`. Modified arrows
+    # share final 'R' (CSI 1;5R = Ctrl+Right), so validate the body
+    # shape, not just the final byte.
+    if isReply:
+      let body = replyAcc[2 ..< ^1]
+      for i, ch in body:
+        let okDigit = ch in {'0'..'9'}
+        let okSep = ch == ';' and i > 0
+        let okPriv = ch == '?' and i == 0
+        if not (okDigit or okSep or okPriv):
+          isReply = false
+          break
+    if not isReply:
+      for i in countdown(replyAcc.high, 1):
+        pushedBack.addFirst(replyAcc[i].ord.int)
+      replyAcc = ""
+  replyAcc
+
+template noteReplyCaptured*(reply: string) =
+  if replyCaptureHook != nil:
+    replyCaptureHook(reply)
+
+when defined(windows):
+  proc legacyConsoleTailKeyPress(): bool =
+    ## Legacy `_getch` console (VT input off): true when the queue holds
+    ## a key press whose char is a valid escape tail. `_getch` consumes
+    ## the record queue itself, so records are the right view there.
+    ## Peeks one record per call (INPUT_RECORD is 20 bytes; a batched
+    ## buffer would need the exact ABI stride to stay aligned).
+    var pending: int32 = 0
+    let h = getStdHandle(STD_INPUT_HANDLE_ML)
+    if h == 0 or getNumberOfConsoleInputEvents(h, addr pending) == 0 or
+        pending <= 0:
+      return false
+    for r in 0 ..< min(pending, 16):
+      var rec: ConsoleRecord
+      var got: int32 = 0
+      if peekConsoleInputW(h, addr rec[0], 1, addr got) == 0 or got == 0:
+        return false
+      if int32(uint16(rec[0])) != keyEventRecord: continue
+      if not recordKeyDown(addr rec): continue
+      let ch = recordChar(addr rec)
+      return ch != 0 and isEscapeTailByte(ch)
+    false
+
+proc terminalHasPendingInput*(): bool =
+  ## Return whether stdin has a pending byte that could be the tail of an
+  ## ESC-prefixed escape sequence. Polls briefly for burst-delivered
+  ## sequences (Alt chords, CSI/SS3 function keys), then peeks at the
+  ## byte. A bare Escape (no byte within the poll window) reports no
+  ## tail so `handleEscape` cancels; any byte that arrives — including
+  ## printable Alt-chord letters — is stashed and reported as a tail.
+  when defined(windows):
+    # Same contract as the POSIX branch below, through the record-based
+    # VT reader: wait one burst window for a translatable byte; a bare
+    # ESC (no second byte in time) reports no tail. Bytes already
+    # translated sit in `vtPending`, so the peek is exact for split CSI
+    # sequences; on a pipe PeekNamedPipe is the readiness probe. The
+    # legacy `_getch` console (no VT input flag) keeps the old record
+    # peek: `_getch` consumes the queue itself, so records are its view.
+    if termPeeked >= 0:
+      return true
+    if not stdinConsole():
+      return pipeByteReady()
+    if consoleVtInputOn():
+      if consoleFillVt(EscapeTailPollMs.cint):
+        return vtPending.len > 0 and isEscapeTailByte(vtPending[0])
+      return false
+    let deadline = epochTime() + EscapeTailPollMs.float / 1000.0
+    while epochTime() < deadline:
+      if legacyConsoleTailKeyPress():
+        return true
+      sleep 1
+    return legacyConsoleTailKeyPress()
+
+  when defined(posix):
+    if isatty(0.cint) != 0:
+      var pfd: TPollfd
+      pfd.fd = 0.cint
+      pfd.events = POLLIN
+      let r = poll(addr pfd, 1.Tnfds, EscapeTailPollMs.cint)
+      if r > 0 and (pfd.revents and POLLIN) != 0:
+        var ch: char
+        if posix.read(0.cint, addr ch, 1) == 1:
+          if inputInterceptHook != nil and inputInterceptHook(ch.ord.int):
+            return false
+          if ch == '\x1b':
+            let reply = consumeTerminalReplyImpl:
+              var b2: char
+              if posix.read(0.cint, addr b2, 1) == 1: b2.ord.int else: -1
+            if reply.len > 0:
+              noteReplyCaptured(reply)
+              return false
+          termPeeked = ch.ord.int
+          return isEscapeTailByte(ch.ord.int)
+      return false
+  true
+
+proc hasPendingEscapeTail(ed: LineEditor): bool =
+  ## POSIX terminals send a bare Escape with the same leading byte used
+  ## by arrow-key CSI sequences. Wait briefly for a tail byte; if none
+  ## arrives, treat it as a standalone cancel key.
+  # An embedded editor (tests, harnesses) supplies its own pending-byte
+  # probe via `hasPendingInput`; the fat prompt on Windows passes none,
+  # and the fallback used to be `true` (a phantom tail) because
+  # `terminalHasPendingInput` had no Windows peek: ESC then fell
+  # through to a blocking `_getch` for a second byte that never comes,
+  # freezing the input thread until the next keystroke. The `_kbhit`
+  # Windows branch makes the fallback honest.
+  if ed.hasPendingInput != nil:
+    ed.hasPendingInput()
+  else:
+    terminalHasPendingInput()
+
+# ---------- readLine driver ----------
+
+proc initEditor*(mode = mdInsert, historySize = 256, historyFile: string = ""): LineEditor =
+  result.mode = mode
+  result.history = historyInit(historySize, historyFile)
+  result.width = 80
+  result.contPrompt = "  "
+  result.escPutback = -1
+  result.selAnchor = -1
+
+proc resetForRead(ed: var LineEditor, prompt: string, hidechars: bool) =
+  if ed.prefillText.len > 0:
+    ed.line = Line(text: ed.prefillText, position: ed.prefillText.len)
+    ed.prefillText = ""
+  else:
+    ed.line = Line(text: "", position: 0)
+  ed.prompt = prompt
+  if ed.contPrompt.len == 0:
+    ed.contPrompt = "  "
+  ed.promptW = visualCols(prompt)
+  ed.contPromptW = visualCols(ed.contPrompt)
+  ed.renderRow = 0
+  ed.echoRows = 0
+  ed.submitted = false
+  ed.renderSuffix = ""
+  ed.renderSuffixCursor = false
+  ed.pendingCaret = false
+  ed.canceled = false
+  ed.eof = false
+  ed.hidechars = hidechars
+  ed.prevRowSpans = @[]
+  ed.complIndex = -1
+  ed.complMatches = @[]
+  ed.complPrefix = ""
+  ed.selAnchor = -1
+  if ed.getWidth != nil:
+    let w = ed.getWidth()
+    if w > 0: ed.width = w
+
+proc handleEscape*(ed: var LineEditor, c1: int): bool =
+  ## Process a single escape sequence starting just after the leading
+  ## prefix byte ``c1`` (POSIX: ESC = 27; Windows console: 0 or 224 for
+  ## extended keys). Returns ``true`` if the sequence requested a submit
+  ## (Shift+Enter / Alt+Enter — these now insert a real newline rather
+  ## than backslash-continuation).
+  if c1 == 27 and not ed.hasPendingEscapeTail():
+    # Bare ESC: dispatch via configured ESCMAP instead of hardcoded
+    # cancel.  If ESC is unbound, fall back to historical cancel.
+    runEscCommands(ed)
+    return false
+
+  template escCh(retries: int = 3): int =
+    block:
+      var r = ed.getCh()
+      if r < 0 and ed.deferSubmit:
+        for _ in 0 ..< retries:
+          r = ed.getCh()
+          if r >= 0:
+            break
+      r
+
+  let c2 = escCh()
+  if c2 < 0:
+    ed.canceled = true
+    raise newException(InputCancelled, "")
+  # Two-byte sequences. On Windows legacy consoles arrows / nav keys
+  # arrive as ``[224, X]`` (``[0, X]`` for a few function keys); the
+  # pair codes map straight onto the same command names the VT grammar
+  # uses, so both console modes dispatch identically. On POSIX KEYSEQS
+  # values are 3+ bytes so the SEQCMDS match below is a no-op there.
+  var s = @[c1.Key, c2.Key]
+  for (seq, keyName) in SEQCMDS:
+    if s == seq:
+      discard runCommandsForKey(ed, keyName)
+      return false
+  when defined(windows):
+    if c1 == 224 or c1 == 0:
+      let pairName =
+        case c2
+        of 72: "up"
+        of 80: "down"
+        of 77: "right"
+        of 75: "left"
+        of 71: "home"
+        of 79: "end"
+        of 82: "insert"
+        of 83: "delete"
+        else: ""
+      if pairName.len > 0:
+        discard runCommandsForKey(ed, pairName)
+        return false
+  if s == KEYSEQS["left"]:   ed.back();             return false
+  if s == KEYSEQS["right"]:  ed.forward();          return false
+  if s == KEYSEQS["up"]:     KEYMAP["up"](ed);      return false
+  if s == KEYSEQS["down"]:   KEYMAP["down"](ed);    return false
+  if s == KEYSEQS["home"]:   ed.goToStart();        return false
+  if s == KEYSEQS["end"]:    ed.goToEnd();          return false
+  if s == KEYSEQS["delete"]: ed.deleteNext();       return false
+  if s == KEYSEQS["insert"]: KEYMAP["insert"](ed);  return false
+  # Everything below is POSIX-specific (ESC + CR for Alt/Shift+Enter,
+  # CSI ``ESC [`` sequences, XMod, bracketed paste, kitty
+  # extensions). Windows' 0/224 prefixes have no further structure.
+  if c1 != 27: return false
+  if c2 == 13:
+    ed.insertNewline()
+    return false
+  # Alt+<key> two-byte sequences: ESC followed by the key's byte.
+  # A real Alt chord arrives as a burst so `hasPendingEscapeTail` saw
+  # the letter as a tail and routed us here; a bare Escape (human-paced)
+  # already canceled at the top of this proc.
+  const StructuralTail = {91, 79, 48..57, 126, 92, 93, 94, 95}
+    ## Second bytes that introduce a longer structural escape sequence
+    ## (CSI ``[``, SS3 ``O``, xterm/kitty digit-``~`` tails, etc.). These
+    ## have explicit handlers below and must NOT be treated as Alt-chord
+    ## letters even though they fall in the printable range.
+  var altName: string
+  if c2 == 8: altName = "alt+h"        # Ctrl+Alt+H = ESC + backspace byte
+  elif c2 in 32..126 and c2 notin StructuralTail:
+    altName = "alt+" & c2.char.toLowerAscii
+  if altName == "alt+e" and ed.editInEditor != nil:
+    ed.editInEditor(ed)
+    return false
+  if altName.len > 0 and DISPATCH.hasKey(altName):
+    discard runCommandsForKey(ed, altName)
+    return false
+  if altName.len > 0 and KEYMAP.hasKey(altName):
+    KEYMAP[altName](ed)
+    return false
+  # ESC + printable letter with no KEYMAP binding: treat the ESC as a bare
+  # cancel and put the letter back so the readLine loop prints it instead
+  # of swallowing it. Structural tails (CSI, SS3, digit/~) fall through to
+  # their own handlers below.
+  if altName.len > 0:
+    ed.escPutback = c2
+    ed.canceled = true
+    raise newException(InputCancelled, "")
+  if c2 == 93:  # OSC: `ESC ] ... (BEL | ESC \\)`
+    # A terminal control reply (e.g. the OSC 11 background-color answer)
+    # that arrived after the app stopped listening for it. It is not user
+    # input: swallow the whole sequence so it never repaints the prompt as
+    # a ghost `]11;rgb:...` line. Terminated by BEL or ST (ESC backslash);
+    # read until either, bounded so a malformed tail can't hang the read.
+    var prev = -1
+    for _ in 0 ..< 128:
+      let ch = escCh()
+      if ch < 0: break
+      if ch == 7: break                          # BEL
+      if prev == 27 and ch == 92: break          # ST: ESC \
+      prev = ch
+    return false
+  if c2 == 91:  # CSI
+    let c3 = escCh(25)
+    if c3 < 0: return false
+    s.add c3.Key
+    for (seq, keyName) in SEQCMDS:
+      if s == seq:
+        discard runCommandsForKey(ed, keyName)
+        return false
+    if s == KEYSEQS["right"]:  ed.forward(); return false
+    if s == KEYSEQS["left"]:   ed.back();    return false
+    if s == KEYSEQS["up"]:     KEYMAP["up"](ed);   return false
+    if s == KEYSEQS["down"]:   KEYMAP["down"](ed); return false
+    if s == KEYSEQS["home"]:   ed.goToStart(); return false
+    if s == KEYSEQS["end"]:    ed.goToEnd();   return false
+    if c3 == 90:
+      # Shift+Tab: reverse completion
+      ed.reverseCompleteLine()
+      return false
+    if c3 == 50 or c3 == 51:
+      let c4 = escCh()
+      if c4 < 0: return false
+      if c4 == 126 and c3 == 50:
+        KEYMAP["insert"](ed); return false
+      if c4 == 126 and c3 == 51:
+        ed.deleteNext(); return false
+      if c3 == 50 and c4 == 55:
+        # XMod: xterm modifyOtherKeys, ESC [ 27 ; <mod> ; <key> ~
+        let c5 = escCh()
+        if c5 == 59:
+          var modDigits = ""
+          var ch = escCh()
+          while ch >= 48 and ch <= 57:
+            modDigits.add ch.chr
+            ch = escCh()
+          if ch == 59:
+            var keyDigits = ""
+            ch = escCh()
+            while ch >= 48 and ch <= 57:
+              keyDigits.add ch.chr
+              ch = escCh()
+            if ch == 126 and keyDigits == "13" and modDigits == "2":
+              ed.insertNewline()
+              return false
+        return false
+      if c3 == 50 and c4 == 48:
+        # bracketed paste start: ESC [ 200 ~
+        let c5 = escCh()
+        let c6 = escCh()
+        if c5 == 48 and c6 == 126:
+          let paste = readBracketedPaste(ed)
+          if paste.len > 0:
+            if ed.hidechars:
+              # Hidden inputs (api keys): drop CR/LF and any non-printable
+              # byte, append the rest to the buffer directly, write one `*`
+              # per kept byte. Avoids `insertText` -> `fullRedraw` (which
+              # would render the cleartext key on screen) and avoids
+              # `c1 == 10/13` early-submit if the clipboard had a trailing
+              # newline that the terminal happens to send raw.
+              var stars = 0
+              for ch in paste:
+                if ch.ord in PRINTABLE and ed.line.text.len < MaxBufferBytes:
+                  ed.line.text.add ch
+                  inc ed.line.position
+                  inc stars
+              if stars > 0:
+                ed.write repeat('*', stars)
+            else:
+              # Normalize line endings: `\r\n` -> `\n`, bare `\r` ->
+              # `\n`. A bare CR is itself a valid line separator (classic
+              # Mac, some terminals/clipboards), so stripping every `\r`
+              # would collapse a CR-separated paste into one line.
+              var clean = newStringOfCap(paste.len)
+              var prev = '\0'
+              for ch in paste:
+                if ch == '\r':
+                  if prev != '\n': clean.add '\n'
+                elif ch == '\n':
+                  if prev != '\r': clean.add '\n'
+                else:
+                  clean.add ch
+                prev = ch
+              ed.insertText(clean)
+        return false
+      if c3 == 51 and c4 == 59:
+        # ESC [ 3 ; <mod> ~  (modified delete)
+        let modCh = escCh()
+        let final = escCh()
+        if final == 126:
+          let keyName =
+            if modCh == 53: "ctrl+delete"
+            elif modCh == 50: "shift+delete"
+            else: ""
+          if keyName.len > 0:
+            discard runCommandsForKey(ed, keyName)
+        return false
+    elif c3 == 49:
+      # ESC [ 1 ; <mod> <dir>  (modified arrows / home / end)
+      let c4 = escCh()
+      if c4 == 59:
+        let modifier = escCh()
+        let direction = escCh()
+        if direction in {65, 66, 67, 68, 72, 70}:
+          let dirName =
+            case direction
+            of 65: "up"
+            of 66: "down"
+            of 67: "right"
+            of 68: "left"
+            of 72: "home"
+            else: "end"
+          let keyName =
+            case modifier
+            of 50: "shift+" & dirName
+            of 53: "ctrl+" & dirName
+            of 54: "ctrl+shift+" & dirName
+            of 51: "alt+" & dirName
+            else: ""
+          if keyName.len > 0:
+            discard runCommandsForKey(ed, keyName)
+            return false
+          # Unbound modified key: fall back to the plain key's binding
+          # (a terminal that reports a modifier the user never asked for
+          # should not strand the arrow).
+          discard runCommandsForKey(ed, dirName)
+      elif c4 == 51:
+        # Kitty Shift+Enter: ESC [ 1 3 ; 2 u
+        let c5 = escCh()
+        if c5 == 59:
+          var modDigits = ""
+          var ch = escCh()
+          while ch >= 48 and ch <= 57:
+            modDigits.add ch.chr
+            ch = escCh()
+          if ch == 117 and modDigits == "2":
+            ed.insertNewline()
+      return false
+  return false
+
+proc readLineWith*(ed: var LineEditor, prompt: string,
+                   getCh: GetChProc, write: WriteProc,
+                   hidechars = false, noHistory = false,
+                   getWidth: WidthProc = nil,
+                   hasPendingInput: HasPendingInputProc = nil): string =
+  ## Pluggable form of ``readLine``. Provides the same behavior as
+  ## ``readLine`` but with explicit IO procs so tests can drive the
+  ## editor against a fake terminal.
+  initKeyTables()
+  ed.getCh = getCh
+  ed.write = write
+  ed.getWidth = getWidth
+  ed.hasPendingInput = hasPendingInput
+  defer:
+    # Leave ed.getCh, ed.write, ed.getWidth, ed.hasPendingInput set:
+    # the wizard and the input thread both overwrite them on their next
+    # readLineWith, and nilling them here races with a concurrent
+    # fullRedraw or getCh call in the other thread (the nil fn pointer
+    # is observable to the other thread's redraw, which then calls
+    # through nil).
+    discard
+  resetForRead(ed, prompt, hidechars)
+  # Bracketed paste is enabled by the caller (the input thread
+  # enables once in its termios setup; the test-only `readLine`
+  # enables once after its own termios setup) and disabled on
+  # process exit by `restoreTerminal` (registered as an exit
+  # proc). The per-read toggle used to live here but was
+  # idempotent noise — the host terminal only cares whether
+  # bracketed paste is on or off at the moment a paste arrives,
+  # and we want it on for the entire editor lifetime so the
+  # shell doesn't briefly see a literal `[200~…[201~` sequence
+  # between the disable (in the old defer) and the next read's
+  # enable.
+  fullRedraw(ed)
+  applyShortcuts(configuredShortcuts)
+  var c1: int
+  var putback = -1
+  # Repaint + show caret. Used to clear a just-cancelled deferred-submit
+  # suffix when the keystroke handler itself did not redraw (no-op arrow,
+  # insert toggle, unknown byte). Handlers that DO redraw already show the
+  # caret via the postRedraw hook, so this only runs for the no-redraw paths.
+  proc paintIfCleared(ed: var LineEditor; cleared: var bool) =
+    if cleared:
+      cleared = false
+      fullRedraw(ed)
+      # Standalone (painter-less) callers still use the physical cursor;
+      # the interactive app keeps it hidden all session and draws the
+      # caret cell instead.
+      if ed.painter == nil:
+        ed.write "\x1b[?25h"
+  while true:
+    var suffixJustCleared = false
+    if ed.escPutback >= 0:
+      c1 = ed.escPutback
+      ed.escPutback = -1
+    elif putback >= 0:
+      c1 = putback
+      putback = -1
+    else:
+      while true:
+        try:
+          c1 = ed.getCh()
+          break
+        except IOError:
+          if consumeResizePending():
+            fullRedraw(ed)
+            continue
+          raise
+    if c1 == wizardSentinel:
+      # The input thread is signalling a modal wizard wants the
+      # editor. Yield this readLineWith so the wizard can start.
+      raise newException(WizardSwitched, "")
+    if c1 < 0:
+      ed.eof = true
+      raise newException(EOFError, "")
+    # Serialize editor mutation + redraw with the background render threads
+    # (spinner/barTick) that read the same editor state under the terminal
+    # write lock. The mutation below (ed.line.text, ed.renderSuffix, ...) is
+    # otherwise unsynchronized with those readers and corrupts the heap.
+    callHook(ed.preMutate, ed)
+    try:
+      if c1 == 10 or c1 == 13:
+        # Hidden-mode (api key) paste burst detection: when a newline
+        # arrives immediately after other bytes (no inter-byte gap),
+        # it's part of a paste, not an Enter press. Drop it so the
+        # user doesn't submit a truncated key. Real Enter has a human
+        # pause before it — pollStdinNow() catches paste bursts only.
+        if hidechars and ed.line.text.len > 0 and stdinHasByteNow():
+          continue
+        if ed.deferSubmit:
+          ed.submitted = true
+          callHook(ed.onSubmit, ed)
+          fullRedraw(ed)
+          if not noHistory and not hidechars:
+            ed.historyAdd()
+          ed.historyFlush()
+          continue
+        parkAtEnd(ed)
+        ed.selAnchor = -1
+        if not noHistory and not hidechars:
+          ed.historyAdd()
+        ed.historyFlush()
+        ed.write "\x1b[?2004l"
+        ed.submitted = true
+        return ed.line.text
+      if ed.pendingCaret:
+        # Typing after a queued submit cancels the queue but keeps the
+        # buffered text and cursor position, so the new keystroke edits in
+        # place rather than starting over. Drop the pending glyph, restore
+        # the native caret, and recompute the editor height from the text
+        # alone (the suffix is gone). State only: no redraw here. The
+        # keystroke handler below (printChar, deletePrevious, etc.) already
+        # calls fullRedraw, so painting now would clear-and-repaint the
+        # whole footer region twice per keystroke. On terminals without
+        # DEC 2026 synchronized output that double clear is visible as a
+        # per-keystroke flash. Defer the single repaint to the handler; if
+        # the byte is ignored (no handler redraws), paint once below.
+        #
+        # Design contract: a prompt queued during a turn shows the
+        # hourglass. Cancelling the current turn with Ctrl-C or a bare ESC
+        # must send that queued prompt as the next user message, not drop
+        # it. So cancel keys raise InputCancelled *before* the teardown
+        # below drops the queue. If the user does not want it sent they
+        # delete the queued text first (any editing keystroke runs the
+        # teardown, cancels the queue, and lets them edit or clear the
+        # line before interrupting).
+        if c1 == 3 or (c1 == 27 and not ed.hasPendingEscapeTail()):
+          ed.canceled = true
+          raise newException(InputCancelled, "")
+        ed.pendingCaret = false
+        ed.renderSuffix = ""
+        ed.renderSuffixCursor = false
+        callHook(ed.onCancelDeferredSubmit, ed)
+        ed.echoRows = totalRows(ed.line.text, ed.promptW, ed.contPromptW,
+                                max(2, ed.width))
+        suffixJustCleared = true
+      if c1 == 8 or c1 == 127:
+        if runCommandsForKey(ed, "backspace"):
+          paintIfCleared(ed, suffixJustCleared)
+          continue
+        continue
+      if c1 == 9:
+        if runCommandsForKey(ed, "tab"):
+          paintIfCleared(ed, suffixJustCleared)
+          continue
+        continue
+      if c1 in PRINTABLE:
+        if hidechars:
+          ed.line.text.add c1.chr
+          inc ed.line.position
+          ed.write "*"
+        else:
+          ed.printChar(c1)
+        continue
+      if c1 in ESCAPES:
+        discard handleEscape(ed, c1)
+        paintIfCleared(ed, suffixJustCleared)
+        continue
+      if c1 == 24 and ed.hasSelection() and DISPATCH.hasKey("ctrl+x") and
+          "cut" in DISPATCH["ctrl+x"]:
+        # Ctrl+X with an active selection cuts it (the standard text
+        # widget contract). Without a selection Ctrl+X stays the emacs
+        # prefix below, so Ctrl+X Ctrl+E keeps working. Only the cut
+        # command runs: the key may also carry edit-in-editor's Ctrl+X
+        # prefix binding, and running that here would hand the buffer
+        # to $VISUAL on every cut.
+        if CommandProcsAll.hasKey("cut"):
+          CommandProcsAll["cut"](ed)
+        paintIfCleared(ed, suffixJustCleared)
+        continue
+      if c1 == 24 and ed.editInEditor != nil:
+        # Ctrl+X Ctrl+E (emacs edit-and-execute-command): read the second
+        # char; Ctrl+E opens the external editor, anything else is
+        # swallowed (Ctrl+X alone is a prefix, not an error).
+        let c2 = ed.getCh()
+        if c2 == 5:
+          ed.editInEditor(ed)
+        paintIfCleared(ed, suffixJustCleared)
+        continue
+      if c1 in CTRL:
+        let name =
+          if c1 >= 0 and c1 <= 31: KEYNAMES[c1] else: ""
+        if name.len > 0:
+          if runCommandsForKey(ed, name):
+            paintIfCleared(ed, suffixJustCleared)
+            continue
+          if KEYMAP.hasKey(name):
+            KEYMAP[name](ed)
+            paintIfCleared(ed, suffixJustCleared)
+            continue
+      # Multi-byte UTF-8: decode the full sequence and insert it.
+      if c1 >= 0x80:
+        var buf = ""
+        buf.add c1.char
+        let n = expectedSeqLen(c1)
+        var bad = false
+        for _ in 1 ..< n:
+          let b = ed.getCh()
+          if b >= 0 and (b and 0xC0) == 0x80:
+            buf.add b.char
+          else:
+            putback = b
+            bad = true
+            break
+        # Only commit a complete sequence; a truncated one would leave a
+        # malformed (invalid-UTF-8) buffer that breaks rune walking.
+        if not bad: ed.insertText(buf)
+        paintIfCleared(ed, suffixJustCleared)
+        continue
+      # Unknown byte: ignore. If we just cleared a deferred-submit suffix
+      # and no handler above redrew, paint once so the suffix glyph is gone.
+      paintIfCleared(ed, suffixJustCleared)
+  
+    finally:
+      callHook(ed.postMutate, ed)
+proc readLine*(ed: var LineEditor, prompt = "", hidechars = false,
+               noHistory = false): string =
+  let write: WriteProc = proc(s: string) =
+    stdout.write s
+    stdout.flushFile()
+  let getWidth: WidthProc = proc(): int =
+    try: terminalWidth() except CatchableError: 80
+  when defined(posix):
+    # Set raw mode ONCE for the whole line read; restore on exit. The
+    # previous getchr() flipped termios in/out of raw mode per byte,
+    # which leaves the terminal in cooked mode between reads with ECHO
+    # + ICANON + ISIG. That visibly echoed paste bytes onscreen (so
+    # bracketed-paste `[200~…[201~` showed up next to the api-key
+    # prompt instead of being captured atomically), and could turn a
+    # signal-interrupted read into a spurious EOF that aborted the
+    # wizard with "3code: aborted".
+    let fd = getFileHandle(stdin)
+    var oldMode: Termios
+    var haveOldMode = false
+    if isatty(fd) != 0 and fd.tcGetAttr(addr oldMode) == 0:
+      haveOldMode = true
+      recordCookedMode()
+      var rawMode = oldMode
+      rawMode.c_iflag = rawMode.c_iflag and not Cflag(BRKINT or ICRNL or
+        INPCK or ISTRIP or IXON)
+      rawMode.c_oflag = rawMode.c_oflag and not Cflag(OPOST)
+      rawMode.c_cflag = (rawMode.c_cflag and not Cflag(CSIZE or PARENB)) or CS8
+      rawMode.c_lflag = rawMode.c_lflag and not Cflag(ECHO or ICANON or
+        IEXTEN or ISIG)
+      rawMode.c_cc[VMIN] = char(1)
+      rawMode.c_cc[VTIME] = char(0)
+      discard fd.tcSetAttr(TCSANOW, addr rawMode)
+      recordRawMode()
+      # Enable bracketed paste. The production path (the input
+      # thread) enables once in its termios setup; the test-only
+      # `readLine` proc owns its own terminal, so it enables
+      # here. `restoreTerminal` (registered as an exit proc)
+      # disables on clean exit. The local `write` closure (the
+      # one passed to `ed.readLineWith`) is used instead of
+      # `stdout.write` directly so the bracketed-paste enable
+      # flows through the same path as the rest of the editor
+      # output.
+      write("\x1b[?2004h")
+    defer:
+      if haveOldMode:
+        discard fd.tcSetAttr(TCSADRAIN, addr oldMode)
+      clearRawMode()
+    let getCh: GetChProc = proc(): int =
+      stdout.flushFile()
+      if pushedBack.len > 0:
+        return pushedBack.popFirst()
+      if termPeeked >= 0:
+        result = termPeeked.int
+        termPeeked = -1
+        return result
+      while true:
+        var ch: char
+        let n = posix.read(fd.cint, addr ch, 1)
+        if n == 1:
+          if inputInterceptHook != nil and inputInterceptHook(ch.ord.int):
+            if pushedBack.len > 0:
+              return pushedBack.popFirst()
+            continue
+          if ch == '\x1b':
+            let reply = consumeTerminalReplyImpl:
+              var b2: char
+              if posix.read(fd.cint, addr b2, 1) == 1: b2.ord.int else: -1
+            if reply.len > 0:
+              noteReplyCaptured(reply)
+              if pushedBack.len > 0:
+                return pushedBack.popFirst()
+              continue
+            # Not a reply: replay any bytes the scan consumed, then let the
+            # editor's escape handling see the leading ESC.
+            if pushedBack.len > 0:
+              pushedBack.addLast(27)
+              return pushedBack.popFirst()
+          return ch.ord.int
+        # EINTR from SIGWINCH (and friends): retry. The outer driver
+        # uses `resizePending` to redraw on the next iteration; we
+        # surface EINTR as IOError so it can do that.
+        if n < 0 and errno == EINTR:
+          if consumeResizePending():
+            markResizePending()
+            raise newException(IOError, "interrupted")
+          continue
+        return -1
+    ed.readLineWith(prompt, getCh, write, hidechars = hidechars,
+                    noHistory = noHistory, getWidth = getWidth,
+                    hasPendingInput = terminalHasPendingInput)
+  else:
+    let getCh: GetChProc = proc(): int = getchr().int
+    ed.readLineWith(prompt, getCh, write, hidechars = hidechars,
+                    noHistory = noHistory, getWidth = getWidth,
+                    hasPendingInput = terminalHasPendingInput)
+
+proc password*(ed: var LineEditor, prompt = ""): string =
+  ed.readLine(prompt, true)
+
+when isMainModule:
+  proc test() =
+    var ed = initEditor(historyFile = "")
+    while true:
+      let s = ed.readLine("-> ")
+      stdout.writeLine "got: " & s.replace("\n", "\\n")
+  test()

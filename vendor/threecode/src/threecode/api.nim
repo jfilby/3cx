@@ -1,0 +1,3515 @@
+## HTTP client and SSE parsing.
+##
+## `callModel` is the single outbound call: it sends the messages array as an
+## OpenAI-compatible chat completions request, reads the Server-Sent Events
+## stream chunk by chunk, and returns a completed assistant `JsonNode` plus
+## a `Usage` record.
+##
+## XML tool call recovery handles a gpt-oss quirk: some nvidia-hosted variants
+## leak the model's native `<tool_call>` chat template into `delta.content`
+## instead of the OpenAI `tool_calls` field. When `xmlToolCalls` is set for a
+## combo, `callModel` promotes those tags to synthetic tool_calls so the rest
+## of the pipeline sees a uniform shape.
+
+import std/[algorithm, atomics, hashes, httpclient, json, locks, monotimes, nativesockets, net, options, os, sequtils, strformat, strutils, tables, times, uri]
+when defined(posix):
+  import std/posix except SocketHandle
+when defined(windows):
+  import std/winlean
+import streamhttp
+import types, util, prompts, streamexec, netthread, auth_openai, auth_google,
+       codeassist, anthropic, auth_anthropic, oauth
+
+type
+  VerifyProfileHook* = proc(p: Profile): (bool, string) {.closure.}
+  FetchModelsHook* = proc(url, key: string): (seq[string], string) {.closure.}
+  CodexModelsHook* = proc(url: string): seq[string] {.closure.}
+    ## Model slugs from the ChatGPT Codex backend. The subscription OAuth
+    ## token is not valid against api.openai.com/v1/models (403,
+    ## api.model.read), so chatgpt wizards list via the auth_openai
+    ## implementation installed as this hook instead.
+  BearerHook* = proc(p: Profile): string {.closure.}
+  ExtraHeadersHook* = proc(p: Profile): seq[(string, string)] {.closure.}
+    ## Extra request headers for a profile (ChatGPT Codex backend needs
+    ## `chatgpt-account-id` and friends). Nil-safe; called on the
+    ## streaming worker thread, so implementations must be gcsafe.
+    ## Resolves the Authorization bearer for a request. Default nil means
+    ## "use p.key as-is". OAuth-backed providers install a hook that
+    ## refreshes and returns a subscription token (see auth_xai).
+
+var
+  verifyProfileHook*: VerifyProfileHook
+  fetchModelsHook*: FetchModelsHook
+  codexModelsHook*: CodexModelsHook
+  bearerHook*: BearerHook
+  extraHeadersHook*: ExtraHeadersHook
+  extraHeadersProfile*: Profile
+    ## Set by `callModel` before dispatching the transport so
+    ## `requestHeaders` can resolve per-profile headers on the worker
+    ## thread, which receives no Profile. Written and read under the
+    ## `callModel` entry contract (one active turn at a time).
+
+proc bearerFor*(p: Profile): string =
+  if bearerHook != nil:
+    let t =
+      try:
+        bearerHook(p)
+      except OAuthError as e:
+        # A dead stored grant (refresh token expired/revoked/rotated out)
+        # raises OAuthError from deep inside the hook. Nothing between here
+        # and the REPL loop would catch it, so it used to kill the whole
+        # process mid-turn. ApiError is the turn-error channel: the turn
+        # loop renders it and the prompt survives.
+        let dot = p.name.find('.')
+        let provider = if dot > 0: p.name[0 ..< dot] else: p.name
+        raise newException(ApiError, provider & " login expired (" &
+          e.msg & "). sign in again: :provider rm " & provider &
+          ", then :provider add " & provider)
+    if t != "": return t
+  p.key
+
+const providerStub {.booldefine.} = false
+const httpStub {.booldefine.} = false
+  ## Test-only define. When true, `tests/testdata/stub/http.nim` is included and
+  ## `callHttp` is replaced by `callHttpStub` so the non-streaming path's
+  ## body→assistantMsg reconstruction, usage parsing, retry categorization,
+  ## and xml-tool-call promotion can be unit-tested without a network.
+  ## Pair with `providerStub=false`: the http stub tests the network layer
+  ## (non-streaming), the provider stub tests everything else. Sum = full
+  ## coverage.
+const ConnectTimeoutMs = 30_000
+const QuietRecvWakeMs* {.intdefine.} = 500
+  ## How long each blocking `recv` may stall before waking. With
+  ## streamhttp's `readTimeoutMs` set to this, `readLine` raises
+  ## `StreamTimeoutError` periodically so the stream loop can re-check
+  ## the quiet/interrupt flags. Must be well under `QuietTooLongMs`.
+  ## Kept at 1s so user interrupts (Ctrl-C) are honored within ~1s;
+  ## the extra poll overhead is negligible for trickle-rate streams.
+const VerifyTimeoutMs* {.intdefine.} = 30_000
+  ## Hard budget for a provider-verification ping (`verifyProfile`). Every
+  ## recv is bounded by `QuietRecvWakeMs` via `SO_RCVTIMEO`, so a stall
+  ## surfaces as a `StreamTimeoutError` each window; we retry until this
+  ## deadline then fail cleanly instead of blocking forever. 30s is
+  ## generous for a `max_tokens=1` ping that should answer in well under a
+  ## second. An `intdefine` so tests can shrink it.
+const NonStreamTooLongMs* {.intdefine.} = 1_800_000
+  ## Hard ceiling for ONE non-streaming wait (30min). With `:streaming
+  ## off` the provider is silent by design until the whole completion is
+  ## ready, so the 45s quiet watchdog cannot tell "generating" from
+  ## "black-holed peer" — the wait loops feed the watchdog clock per tick
+  ## and enforce this ceiling themselves instead. Long enough for the
+  ## slowest reasoning generations; past it the link is presumed dead and
+  ## the error rides the same NetworkHealthError retry path as a quiet
+  ## stream. An `intdefine` so tests can shrink it.
+const QuietTooLongMs* {.intdefine.} = 45_000
+  ## If a streaming response goes this long with no data from the
+  ## provider (45s), the turn is aborted. `posix.shutdown(fd)` from another
+  ## thread does not reliably wake a blocked TLS `recv`, so the stream
+  ## loop instead relies on `QuietRecvWakeMs`-bounded reads to wake up
+  ## and observe this threshold. That bound is enforced twice now:
+  ## `poll()` bounds the wait-for-readable step, and `SO_RCVTIMEO` (set
+  ## by `setReadTimeoutMs`) hard-bounds the blocking `SSL_read`/`recv`
+  ## that follows, closing the race where `poll` returns readable for a
+  ## TLS control record (close_notify, ticket, renegotiation) and the
+  ## subsequent `SSL_read` then blocks forever immune to the shutdown wake.
+
+proc isInterrupted*(): bool {.gcsafe.}
+# ---------- Cancellation and stream hooks ----------
+
+var interruptedFlag: Atomic[bool]
+  ## Set by the SIGINT hook and buffered prompt key path. Checked between
+  ## model/tool steps and during HTTP polling / retry backoff so ctrl-c drops
+  ## back to the prompt without killing the process.
+
+proc isInterrupted*(): bool {.gcsafe.} =
+  interruptedFlag.load(moAcquire)
+
+proc setInterrupted*(value: bool) {.gcsafe.} =
+  interruptedFlag.store(value, moRelease)
+
+proc clearInterrupted*() {.gcsafe.} =
+  setInterrupted(false)
+
+var networkQuietFlag: Atomic[bool]
+  ## Set by the quiet-watch thread when no provider data has arrived for
+  ## `QuietTooLongMs`. It then shuts down the cached socket fd (same wake
+  ## mechanism as ctrl-c) so the blocking `recv` in streamhttp returns and
+  ## the stream loop can surface the error instead of hanging forever.
+
+proc isNetworkQuiet*(): bool {.gcsafe.} =
+  networkQuietFlag.load(moAcquire)
+
+type StallClock = object
+  ## Transport-side fallback for the quiet watchdog. The flag above is set
+  ## by the fatprompt quiet-watch thread, which only exists while the TUI
+  ## turn loop runs; library consumers and testament-run tests drive
+  ## callModel with no watcher at all, so a response head that never
+  ## arrives used to park the recv loop forever (one missed external
+  ## signal = infinite hang). Every StreamTimeoutError wait in the
+  ## transports now also carries its own clock: any successful read
+  ## touches it, and QuietTooLongMs of silence breaks the wait with the
+  ## same canonical networkQuietMsg the external watcher would produce.
+  since: float
+
+proc touch(c: var StallClock) =
+  c.since = epochTime()
+
+proc quietTooLong(c: var StallClock): bool =
+  epochTime() - c.since >= QuietTooLongMs / 1000.0
+
+proc markNetworkQuiet*() {.gcsafe.} =
+  networkQuietFlag.store(true, moRelease)
+
+proc clearNetworkQuiet*() {.gcsafe.} =
+  networkQuietFlag.store(false, moRelease)
+
+type
+  ApiStreamHooks* = object
+    beforeCall*: proc(lastPromptTokens, window: int): string {.closure.}
+    afterCall*: proc() {.closure.}
+    progress*: proc(baseLabel: string; slurped: int) {.closure.}
+    setStatusLabel*: proc(label: string) {.closure.}
+    startSpinner*: proc(label: string) {.closure.}
+    stopSpinner*: proc() {.closure.}
+    providerActivity*: proc() {.closure.}
+    reasoningDelta*: proc(reasoning, baseLabel: string; slurped: int;
+                          contentStarted: bool) {.closure.}
+    contentDelta*: proc(chunk, baseLabel: string; slurped: int): bool {.closure.}
+    contentFinished*: proc(fullContent, baseLabel: string;
+                           slurped: int): bool {.closure.}
+    trimTrailingContent*: proc(fullContent, baseLabel: string;
+                               slurped: int) {.closure.}
+    afterLiveContent*: proc(baseLabel: string; slurped: int) {.closure.}
+    finalUsage*: proc(usage: Usage; window, elapsed: int;
+                      assistantContent: string; streamedLive: bool) {.closure.}
+    noUsage*: proc(elapsed: int) {.closure.}
+    retryNotice*: proc(msg: string) {.closure.}
+    retryWait*: proc(label: string; remainingS: int) {.closure.}
+      ## Enter the backoff countdown (spinner glyph swaps to a clock).
+    retryWaitTick*: proc(remainingS: int) {.closure.}
+      ## Update just the countdown seconds.
+    retryWaitClear*: proc() {.closure.}
+      ## Leave the countdown: the next HTTP attempt is starting.
+
+var apiStreamHooks*: ApiStreamHooks
+
+proc setApiStreamHooks*(hooks: ApiStreamHooks) =
+  apiStreamHooks = hooks
+
+proc hookBeforeCall(lastPromptTokens, window: int): string =
+  if apiStreamHooks.beforeCall != nil:
+    result = apiStreamHooks.beforeCall(lastPromptTokens, window)
+
+proc hookAfterCall() =
+  if apiStreamHooks.afterCall != nil: apiStreamHooks.afterCall()
+
+proc hookProgress(baseLabel: string; slurped: int) =
+  if apiStreamHooks.progress != nil:
+    apiStreamHooks.progress(baseLabel, slurped)
+
+proc hookSetStatusLabel(label: string) =
+  if apiStreamHooks.setStatusLabel != nil:
+    apiStreamHooks.setStatusLabel(label)
+
+proc hookStartSpinner(label: string) =
+  if apiStreamHooks.startSpinner != nil: apiStreamHooks.startSpinner(label)
+
+proc hookStopSpinner() =
+  if apiStreamHooks.stopSpinner != nil: apiStreamHooks.stopSpinner()
+
+proc hookProviderActivity() =
+  if apiStreamHooks.providerActivity != nil:
+    apiStreamHooks.providerActivity()
+
+proc hookReasoningDelta(reasoning, baseLabel: string; slurped: int;
+                        contentStarted: bool) =
+  if apiStreamHooks.reasoningDelta != nil:
+    apiStreamHooks.reasoningDelta(reasoning, baseLabel, slurped,
+                                  contentStarted)
+
+proc hookContentDelta(chunk, baseLabel: string; slurped: int): bool =
+  if apiStreamHooks.contentDelta != nil:
+    result = apiStreamHooks.contentDelta(chunk, baseLabel, slurped)
+
+proc hookContentFinished(fullContent, baseLabel: string; slurped: int): bool =
+  if apiStreamHooks.contentFinished != nil:
+    result = apiStreamHooks.contentFinished(fullContent, baseLabel, slurped)
+
+proc hookTrimTrailingContent(fullContent, baseLabel: string; slurped: int) =
+  if apiStreamHooks.trimTrailingContent != nil:
+    apiStreamHooks.trimTrailingContent(fullContent, baseLabel, slurped)
+
+proc hookAfterLiveContent(baseLabel: string; slurped: int) =
+  if apiStreamHooks.afterLiveContent != nil:
+    apiStreamHooks.afterLiveContent(baseLabel, slurped)
+
+proc hookFinalUsage(usage: Usage; window, elapsed: int;
+                    assistantContent: string; streamedLive: bool) =
+  if apiStreamHooks.finalUsage != nil:
+    apiStreamHooks.finalUsage(usage, window, elapsed, assistantContent,
+                              streamedLive)
+
+proc hookNoUsage(elapsed: int) =
+  if apiStreamHooks.noUsage != nil: apiStreamHooks.noUsage(elapsed)
+
+proc hookRetryNotice(msg: string) =
+  if apiStreamHooks.retryNotice != nil: apiStreamHooks.retryNotice(msg)
+
+proc hookRetryWait(label: string; remainingS: int) =
+  if apiStreamHooks.retryWait != nil:
+    apiStreamHooks.retryWait(label, remainingS)
+
+proc hookRetryWaitTick(remainingS: int) =
+  if apiStreamHooks.retryWaitTick != nil:
+    apiStreamHooks.retryWaitTick(remainingS)
+
+proc hookRetryWaitClear() =
+  if apiStreamHooks.retryWaitClear != nil: apiStreamHooks.retryWaitClear()
+
+
+proc parseUsage*(u: JsonNode): Usage =
+  ## Parses an OpenAI-compatible `usage` object. Cached-token accounting
+  ## differs by provider: OpenAI/DeepInfra/Anthropic report it under
+  ## `prompt_tokens_details.cached_tokens`; DeepSeek reports it flat as
+  ## `prompt_cache_hit_tokens`. We accept either.
+  if u == nil or u.kind != JObject: return
+  result.promptTokens = u{"prompt_tokens"}.getInt(0)
+  result.completionTokens = u{"completion_tokens"}.getInt(0)
+  result.totalTokens = u{"total_tokens"}.getInt(0)
+  let promptDetails = u{"prompt_tokens_details"}
+  if promptDetails != nil and promptDetails.kind == JObject:
+    result.cachedTokens = promptDetails{"cached_tokens"}.getInt(0)
+  if result.cachedTokens == 0:
+    result.cachedTokens = u{"prompt_cache_hit_tokens"}.getInt(0)
+  let completionDetails = u{"completion_tokens_details"}
+  if completionDetails != nil and completionDetails.kind == JObject:
+    result.reasoningTokens = completionDetails{"reasoning_tokens"}.getInt(0)
+
+proc classifyRetry*(exc: ref CatchableError, code: int): string =
+  ## Returns "server" for network errors and 5xx, "rate" for 429, "" for
+  ## anything else (not retryable). Pure-logic helper for the callModel
+  ## retry block.
+  if exc != nil: return "server"
+  case code
+  of 429: "rate"
+  of 500, 502, 503, 504: "server"
+  else: ""
+
+proc networkQuietMsg*(quietMs = QuietTooLongMs): string =
+  ## Canonical "network quiet for Ns" message the transport writes into
+  ## `StreamOutcome.errMsg`. `callModel` detects it via `isNetworkQuietMsg`
+  ## and raises a `NetworkHealthError`, which the retry loop treats as a
+  ## server error. One constructor so every call site carries the same
+  ## text (and the quiet budget that fired) without drift.
+  NetworkQuietPrefix & " " & $(quietMs div 1000) & "s"
+
+proc longestStringLeaf(j: JsonNode): string =
+  ## Longest string value in the tree. Ids, codes, types and urls are short;
+  ## the human-readable sentence is the longest field. Used as the fallback
+  ## for error shapes we don't know, so no raw JSON reaches the user.
+  case j.kind
+  of JString: result = j.getStr
+  of JNull, JBool, JInt, JFloat: discard
+  of JObject:
+    for _, v in pairs(j):
+      let s = longestStringLeaf(v)
+      if s.len > result.len: result = s
+  of JArray:
+    for v in items(j):
+      let s = longestStringLeaf(v)
+      if s.len > result.len: result = s
+
+proc extractErrorMsg*(errBody: string): string =
+  ## Pull a human-readable message from a JSON error body. Recognized
+  ## shapes: OpenAI/Anthropic `error.message`, Gemini-style flat `message`,
+  ## FastAPI-style `detail` (NVIDIA NIM emits this). Any other JSON object
+  ## yields its longest string leaf instead of raw JSON; non-JSON bodies
+  ## pass through verbatim.
+  if errBody.len == 0: return ""
+  let j = try: parseJson(errBody) except CatchableError: nil
+  if j == nil or j.kind != JObject: return errBody
+  let err = j{"error"}
+  if err != nil and err.kind == JObject:
+    let msg = err{"message"}.getStr("")
+    if msg.len > 0: return msg
+  elif err != nil and err.kind == JString and err.getStr.len > 0:
+    return err.getStr
+  for key in ["message", "detail"]:
+    let msg = j{key}.getStr("")
+    if msg.len > 0: return msg
+  longestStringLeaf(j)
+
+proc isCodeEcho(s: string; code: int): bool =
+  ## True when `s` carries no information beyond restating the HTTP status,
+  ## e.g. "", "error code: 502", "502". Such a message is redundant once the
+  ## code is shown in the trailing `(code N)` suffix.
+  let stripped = s.strip
+  if stripped.len == 0: return true
+  if code > 0 and stripped == $code: return true
+  if code > 0 and stripped == "error code: " & $code: return true
+  if stripped == "error": return true
+  false
+
+proc formatApiDetail*(errMsg, errBody: string; code: int): string =
+  ## Build the human-readable detail for an API error or retry notice in the
+  ## form `<message> (code N)` or just `<message>`. The message is the body's
+  ## error text if present, then the transport `errMsg`, then a bare "error".
+  ## The code is shown as a trailing `(code N)` so it never duplicates the
+  ## message the way a leading `502: error code: 502` did. Some gateways emit
+  ## a body whose message is just an "error code: N" echo of the status;
+  ## that carries no information beyond the code we already show, so it is
+  ## collapsed to a bare "error".
+  let rawBody = extractErrorMsg(errBody)
+  let msg =
+    if rawBody.len > 0 and not isCodeEcho(rawBody, code): rawBody
+    elif errMsg.len > 0: errMsg
+    else: "error"
+  if code != 0: msg & " (code " & $code & ")"
+  else: msg
+
+proc newHttpError*(code: int, errMsg, errBody: string): ref HttpError =
+  ## Build an `HttpError` carrying the status `code` as a field plus the
+  ## formatted detail as its message. Use this for every raise that has an
+  ## HTTP status, so callers can branch on the class (`except HttpError`)
+  ## and read `.code` instead of string-matching.
+  var e = newException(HttpError, formatApiDetail(errMsg, errBody, code))
+  e.code = code
+  e
+
+proc retryCategory*(errMsg: string, assistantMsg: JsonNode, statusCode: int): string =
+  # An explicit HTTP status wins: a 400/401/403 with an error body still has
+  # errMsg set and assistantMsg nil (the body isn't an assistant message), so
+  # the old "netFailed implies server" shortcut would wrongly retry a
+  # malformed request as if it were a transport blip. Only an unknown status
+  # (no HTTP response at all) falls back to the network heuristic.
+  case statusCode
+  of 0:
+    if errMsg != "" and assistantMsg == nil: "server" else: ""
+  of 429: "rate"
+  of 500, 502, 503, 504: "server"
+  else: ""
+
+var
+  # Retry state split by category — different semantics, different ceilings.
+  # A 5xx burst shouldn't inflate the backoff a later 429 sees, and vice versa.
+  serverRetryLevel = 0    # network errors + 5xx (server hiccup; recovers fast)
+  serverLastTs = 0.0
+  rateRetryLevel = 0      # 429 specifically (rate limit / capacity crunch)
+  rateLastTs = 0.0
+
+proc decayLevel(level: var int, lastTs: var float, now: float) =
+  if level > 0 and lastTs > 0.0:
+    let idleMin = int((now - lastTs) / 60.0)
+    if idleMin > 0:
+      level = max(0, level - idleMin)
+      lastTs = now
+
+var emptyRetryLevel = 0
+  ## Backoff level for empty-assistant-reply resends (`runTurns`'s
+  ## length/steer/resend loop). Independent of the transport categories
+  ## so a burst of empties doesn't inflate a later 5xx's backoff.
+var emptyLastTs = 0.0
+
+proc decayEmptyRetryLevel*(now: float) =
+  decayLevel(emptyRetryLevel, emptyLastTs, now)
+
+proc emptyReplyBackoffS*(): int =
+  min(1 shl emptyRetryLevel, 32)
+
+proc incEmptyRetryLevel*() =
+  inc emptyRetryLevel
+  emptyLastTs = epochTime()
+
+proc emptyReplyWait*(): bool =
+  ## Back off before the next empty-reply resend, keeping the spinner
+  ## live and honoring Ctrl-C. Returns true when interrupted (caller
+  ## aborts the turn); false when the wait elapsed.
+  let backoff = emptyReplyBackoffS()
+  hookStartSpinner("")
+  block wait:
+    var remaining = backoff * 1000
+    while remaining > 0:
+      if isInterrupted(): break wait
+      let step = min(100, remaining)
+      sleep(step)
+      remaining -= step
+  isInterrupted()
+
+# ---- Streaming HTTP via streamhttp ----
+#
+# `streamhttp` is a tiny synchronous TLS HTTP/1.1 client we ship as a
+# separate package — it reads chunked SSE bodies line by line on the
+# main thread, blocking on `recv` between chunks. The threaded spinner
+# paints in its own thread while we block on the socket here.
+# Cancellation on Ctrl-C closes `conn` from the signal hook.
+#
+# Connection reuse: the StreamConn is cached at module scope keyed by
+# host:port and reused across turns to the same provider — saving
+# the TLS handshake (1-2 RTT + crypto) per turn. After a clean body
+# end (chunked terminator), the conn stays alive for the next call.
+# If the server has closed its end during the idle window, the next
+# `sendRequest`/`readResponseHead` raises; we close the cached conn,
+# reconnect once, and retry. Mid-body errors and Ctrl-C also drop the
+# cache so the next turn starts on a fresh socket.
+var cachedStreamConn: StreamConn
+var cachedStreamHostKey: string
+var lastRequestBodyBytes* = 0
+  ## Byte length of the body the most recent real (non-stub) `callModel`
+  ## serialized for the wire. Published for the turn loop's byte-envelope
+  ## guard: Zen-family gateways reject oversized request bodies with an
+  ## opaque 400 well before the token context limit, and only the actual
+  ## body size (tools + system + history, after provider-specific
+  ## wrapping) predicts that — token counts cannot.
+# Mirror of the cached conn's fd, kept current so the SIGINT hook and
+# the stdin watcher thread can `posix.shutdown` it without touching
+# the GC'd `StreamConn` ref. Set/cleared alongside `cachedStreamConn`.
+var cachedStreamFd: SocketHandle = osInvalidSocket
+
+# A connect-in-progress fd, published by streamhttp's `onConnectingFd` hook
+# the instant the socket is created, before the blocking connect. Held in
+# `cachedStreamFd` so `shutdownCachedStreamFd` can interrupt a connect that
+# has not yet produced a `StreamConn` (the connect path only sets the cached
+# conn/fd after a successful connect). Cleared by `closeCachedStreamConn`.
+# See `installConnectingFdHook`.
+proc onConnectingFdHook(fd: SocketHandle) {.gcsafe.} =
+  cachedStreamFd = fd
+
+proc installConnectingFdHook*() =
+  ## Wire streamhttp's connect-time hook so a Ctrl-C / quiet-watch shutdown
+  # can wake a blocking TCP connect or TLS handshake. Without this the fd is
+  # unknown to us until connectTls/connectPlain returns, so there is nothing
+  # to `shutdown`, and a slow/black-holed remote pins the caller for the full
+  # connect budget regardless of any interrupt. Idempotent.
+  onConnectingFd = onConnectingFdHook
+
+# Install at module load so every connect path (streaming, non-streaming,
+# first turn or retry) publishes its fd before the blocking connect. There is
+# no scenario where we want a connect to be uninterruptible, so this is not
+# opt-in.
+installConnectingFdHook()
+
+proc closeCachedStreamConn*() =
+  ## Drop the cached connection. `StreamConn.close` is non-blocking and safe
+  ## from any thread: it frees the OpenSSL handle and closes the fd directly,
+  ## skipping the bidirectional TLS `close_notify` that would otherwise hang
+  ## forever against a black-holed peer (the wedge a leaked network worker
+  ## hit, where Ctrl-C/ESC could not cancel a teardown close()). No need to
+  ## branch on interrupted/quiet - one path for all cases.
+  if cachedStreamConn != nil:
+    try: cachedStreamConn.close() except CatchableError: discard
+    cachedStreamConn = nil
+    cachedStreamHostKey = ""
+  cachedStreamFd = osInvalidSocket
+
+when defined(posix):
+  var MSG_DONTWAIT {.importc: "MSG_DONTWAIT", header: "<sys/socket.h>".}: cint
+
+proc cachedConnClosedByPeer(): bool =
+  ## Non-blocking peek at the cached fd: a 0-byte read at EOF means the
+  ## peer closed its side (every `Connection: close` reply). EAGAIN means
+  ## nothing pending and the conn is alive; any other error counts as
+  ## dead. Reusing a peer-closed conn wedged `send` in a tight retry that
+  ## never surfaced as an exception, so the stale-cache recovery in
+  ## callHttp/streamHttp never engaged.
+  when defined(posix):
+    let fd = cachedStreamFd
+    if fd == osInvalidSocket: return true
+    var buf: array[1, char]
+    let n = posix.recv(posix.SocketHandle(fd), addr buf[0], 1,
+                       (posix.MSG_PEEK or MSG_DONTWAIT).cint)
+    if n == 0: return true
+    if n > 0: return false
+    let err = errno
+    return not (err == EAGAIN.cint or err == EWOULDBLOCK.cint)
+  else:
+    false
+
+proc acquireStreamConn(host: string; port: Port; plainHttp: bool): StreamConn =
+  let identity = (if plainHttp: "http://" else: "https://") & host & ":" & $port.uint16
+  if cachedStreamConn != nil and cachedStreamHostKey == identity and
+      not cachedConnClosedByPeer():
+    return cachedStreamConn
+  closeCachedStreamConn()
+  try:
+    result = if plainHttp:
+      connectPlain(host, port, timeoutMs = ConnectTimeoutMs)
+    else:
+      connectTls(host, port, timeoutMs = ConnectTimeoutMs, caFile = bundledCaFile())
+  except CatchableError:
+    invalidateResolved(host, port)
+    raise
+  cachedStreamConn = result
+  cachedStreamHostKey = identity
+  cachedStreamFd = result.getFd
+
+proc shutdownCachedStreamFd*() {.gcsafe.} =
+  ## Async-signal-safe: only the `shutdown` syscall, no allocation, no
+  ## Nim GC traffic. Forces a blocking `recv` on `cachedStreamConn` to
+  ## return so the streamHttp loop observes the interrupt/quiet flags and
+  ## bails. Safe to call from a SIGINT hook, the quiet-watch thread, or
+  ## the stdin watcher thread.
+  when defined(posix):
+    let fd = cachedStreamFd
+    if fd != osInvalidSocket:
+      discard posix.shutdown(posix.SocketHandle(fd), SHUT_RDWR.cint)
+  else:
+    # Winsock shutdown wakes a blocked recv/SSL_read on the socket from
+    # any thread, same contract as the POSIX branch. Without it a Ctrl-C /
+    # ESC during a wedged provider read sets the flag but nothing ever
+    # observes it: the stream loop is parked in recv with no timeout.
+    let fd = cachedStreamFd
+    if fd != osInvalidSocket:
+      discard winlean.shutdown(fd, 2'i32)  # SD_BOTH
+
+proc requestTurnInterrupt*(source = "unspecified") {.gcsafe.} =
+  ## One cancellation path for signal hooks, buffered prompt keys, and
+  ## stream/tool stdin watchers. Setting the flag alone is not enough:
+  ## blocking HTTP reads must be woken and active tool subprocesses must
+  ## be signalled, otherwise Ctrl-C appears to do nothing until the
+  ## provider or command produces output. `source` is a debug breadcrumb
+  ## (visible with -D) naming the watcher/hook that fired, so a spurious
+  ## "interrupted by user" on a turn nobody cancelled can be traced.
+  debugOut("interrupt flag set", source)
+  setInterrupted(true)
+  shutdownCachedStreamFd()
+  cancelActiveTool()
+
+proc requestQuietShutdown*() {.gcsafe.} =
+  ## Wakes a blocked HTTP read because the provider has been quiet too long,
+  ## WITHOUT setting the user-interrupt flag. The streamHttp loop will see
+  ## `isNetworkQuiet()` and surface a dedicated error; the user sees a
+  ## timeout notice, not "interrupted by user". Kept separate from
+  ## `requestTurnInterrupt` because that path sets `interruptedFlag`, which
+  ## confuses `callModel`'s retry logic (retries fail immediately as
+  ## "interrupted during backoff") and masks the real cause.
+  markNetworkQuiet()
+  shutdownCachedStreamFd()
+
+proc stripLeadingTrailingBlankLines*(s: string): string =
+  ## Drop blank (whitespace-only) lines from the start and end of `s`.
+  ## Internal blank lines survive so paragraph spacing and fenced code
+  ## stay intact. Normalizes assistant content the model pads with
+  ## leading/trailing newlines.
+  if s.len == 0: return s
+  var lines = s.replace("\r\n", "\n").replace("\r", "\n").splitLines
+  var first = 0
+  while first < lines.len and lines[first].strip.len == 0:
+    inc first
+  if first >= lines.len:
+    return ""
+  var last = lines.len - 1
+  while last > first and lines[last].strip.len == 0:
+    dec last
+  result = lines[first .. last].join("\n")
+
+proc buildStreamAssistantMsg*(content, reasoning: string,
+                              tools: OrderedTable[int, JsonNode],
+                              usage: Usage,
+                              wasInterrupted = false;
+                              finishReason = "";
+                              reasoningBlocks: seq[JsonNode] = @[]): JsonNode =
+  ## Build the assistant message reconstructed from an SSE stream.
+  ## Returns nil only when the stream produced nothing at all: no
+  ## content/tools/reasoning, no usage, no finish_reason, which signals a
+  ## transport-level problem the callModel retry block handles. A stream
+  ## that produced usage and/or a finish_reason but no visible content
+  ## (e.g. the model spent its whole budget on reasoning, finish_reason
+  ## "length") is NOT nil: it is handed back carrying `finish_reason` so
+  ## the turn loop can branch on it instead of dead-ending.
+  if content.len == 0 and tools.len == 0 and reasoning.len == 0 and
+     usage.totalTokens == 0 and finishReason.len == 0:
+    return nil
+  result = %*{"role": "assistant", "content": stripLeadingTrailingBlankLines(content)}
+  if finishReason.len > 0:
+    result["finish_reason"] = %finishReason
+  # DeepSeek-R1-style reasoning models REQUIRE the `reasoning_content`
+  # field on every assistant message in history — even when the model
+  # emitted no reasoning on that turn. Drop it and the next API call
+  # fails with `invalid_request_error`. Always set it; other providers
+  # ignore the extra field.
+  result["reasoning_content"] = %reasoning
+  if reasoningBlocks.len > 0:
+    # Anthropic thinking blocks for tool-loop replay; an internal
+    # field (see stripInternalFields / anthropic.nim).
+    result["reasoning_blocks"] = %reasoningBlocks
+  if tools.len > 0:
+    var tcArr = newJArray()
+    var keys = toSeq(tools.keys).sorted
+    for k in keys: tcArr.add tools[k]
+    result["tool_calls"] = tcArr
+  if wasInterrupted:
+    result["interrupted"] = %true
+
+proc parseXmlToolCalls*(content: string): tuple[cleaned: string, calls: seq[JsonNode]] =
+  ## Extract native `<tool_call>...</tool_call>` blocks from `content`
+  ## and promote them to OpenAI-style `tool_calls` entries. Two body
+  ## shapes: Hermes-style JSON (`{"name": ..., "arguments": {...}}`,
+  ## Kolibri/Qwen3) and GLM's `NAME<arg_key>K</arg_key>
+  ## <arg_value>V</arg_value>` markup. Returns the content with those
+  ## blocks removed and the synthesized calls.
+  ##
+  ## Some endpoints (e.g. nvidia z-ai/glm-5.2 mid-turn) leak the model's
+  ## chat-template tokens into the SSE content stream instead of parsing
+  ## them into `tool_calls` deltas. This parser is the fallback.
+  const
+    Open  = "<tool_call>"
+    Close = "</tool_call>"
+    KOpen = "<arg_key>"
+    KClose = "</arg_key>"
+    VOpen = "<arg_value>"
+    VClose = "</arg_value>"
+  var cleaned = ""
+  var calls: seq[JsonNode] = @[]
+  var i = 0
+  while i < content.len:
+    let openIdx = content.find(Open, i)
+    if openIdx < 0:
+      cleaned.add content[i .. ^1]
+      break
+    cleaned.add content[i ..< openIdx]
+    let closeIdx = content.find(Close, openIdx + Open.len)
+    if closeIdx < 0:
+      # Unterminated: keep tail as content rather than lose data.
+      cleaned.add content[openIdx .. ^1]
+      break
+    let inner = content[openIdx + Open.len ..< closeIdx]
+    # Hermes-style blocks carry a JSON body (Kolibri, Qwen3):
+    # <tool_call>{"name": "bash", "arguments": {"command": "ls"}}</tool_call>
+    # Try that shape first; the arg_key/arg_value markup below is GLM's.
+    var hermes = false
+    block:
+      let j = try: parseJson(inner.strip)
+              except CatchableError: nil
+      if j != nil and j.kind == JObject and j{"name"}.kind == JString:
+        let args =
+          if j{"arguments"}.kind == JString: j{"arguments"}.getStr
+          elif j{"arguments"}.kind != JNull: $j["arguments"]
+          else: "{}"
+        calls.add %*{
+          "id": "xmltc-" & $calls.len & "-" & toHex(hash(content[openIdx ..< closeIdx + Close.len]).uint64, 8),
+          "type": "function",
+          "function": {"name": j{"name"}.getStr, "arguments": args}
+        }
+        hermes = true
+    if hermes:
+      i = closeIdx + Close.len
+      continue
+    let firstK = inner.find(KOpen)
+    let name =
+      if firstK < 0: inner.strip()
+      else: inner[0 ..< firstK].strip()
+    var args = newJObject()
+    var p = (if firstK < 0: inner.len else: firstK)
+    while p < inner.len:
+      let kStart = inner.find(KOpen, p)
+      if kStart < 0: break
+      let kEnd = inner.find(KClose, kStart + KOpen.len)
+      if kEnd < 0: break
+      let key = inner[kStart + KOpen.len ..< kEnd].strip()
+      let vStart = inner.find(VOpen, kEnd + KClose.len)
+      if vStart < 0: break
+      let vEnd = inner.find(VClose, vStart + VOpen.len)
+      if vEnd < 0: break
+      let value = inner[vStart + VOpen.len ..< vEnd]
+      if key.len > 0: args[key] = %value
+      p = vEnd + VClose.len
+    if name.len > 0:
+      calls.add %*{
+        "id": "xmltc-" & $calls.len & "-" & toHex(hash(content[openIdx ..< closeIdx + Close.len]).uint64, 8),
+        "type": "function",
+        "function": {"name": name, "arguments": $args}
+      }
+    i = closeIdx + Close.len
+  result.cleaned = cleaned.strip(leading = false)
+  result.calls = calls
+
+proc accumulateToolCall(dst: JsonNode, delta: JsonNode) =
+  # Merge a tool_calls delta chunk into the accumulator slot. OpenAI-style
+  # providers emit `arguments` as partial strings across chunks; concatenate.
+  if delta.kind != JObject: return
+  if "id" in delta and delta["id"].getStr != "":
+    dst["id"] = delta["id"]
+  if "type" in delta and delta["type"].getStr != "":
+    dst["type"] = delta["type"]
+  let fn = delta{"function"}
+  if fn == nil or fn.kind != JObject: return
+  if fn{"name"}.getStr("") != "":
+    dst["function"]["name"] = %(dst["function"]["name"].getStr & fn{"name"}.getStr)
+  if "arguments" in fn:
+    dst["function"]["arguments"] = %(dst["function"]["arguments"].getStr & fn{"arguments"}.getStr(""))
+
+type XmlToolFilter = object
+  ## Streaming filter that drops `<tool_call>...</tool_call>` blocks from
+  ## live content output. State persists across SSE chunks so a tag may
+  ## span chunk boundaries.
+  pending: string
+  inside: bool
+
+const
+  XmlOpenTag = "<tool_call>"
+  XmlCloseTag = "</tool_call>"
+
+proc feed(f: var XmlToolFilter, c: string): string =
+  ## Append `c` to the filter and return the bytes safe to render now.
+  ## Bytes inside a `<tool_call>` block are dropped; bytes that might be
+  ## the start of an open tag are held back until we know.
+  f.pending.add c
+  result = ""
+  while f.pending.len > 0:
+    if f.inside:
+      let idx = f.pending.find(XmlCloseTag)
+      if idx < 0:
+        let keep = min(f.pending.len, XmlCloseTag.len - 1)
+        f.pending = f.pending[f.pending.len - keep .. ^1]
+        return
+      f.pending = f.pending[idx + XmlCloseTag.len .. ^1]
+      f.inside = false
+    else:
+      let idx = f.pending.find(XmlOpenTag)
+      if idx < 0:
+        let safeUpTo = f.pending.len - min(f.pending.len, XmlOpenTag.len - 1)
+        if safeUpTo > 0:
+          result.add f.pending[0 ..< safeUpTo]
+          f.pending = f.pending[safeUpTo .. ^1]
+        return
+      if idx > 0: result.add f.pending[0 ..< idx]
+      f.pending = f.pending[idx + XmlOpenTag.len .. ^1]
+      f.inside = true
+
+proc flushTail(f: var XmlToolFilter): string =
+  ## At end-of-stream, anything still pending outside a tool_call block
+  ## is real content — emit it. (Pending bytes inside an unterminated
+  ## block are dropped; that's expected: the parser will treat the block
+  ## as malformed and the post-stream history will retain raw content.)
+  if f.inside: return ""
+  result = f.pending
+  f.pending = ""
+
+proc chatgptProvider*(name: string): bool =
+  ## Profile/provider name that routes to the ChatGPT Codex backend
+  ## (subscription OAuth). Matches `chatgpt` itself plus any prefixed
+  ## spelling (e.g. a legacy `openai.chatgpt` profile name), so it takes
+  ## the full dotted name rather than the leading label.
+  let n = name.toLowerAscii
+  if n == "chatgpt": return true
+  for label in n.split('.'):
+    if label == "chatgpt": return true
+  false
+
+proc chatgptProfile*(p: Profile): bool =
+  chatgptProvider(p.name)
+
+proc geminicliProfile*(p: Profile): bool =
+  ## True when this profile speaks the Google Code Assist wire
+  ## (cloudcode-pa wrapped Gemini-native shape, OAuth token from
+  ## auth_google) instead of OpenAI chat completions.
+  providerOf(p) == "geminicli"
+
+proc anthropicProfile*(p: Profile): bool =
+  ## True when this profile speaks the Anthropic Messages wire
+  ## (`/messages` with typed content blocks; see anthropic.nim) instead
+  ## of OpenAI chat completions. The claude family covers Anthropic
+  ## direct and the Anthropic-protocol gateways.
+  p.family == "claude"
+
+proc claudecodeProfile*(p: Profile): bool =
+  ## True for the Claude-subscription twin (OAuth tokens from
+  ## auth_anthropic, `claudecode` provider). Same Messages wire as the
+  ## claude family, but Bearer + beta header instead of x-api-key and a
+  ## url pinned to api.anthropic.com.
+  providerOf(p) == "claudecode"
+
+proc requestUrl*(p: Profile): string =
+  ## Full request URL (scheme://host/path, no endpoint suffix). The
+  ## ChatGPT subscription token is not valid against api.openai.com, so
+  ## `chatgpt` profiles always post to the Codex backend regardless of
+  ## the configured url.
+  if chatgptProfile(p): auth_openai.CodexApiUrl
+  elif geminicliProfile(p): auth_google.CloudCodeApiUrl
+  elif claudecodeProfile(p):
+    # A local plain-http server url (transport tests, or a local
+    # Messages-protocol proxy) keeps its url; everything else pins
+    # api.anthropic.com, where the subscription token is valid.
+    if p.url.startsWith("http://") and
+        plainHttpHost(parseUri(p.url).hostname): p.url
+    else: auth_anthropic.ClaudeApiUrl
+  else: p.url
+
+proc endpointUrl*(p: Profile, responses, streaming: bool): string =
+  ## Full URL the transport POSTs to for this profile. OpenAI-shaped
+  ## providers append /responses or /chat/completions to the base;
+  ## geminicli pins the Code Assist v1internal methods (the
+  ## `?alt=sse` query selects server-sent events on the stream path).
+  let base = requestUrl(p)
+  if geminicliProfile(p):
+    if streaming: base & CodeAssistStreamPath
+    else: base & CodeAssistGeneratePath
+  elif anthropicProfile(p): base & AnthropicMessagesPath
+  elif responses: base & "/responses"
+  else: base & "/chat/completions"
+
+proc requestHeaders(p: Profile, key: string;
+                    accept: string): seq[(string, string)] =
+  ## Base headers every model request sends, plus whatever
+  ## `extraHeadersHook` adds for this profile (ChatGPT Codex wants
+  ## `chatgpt-account-id`, `OpenAI-Beta`, `originator`).
+  if claudecodeProfile(p):
+    # The subscription token authenticates as a Bearer with the OAuth
+    # beta opt-in; x-api-key is rejected for these credentials. The
+    # drop_block thinking replay adds its own beta on models that bind
+    # thinking blocks (anthropic-beta takes a comma list).
+    var betas = ClaudeOAuthBeta
+    if runsPrefixCheck(p.model):
+      betas.add "," & ThinkingBindingBeta
+    result = @[("Authorization", "Bearer " & key),
+               ("anthropic-version", AnthropicVersionHeader),
+               ("anthropic-beta", betas),
+               ("Content-Type", "application/json"),
+               ("Accept", accept),
+               ("User-Agent", ModelUserAgent)]
+  elif anthropicProfile(p):
+    # Anthropic-protocol endpoints take `x-api-key` + the pinned
+    # version header. drop_block thinking replay (see anthropic.nim)
+    # needs its beta opt-in on the models that bind thinking blocks.
+    var betas = ""
+    if runsPrefixCheck(p.model):
+      betas = ThinkingBindingBeta
+    result = @[("x-api-key", key),
+               ("anthropic-version", AnthropicVersionHeader),
+               ("Content-Type", "application/json"),
+               ("Accept", accept),
+               ("User-Agent", ModelUserAgent)]
+    if betas.len > 0:
+      result.insert(("anthropic-beta", betas), 2)
+  else:
+    result = @[("Authorization", "Bearer " & key),
+               ("Content-Type", "application/json"),
+               ("Accept", accept),
+               ("User-Agent", ModelUserAgent)]
+  if providerOf(p) in ["opencode", "opencodego"]:
+    # Zen/Go route and shard by this header; requests without it are
+    # rejected as of 2026-09-06. Stable across the conversation's turns
+    # (token-cache affinity), unique per conversation. One-shot calls
+    # (verify/summarize) fall back to a per-call id.
+    result.add ("x-opencode-session",
+      if conversationId != "": conversationId else: oneShotSessionId())
+  if extraHeadersHook != nil:
+    for kv in extraHeadersHook(p):
+      result.add kv
+
+proc sseFieldValue(line: string): string =
+  ## Value of an SSE `data:` line per the WHATWG spec: everything after
+  ## the colon with ONE optional leading space stripped. vLLM gateways
+  ## (inference.hetzner.com) frame chunks `data:{...}` without the space;
+  ## most providers send `data: {...}`. Both must parse.
+  result = line["data:".len .. ^1]
+  if result.len > 0 and result[0] == ' ': result = result[1 .. ^1]
+
+proc streamHttp(url, key, bodyStr: string, baseLabel: string,
+                slurped: var int, suppressXml: bool,
+                job: NetJob, codeAssist = false,
+                anthropic = false): StreamOutcome =
+  debugOut "streamHttp start"
+  # Post `bodyStr` to `url` and consume SSE chunks until `[DONE]`. `slurped`
+  # accumulates an approximate output-character count so the caller can
+  # show a live "↓ Nk" on the spinner; update it inline as chunks arrive.
+  # `suppressXml` enables a streaming filter that drops the model's
+  # `<tool_call>...</tool_call>` chat-template tags from live output for
+  # endpoints that leak them into delta.content (see xmlToolCallsFallback).
+  #
+  # Side effects (progress, content deltas, reasoning, the final assistant
+  # message) are fired as `NetDelta`s into `job` instead of calling the
+  # terminal hooks directly. The main thread drains and replays them. This
+  # lets the blocking recv loop run on a worker thread while the UI stays
+  # responsive.
+  let u = try: parseUri(url) except CatchableError as e:
+    result.errMsg = "bad url: " & e.msg
+    return
+  let host = u.hostname
+  let plainHttp = u.scheme == "http" and plainHttpHost(host)
+  if u.scheme != "https" and not plainHttp:
+    result.errMsg = "plain http is only allowed for local/LAN hosts, got: " & host
+    return
+  let port =
+    if u.port.len > 0: Port(parseInt(u.port))
+    elif plainHttp: Port(80)
+    else: Port(443)
+  let pathQuery =
+    block:
+      var pq = if u.path.len > 0: u.path else: "/"
+      if u.query.len > 0: pq.add "?" & u.query
+      pq
+
+  var conn: StreamConn
+  var resp: StreamResponse
+  var attempt = 0
+  while true:
+    if isInterrupted():
+      closeCachedStreamConn()
+      result.errMsg = InterruptedByUserMsg
+      return
+    inc attempt
+    try:
+      conn = acquireStreamConn(host, port, plainHttp)
+    except CatchableError as e:
+      result.errMsg = if isInterrupted(): InterruptedByUserMsg
+        else: connectFailMsg(endpointLabel(host, port, plainHttp), plainHttp, e)
+      return
+    conn.setReadTimeoutMs(QuietRecvWakeMs)
+    var headStall = StallClock(since: epochTime())
+    try:
+      conn.sendRequest("POST", pathQuery, host,
+                       headers = requestHeaders(
+                         extraHeadersProfile, key, "text/event-stream"),
+                       body = bodyStr)
+      fireActivity(job)
+      while true:
+        try:
+          resp = conn.readResponseHead()
+          break
+        except StreamTimeoutError:
+          if isInterrupted() or isNetworkQuiet() or headStall.quietTooLong():
+            closeCachedStreamConn()
+            break
+          continue
+      if resp.status == 0 and resp.headers.len == 0:
+        if isInterrupted() and not isNetworkQuiet():
+          result.errMsg = InterruptedByUserMsg
+        else:
+          result.errMsg = networkQuietMsg()
+        return
+      fireActivity(job)
+      break
+    except CatchableError as e:
+      # Cached conn was stale (server-side keep-alive timeout, etc.) or
+      # the fresh connect's first send/head failed. Drop the cache and
+      # retry once with a fresh socket; second failure surfaces the
+      # error.
+      closeCachedStreamConn()
+      if attempt >= 2:
+        result.errMsg = "request failed: " & e.msg
+        return
+  result.statusCode = resp.status
+  result.retryAfter = resp.headers.getOrDefault("retry-after")
+
+  var accContent = ""
+  var accReasoning = ""
+  var accReasoningBlocks: seq[JsonNode] = @[]
+  var accTools = initOrderedTable[int, JsonNode]()
+  var nonSSE: seq[string]
+  var contentStarted = false
+  var xmlFilter = XmlToolFilter()
+  # Completion signals. A clean upstream EOF without either `[DONE]` or a
+  # non-empty `finish_reason` means the SSE stream was cut mid-response
+  # (server-side keepalive timeout, LB drop, etc.). We need to detect that
+  # because Nim's `readLine` returns `false` on graceful FIN and the loop
+  # exits without raising — so partial deltas would otherwise be returned
+  # as if they were a complete assistant turn, leaving the bullet `· Xs`
+  # marker on screen and stranding the user with an unfinished job.
+  var sawDone = false
+  var sawFinish = false
+  var finishReason = ""
+  var line = ""
+  var streamErr = ""
+  # OpenRouter (and other OpenAI-compatible gateways) emit mid-stream
+  # provider failures as a regular `data:` chunk carrying a top-level
+  # `error` object, with `choices[0].finish_reason` set to "error". The
+  # HTTP status stays 200 (headers were already committed), so without
+  # explicit detection the error is silently swallowed: finish_reason
+  # "error" produces an empty assistant message that the turn loop retries
+  # up to 12 times as a bare empty reply, never showing the provider's
+  # error message. Capture the error here so it surfaces to the user.
+  var sseErrorBody = ""
+  var sseErrorCode = 0
+  var caState: CodeAssistStreamState
+  var anthropicState: AnthropicStreamState
+  # Translated chunks queued by the Code Assist / Anthropic paths: one
+  # SSE event can fan out to several OpenAI payloads (delta + usage +
+  # [DONE]), replayed one per loop iteration.
+  var caQueue: seq[string]
+  var bodyStall = StallClock(since: epochTime())
+  while true:
+    # Drain translated Gemini chunks before reading another SSE line:
+    # one event can fan out to several OpenAI payloads.
+    var payload = ""
+    if caQueue.len > 0:
+      payload = caQueue[0]
+      caQueue.delete(0)
+      bodyStall.touch()
+    else:
+      var hasLine = false
+      try: hasLine = conn.readLine(line)
+      except StreamTimeoutError:
+        if isInterrupted() or isNetworkQuiet() or bodyStall.quietTooLong():
+          closeCachedStreamConn()
+          break
+        continue
+      except CatchableError as e:
+        streamErr = e.msg
+        closeCachedStreamConn()
+        break
+      if not hasLine: break
+      fireActivity(job)
+      bodyStall.touch()
+      if isInterrupted():
+        closeCachedStreamConn()
+        break
+      if line.startsWith("data:"):
+        payload = sseFieldValue(line)
+        if codeAssist:
+          caQueue = translateEvent(caState, payload)
+          continue
+        if anthropic:
+          caQueue = translateAnthropicEvent(anthropicState, payload)
+          continue
+    if payload.len > 0:
+      if payload.strip == "[DONE]":
+        sawDone = true
+        continue
+      let j = try: parseJson(payload)
+                 except CatchableError as e:
+                   # Empty payload or [DONE]-like comment is benign; anything
+                   # else that fails to parse is suspicious (truncated JSON).
+                   if payload.strip.len > 0:
+                     debugOut "malformed SSE data line: " & e.msg & " — " & payload
+                   continue
+      # Mid-stream error check (OpenRouter et al.): a top-level `error`
+      # object on a `data:` chunk signals a provider failure delivered
+      # in-band because the 200 status was already sent. Capture it and
+      # stop processing further chunks — the stream is terminated.
+      let errNode = j{"error"}
+      if errNode != nil and errNode.kind == JObject:
+        sseErrorBody = payload
+        let codeNode = errNode{"code"}
+        if codeNode != nil and codeNode.kind == JInt:
+          sseErrorCode = codeNode.getInt
+        break
+      let choices = j{"choices"}
+      if choices != nil and choices.kind == JArray and choices.len > 0:
+        let fr = choices[0]{"finish_reason"}
+        if fr != nil and fr.kind == JString and fr.getStr.len > 0:
+          sawFinish = true
+          finishReason = fr.getStr
+        let delta = choices[0]{"delta"}
+        if delta != nil and delta.kind == JObject:
+          # Reasoning chunks arrive on `reasoning_content` (DeepSeek, Qwen,
+          # Kimi) or `reasoning` (a few others). Always accumulate so we can
+          # echo back on the next turn; only render the ticker when enabled.
+          var r = delta{"reasoning_content"}.getStr("")
+          if r.len == 0: r = delta{"reasoning"}.getStr("")
+          var c = delta{"content"}.getStr("")
+          # Anthropic thinking block closed (see anthropic.nim): the
+          # exact (thinking, signature) pair for history replay.
+          let rblock = delta{"reasoning_block"}
+          if rblock != nil and rblock.kind == JObject:
+            accReasoningBlocks.add rblock
+          # Mistral-native chunked thinking: while the model reasons,
+          # delta.content is an array of typed chunks instead of a string
+          # ({"type":"thinking","thinking":[{"type":"text","text":..}]},
+          # plus a {"type":"text"} chunk on the thinking->answer
+          # transition). Fold both into the string paths below.
+          let cn = delta{"content"}
+          if cn != nil and cn.kind == JArray:
+            for chunk in cn:
+              case chunk{"type"}.getStr("")
+              of "thinking":
+                let th = chunk{"thinking"}
+                if th != nil and th.kind == JArray:
+                  for t in th:
+                    r &= t{"text"}.getStr("")
+              of "text":
+                c &= chunk{"text"}.getStr("")
+              else: discard
+          if r.len > 0:
+            accReasoning &= r
+            slurped += r.len
+            fireProgress(job, slurped)
+            if not contentStarted:
+              fireReasoning(job, accReasoning, slurped)
+          if c.len > 0:
+            accContent &= c
+            slurped += c.len
+            fireProgress(job, slurped)
+            let visible =
+              if suppressXml: feed(xmlFilter, c)
+              else: c
+            if visible.len > 0:
+              fireContent(job, visible, slurped)
+              contentStarted = true
+          let tcDelta = delta{"tool_calls"}
+          if tcDelta != nil and tcDelta.kind == JArray:
+            for tc in tcDelta:
+              let idx = tc{"index"}.getInt(0)
+              if idx notin accTools:
+                accTools[idx] = %*{
+                  "id": "", "type": "function",
+                  "function": {"name": "", "arguments": ""}
+                }
+              accumulateToolCall(accTools[idx], tc)
+              # tool args bytes also count as "output" for slurp feel
+              let fn = tc{"function"}
+              if fn != nil:
+                slurped += fn{"arguments"}.getStr("").len
+                fireProgress(job, slurped)
+      let u = j{"usage"}
+      if u != nil and u.kind == JObject:
+        result.usage = parseUsage(u)
+    elif payload.len == 0 and (line.startsWith("event:") or line.strip.len == 0 or
+         line.startsWith(": ")):  # SSE comment
+      discard
+    elif payload.len == 0:
+      nonSSE.add line
+
+  if suppressXml:
+    let tail = flushTail(xmlFilter)
+    if tail.len > 0:
+      fireContent(job, tail, slurped)
+      contentStarted = true
+
+  if contentStarted:
+    result.streamedLive = true
+    fireContentFinished(job, accContent, slurped)
+    fireTrimTrailing(job, accContent, slurped)
+    fireAfterLive(job, slurped)
+
+  if isNetworkQuiet():
+    # The quiet-watch thread marked the connection dead and shut down the
+    # cached fd. The recv loop's bounded timeout (StreamTimeoutError) let it
+    # wake and check this flag. Surface the canonical quiet message;
+    # `callModel` turns it into a `NetworkHealthError` and retries it as a
+    # server error rather than handing the caller a dead connection.
+    closeCachedStreamConn()
+    result.errMsg = networkQuietMsg()
+    return
+  if isInterrupted():
+    if result.assistantMsg == nil:
+      result.assistantMsg = buildStreamAssistantMsg(accContent, accReasoning,
+        accTools, result.usage, isInterrupted(),
+        reasoningBlocks = accReasoningBlocks)
+    # Drop the cache: the SIGINT hook / watcher already shut down the
+    # fd, so the conn is half-closed. Reusing it on the next turn
+    # would fail on first send. The next call will reconnect cleanly.
+    closeCachedStreamConn()
+    result.errMsg = InterruptedByUserMsg
+    return
+  if streamErr.len > 0:
+    result.errMsg = "stream read: " & streamErr &
+      (if nonSSE.len > 0: ": " & nonSSE.join("\n") else: "")
+    return
+  if sseErrorBody.len > 0:
+    # A mid-stream error chunk (OpenRouter et al.) terminated the stream.
+    # Surface the provider's error message so the user sees why the turn
+    # failed, instead of a silent empty-reply retry loop. Promote the
+    # error's HTTP code (429, 502, ...) to the effective status so
+    # callModel's retry classifier can route it (retryable 5xx/429 vs.
+    # terminal 4xx). Drop any partial assistant message: the stream was
+    # terminated by an error, not completed.
+    closeCachedStreamConn()
+    result.errBody = sseErrorBody
+    result.statusCode = if sseErrorCode > 0: sseErrorCode else: result.statusCode
+    result.errMsg = "api error: " & extractErrorMsg(sseErrorBody)
+    result.assistantMsg = nil
+    return
+
+  # Truncation guard: 200 OK with partial choice deltas but neither `[DONE]`
+  # nor a `finish_reason` means the upstream socket closed before the model
+  # was finished. Surface it as a retryable server error rather than handing
+  # the caller a half-formed assistant turn (would otherwise show as a lone
+  # `· Xs` line with no token bar and no tool_calls, prompting the user as
+  # if the model had simply stopped).
+  #let gotAnyDelta = accContent.len > 0 or accTools.len > 0 or accReasoning.len > 0
+  #if result.statusCode == 200 and gotAnyDelta and
+  #   not sawDone and not sawFinish:
+  #  closeCachedStreamConn()
+  #  result.errMsg = "stream truncated before completion"
+  #  return
+
+  result.finishReason = finishReason
+  # Build assistant message. A stream with usage and/or a finish_reason but
+  # no visible content is still a real (if empty) assistant turn: the model
+  # may have spent its whole token budget on reasoning (finish_reason
+  # "length") or hit a content filter. Build a minimal message carrying the
+  # finish_reason so the turn loop can branch on it. Only the case with no
+  # content, no usage, and no finish_reason is a transport-level problem
+  # surfaced as an error here.
+  if result.assistantMsg == nil:
+    result.assistantMsg = buildStreamAssistantMsg(accContent, accReasoning,
+      accTools, result.usage, isInterrupted(), finishReason,
+      reasoningBlocks = accReasoningBlocks)
+  if result.assistantMsg == nil:
+    # No SSE data at all. Provider may have returned a plain JSON error
+    # body. Surface as a retryable transport error so callModel handles it
+    # via the network retry block, NOT the empty-content auto-handling mode.
+    result.errBody = nonSSE.join("\n")
+    result.errMsg = EmptyReplyMsg
+  debugOut &"streamHttp end contentStarted={contentStarted} accTools={accTools.len} finishReason={finishReason}"
+
+# ---------- OpenAI Responses API (/responses) ----------
+#
+# First-party openai profiles use the Responses API instead of chat
+# completions. The wire shape differs in three places, all translated
+# here so the rest of the pipeline (history, turn loop, tool dispatch)
+# still sees chat-style messages:
+#   - request: `input` items instead of `messages`, flat tool schemas
+#     ({type:"function", name, ...} instead of {function:{...}}),
+#     `max_output_tokens` instead of `max_completion_tokens`.
+#   - stream: semantic SSE events (`response.output_text.delta`,
+#     `response.completed`, ...) instead of `choices[0].delta` chunks.
+#   - reply: `output[]` items (message / function_call / reasoning)
+#     instead of `choices[0].message`.
+# Assistant history is translated to Responses items on the wire
+# (function_call / function_call_output); OpenAI drops unknown fields
+# like `reasoning_content` on replayed message items.
+
+proc responsesInput(messages: JsonNode): JsonNode =
+  ## Translate the chat-style history into Responses `input` items.
+  ## `system` becomes the v1 `developer` role; an assistant message with
+  ## `tool_calls` is split into standalone `function_call` items, each
+  ## answered (in subsequent history) by the `function_call_output` item
+  ## translated from the chat-style role:tool message. `call_id` is the
+  ## tool_call id, which OpenAI already issues as `call_...`.
+  if messages == nil or messages.kind != JArray: return newJArray()
+  result = newJArray()
+  for m in messages:
+    if m.kind != JObject:
+      result.add m
+      continue
+    case m{"role"}.getStr
+    of "system":
+      var dev = newJObject()
+      for k, v in m.pairs:
+        dev[k] = if k == "role": %"developer" else: v
+      result.add dev
+    of "assistant":
+      let tcs = m{"tool_calls"}
+      if tcs == nil or tcs.kind != JArray or tcs.len == 0:
+        result.add m
+        continue
+      let content = m{"content"}.getStr("")
+      if content.len > 0:
+        result.add %*{"role": "assistant", "content": content}
+      for tc in tcs:
+        result.add %*{
+          "type": "function_call",
+          "call_id": tc{"id"}.getStr(""),
+          "name": tc{"function"}{"name"}.getStr(""),
+          "arguments": tc{"function"}{"arguments"}.getStr(""),
+        }
+    of "tool":
+      result.add %*{
+        "type": "function_call_output",
+        "call_id": m{"tool_call_id"}.getStr(""),
+        "output": m{"content"}.getStr(""),
+      }
+    else:
+      result.add m
+
+proc responsesTools(tools: JsonNode): JsonNode =
+  ## Flatten chat tool schemas ({type, function:{name, ...}}) into the
+  ## Responses shape ({type:"function", name, description, parameters}).
+  if tools == nil or tools.kind != JArray: return tools
+  result = newJArray()
+  for t in tools:
+    let fn = t{"function"}
+    if t.kind != JObject or fn == nil or fn.kind != JObject:
+      result.add t
+      continue
+    var flat = %*{"type": t{"type"}.getStr("function")}
+    for k, v in fn.pairs: flat[k] = v
+    result.add flat
+
+proc responsesUsage*(u: JsonNode): Usage =
+  ## Parses a Responses `usage` object (input/output naming) into the
+  ## completions-style `Usage` the rest of the pipeline consumes.
+  if u == nil or u.kind != JObject: return
+  result.promptTokens = u{"input_tokens"}.getInt(0)
+  result.completionTokens = u{"output_tokens"}.getInt(0)
+  result.totalTokens = u{"total_tokens"}.getInt(0)
+  let inDetails = u{"input_tokens_details"}
+  if inDetails != nil and inDetails.kind == JObject:
+    result.cachedTokens = inDetails{"cached_tokens"}.getInt(0)
+  let outDetails = u{"output_tokens_details"}
+  if outDetails != nil and outDetails.kind == JObject:
+    result.reasoningTokens = outDetails{"reasoning_tokens"}.getInt(0)
+
+proc buildResponsesBody*(p: Profile, wireMessages: JsonNode): JsonNode =
+  ## Request body for POST /responses. Mirrors the completions body built
+  ## in `callModel` (same generation defaults, same tools) with the
+  ## Responses field naming.
+  result = %*{
+    "model": p.model,
+    "input": responsesInput(wireMessages),
+    "stream": streamingEnabled,
+  }
+  result["tools"] = responsesTools(setup(p).tools)
+  result["tool_choice"] = %"auto"
+  let d = knownGoodGeneration(p)
+  # The Codex backend rejects `max_output_tokens` outright (400
+  # "Unsupported parameter"); first-party codex never sends it.
+  if d.maxTokens > 0 and not chatgptProfile(p):
+    result["max_output_tokens"] = %d.maxTokens
+  # The known-good `gpt` temperature is the completions-era default;
+  # gpt-5.x on /responses rejects any temperature but 1, so omit it.
+  if p.family != "gpt" and d.temperature >= 0.0:
+    result["temperature"] = %d.temperature
+  if p.reasoning.len > 0:
+    result["reasoning"] = %*{"effort": %p.reasoning}
+  if chatgptProfile(p):
+    # The ChatGPT Codex backend (subscription OAuth) only serves this
+    # exact shape: SSE-only, no server-side storage, and a top-level
+    # `instructions` string (it rejects a system/developer input item as
+    # a substitute).
+    result["stream"] = %true
+    result["store"] = %false
+    let input = result["input"]
+    var instructions = ""
+    if input != nil and input.kind == JArray:
+      var kept = newJArray()
+      for item in input:
+        if instructions == "" and item.kind == JObject and
+           item{"role"}.getStr in ["system", "developer"]:
+          instructions = item{"content"}.getStr("")
+        else:
+          kept.add item
+      result["input"] = kept
+    result["instructions"] =
+      %(if instructions == "": "You are a helpful assistant."
+        else: instructions)
+
+proc responsesAssistantMsg(r: JsonNode; wasInterrupted: bool): JsonNode =
+  ## Build a chat-style assistant message from a completed response's
+  ## `output[]` items (message / function_call / reasoning). Tool calls
+  ## keep the Responses item id so tool results can be paired; the items
+  ## themselves are NOT echoed into history (the chat-shape echo above
+  ## suffices), so no `item_reference` input is ever sent. Returns nil
+  ## for a genuinely empty output with no status, the same transport
+  ## anomaly contract as `buildStreamAssistantMsg`.
+  var content = ""
+  var toolCalls = newJArray()
+  let output = r{"output"}
+  if output != nil and output.kind == JArray:
+    for item in output:
+      if item.kind != JObject: continue
+      case item{"type"}.getStr
+      of "message":
+        let parts = item{"content"}
+        if parts != nil and parts.kind == JArray:
+          for c in parts:
+            if c{"type"}.getStr == "output_text":
+              content &= c{"text"}.getStr("")
+      of "function_call":
+        toolCalls.add %*{
+          "id": item{"id"}.getStr(""),
+          "type": "function",
+          "function": {
+            "name": item{"name"}.getStr(""),
+            "arguments": item{"arguments"}.getStr(""),
+          },
+        }
+      else: discard  # reasoning items: opaque, not replayed
+  let status = r{"status"}.getStr("")
+  if content.len == 0 and toolCalls.len == 0 and status.len == 0:
+    return nil
+  result = %*{"role": "assistant",
+              "content": stripLeadingTrailingBlankLines(content)}
+  result["reasoning_content"] = %""
+  # The turn loop's budget-escalation keys on the completions word
+  # "length"; Responses signals the same starvation as status
+  # "incomplete" with incomplete_details.reason "max_output_tokens".
+  if status == "incomplete":
+    if r{"incomplete_details"}{"reason"}.getStr("") == "max_output_tokens":
+      result["finish_reason"] = %"length"
+    else:
+      result["finish_reason"] = %status
+  elif status.len > 0 and status != "completed":
+    result["finish_reason"] = %status
+  if toolCalls.len > 0:
+    result["tool_calls"] = toolCalls
+  if wasInterrupted:
+    result["interrupted"] = %true
+
+proc streamResponses(url, key, bodyStr: string, baseLabel: string,
+                     slurped: var int,
+                     job: NetJob): StreamOutcome =
+  ## POST /responses with `"stream": true` and consume the semantic SSE
+  ## event stream until `response.completed`. `event:` lines select the
+  ## handler; `data:` payloads are per-event JSON. Tool-call arguments
+  ## arrive as `response.function_call_arguments.delta` fragments keyed
+  ## by `item_id`; the completed `function_call` items on the final
+  ## `response.completed` payload carry name+args in full, so the
+  ## accumulator is only a liveness fallback for interrupted streams.
+  let u = try: parseUri(url) except CatchableError as e:
+    result.errMsg = "bad url: " & e.msg
+    return
+  let host = u.hostname
+  let plainHttp = u.scheme == "http" and plainHttpHost(host)
+  if u.scheme != "https" and not plainHttp:
+    result.errMsg = "plain http is only allowed for local/LAN hosts, got: " & host
+    return
+  let port =
+    if u.port.len > 0: Port(parseInt(u.port))
+    elif plainHttp: Port(80)
+    else: Port(443)
+  let pathQuery =
+    block:
+      var pq = if u.path.len > 0: u.path else: "/"
+      if u.query.len > 0: pq.add "?" & u.query
+      pq
+
+  var conn: StreamConn
+  var resp: StreamResponse
+  var attempt = 0
+  while true:
+    if isInterrupted():
+      closeCachedStreamConn()
+      result.errMsg = InterruptedByUserMsg
+      return
+    inc attempt
+    try:
+      conn = acquireStreamConn(host, port, plainHttp)
+    except CatchableError as e:
+      result.errMsg = if isInterrupted(): InterruptedByUserMsg
+        else: connectFailMsg(endpointLabel(host, port, plainHttp), plainHttp, e)
+      return
+    conn.setReadTimeoutMs(QuietRecvWakeMs)
+    var headStall = StallClock(since: epochTime())
+    try:
+      conn.sendRequest("POST", pathQuery, host,
+                       headers = requestHeaders(
+                         extraHeadersProfile, key, "text/event-stream"),
+                       body = bodyStr)
+      fireActivity(job)
+      while true:
+        try:
+          resp = conn.readResponseHead()
+          break
+        except StreamTimeoutError:
+          if isInterrupted() or isNetworkQuiet() or headStall.quietTooLong():
+            closeCachedStreamConn()
+            break
+          continue
+      if resp.status == 0 and resp.headers.len == 0:
+        if isInterrupted() and not isNetworkQuiet():
+          result.errMsg = InterruptedByUserMsg
+        else:
+          result.errMsg = networkQuietMsg()
+        return
+      fireActivity(job)
+      break
+    except CatchableError as e:
+      closeCachedStreamConn()
+      if attempt >= 2:
+        result.errMsg = "request failed: " & e.msg
+        return
+  result.statusCode = resp.status
+  result.retryAfter = resp.headers.getOrDefault("retry-after")
+
+  var accContent = ""
+  var accTools = initOrderedTable[int, JsonNode]()
+  var toolIdx = initTable[string, int]()  # item_id -> accTools slot
+  var completedResp: JsonNode
+  var nonSSE: seq[string]
+  var contentStarted = false
+  var event = ""
+  var sawDone = false
+  var line = ""
+  var streamErr = ""
+  var sseErrorBody = ""
+  var bodyStall = StallClock(since: epochTime())
+  while true:
+    var hasLine = false
+    try: hasLine = conn.readLine(line)
+    except StreamTimeoutError:
+      if isInterrupted() or isNetworkQuiet() or bodyStall.quietTooLong():
+        closeCachedStreamConn()
+        break
+      continue
+    except CatchableError as e:
+      streamErr = e.msg
+      closeCachedStreamConn()
+      break
+    if not hasLine: break
+    fireActivity(job)
+    bodyStall.touch()
+    if isInterrupted():
+      closeCachedStreamConn()
+      break
+    if line.startsWith("event: "):
+      event = line["event: ".len .. ^1].strip
+      continue
+    if line.strip.len == 0 or line.startsWith(": "):
+      continue
+    if not line.startsWith("data:"):
+      nonSSE.add line
+      continue
+    let payload = sseFieldValue(line)
+    let j = try: parseJson(payload)
+              except CatchableError as e:
+                if payload.strip.len > 0:
+                  debugOut "malformed SSE data line: " & e.msg & " — " & payload
+                continue
+    let ev =
+      if event.len > 0: event
+      else: j{"type"}.getStr("")
+    event = ""
+    case ev
+    of "response.output_text.delta":
+      let c = j{"delta"}.getStr("")
+      if c.len > 0:
+        accContent &= c
+        slurped += c.len
+        fireProgress(job, slurped)
+        fireContent(job, c, slurped)
+        contentStarted = true
+    of "response.output_item.added":
+      let item = j{"item"}
+      if item != nil and item.kind == JObject and
+         item{"type"}.getStr == "function_call":
+        let id = item{"id"}.getStr("")
+        toolIdx[id] = accTools.len
+        accTools[toolIdx[id]] = %*{
+          "id": id, "type": "function",
+          "function": {"name": item{"name"}.getStr(""),
+                       "arguments": ""}
+        }
+    of "response.function_call_arguments.delta":
+      let id = j{"item_id"}.getStr("")
+      let d = j{"delta"}.getStr("")
+      if id in toolIdx:
+        let fn = accTools[toolIdx[id]]{"function"}
+        if fn != nil:
+          fn["arguments"] = %(fn{"arguments"}.getStr("") & d)
+      slurped += d.len
+      fireProgress(job, slurped)
+    of "response.completed", "response.incomplete":
+      sawDone = true
+      completedResp = j{"response"}
+    of "response.failed":
+      sawDone = true
+      completedResp = j{"response"}
+      sseErrorBody = payload
+    of "error":
+      sseErrorBody = payload
+      sawDone = true
+    else: discard  # created / in_progress / output_item.done / ...
+
+  if contentStarted:
+    result.streamedLive = true
+    fireContentFinished(job, accContent, slurped)
+    fireTrimTrailing(job, accContent, slurped)
+    fireAfterLive(job, slurped)
+
+  if isNetworkQuiet():
+    closeCachedStreamConn()
+    result.errMsg = networkQuietMsg()
+    return
+  if isInterrupted():
+    if completedResp != nil:
+      result.assistantMsg = responsesAssistantMsg(completedResp, true)
+    if result.assistantMsg == nil:
+      result.assistantMsg = buildStreamAssistantMsg(accContent, "",
+        accTools, result.usage, true)
+    closeCachedStreamConn()
+    result.errMsg = InterruptedByUserMsg
+    return
+  if streamErr.len > 0:
+    result.errMsg = "stream read: " & streamErr &
+      (if nonSSE.len > 0: ": " & nonSSE.join("\n") else: "")
+    return
+  if sseErrorBody.len > 0:
+    closeCachedStreamConn()
+    result.errBody = sseErrorBody
+    result.errMsg = "api error: " & extractErrorMsg(sseErrorBody)
+    result.assistantMsg = nil
+    return
+  if completedResp != nil:
+    let u2 = completedResp{"usage"}
+    if u2 != nil and u2.kind == JObject:
+      result.usage = responsesUsage(u2)
+    let status = completedResp{"status"}.getStr("")
+    result.finishReason = status
+    result.assistantMsg = responsesAssistantMsg(completedResp,
+                                                isInterrupted())
+    let msg = result.assistantMsg
+    let hollow = msg != nil and
+      msg{"content"}.getStr("").len == 0 and
+      msg{"tool_calls"} == nil
+    if (msg == nil or hollow) and (accContent.len > 0 or accTools.len > 0):
+      # The Codex backend completes with `"output": []` — the reply only
+      # ever exists as streamed deltas. Rebuild from the accumulator.
+      result.assistantMsg = buildStreamAssistantMsg(accContent, "",
+        accTools, result.usage, isInterrupted())
+  elif accTools.len > 0 or accContent.len > 0:
+    # EOF before response.completed: interrupted-stream fallback.
+    result.assistantMsg = buildStreamAssistantMsg(accContent, "",
+      accTools, result.usage, false)
+  if result.assistantMsg == nil:
+    result.errBody = nonSSE.join("\n")
+    result.errMsg = EmptyReplyMsg
+  debugOut &"streamResponses end contentStarted={contentStarted} accTools={accTools.len} status={result.finishReason}"
+
+proc buildBatchAssistantMsg*(message, reasoning: string;
+                             toolCalls: JsonNode;
+                             finishReason = "";
+                             reasoningBlocks: JsonNode = nil): JsonNode =
+  ## Build an assistant message from a non-streaming completion's
+  ## `choices[0].message`. Mirrors `buildStreamAssistantMsg`'s shape so the
+  ## rest of the pipeline (history replay, tool dispatch) sees a uniform
+  ## object regardless of transport. Returns nil only when the message is
+  ## genuinely empty (no content, no tool_calls, no reasoning) AND has no
+  ## finish_reason. The caller treats that as a transport error to surface.
+  ## An empty message with a finish_reason (length/content_filter) is NOT
+  ## nil so the turn loop can branch on it.
+  if message.len == 0 and reasoning.len == 0 and finishReason.len == 0 and
+     (toolCalls == nil or toolCalls.kind != JArray or toolCalls.len == 0):
+    return nil
+  result = %*{"role": "assistant", "content": stripLeadingTrailingBlankLines(message)}
+  # Same rationale as buildStreamAssistantMsg: DeepSeek-R1-style models
+  # require `reasoning_content` on every assistant message in history.
+  result["reasoning_content"] = %reasoning
+  if reasoningBlocks != nil and reasoningBlocks.kind == JArray and
+     reasoningBlocks.len > 0:
+    # Anthropic thinking blocks for tool-loop replay (see
+    # buildStreamAssistantMsg).
+    result["reasoning_blocks"] = reasoningBlocks
+  if toolCalls != nil and toolCalls.kind == JArray and toolCalls.len > 0:
+    result["tool_calls"] = toolCalls
+  if finishReason.len > 0:
+    result["finish_reason"] = %finishReason
+
+proc readFullBody(conn: StreamConn): string =
+  ## Drain the response body into a single string. streamhttp's `readLine`
+  ## already handles chunked + content-length + until-close decoding, so we
+  ## just concatenate every body line until end-of-body. Used by the
+  ## non-streaming path where the whole JSON document arrives in one shot.
+  var line = ""
+  while conn.readLine(line):
+    if result.len > 0: result.add "\n"
+    result.add line
+
+when httpStub:
+  ## Test-only stub for the non-streaming transport. Included here (before
+  ## `callHttp`) so `callHttpStub` is in scope at the `callHttp` dispatch
+  ## site. Shares this module's scope (`StreamOutcome`,
+  ## `buildBatchAssistantMsg`, `parseUsage`, `hookProgress`, etc.) so the
+  ## stub returns the same shape the real `callHttp` builds.
+  include "../../tests/testdata/stub/http.nim"
+
+proc callHttp(url, key, bodyStr: string; baseLabel: string;
+              slurped: var int; codeAssist = false;
+              anthropic = false): StreamOutcome =
+  ## Non-streaming companion to `streamHttp`. Posts `bodyStr` (which carries
+  ## `"stream": false`) and reads the complete JSON completion in one shot —
+  ## no SSE, no recv-loop race. Same `StreamConn` cache and stale-conn retry
+  ## as `streamHttp` so connection reuse and interrupt behavior are uniform.
+  ##
+  ## Why this exists: streamhttp's TLS read path occasionally treats a
+  ## zero-length `recv` as clean EOF while OpenSSL still has buffered
+  ## records, cutting the SSE stream mid-response (empty 200 replies, ticker
+  ## dying after a few tokens). The straight request/response path reads the
+  ## full body before returning, so it is immune to that race. Streaming
+  ## stays the default for live output; this is the reliable fallback when
+  ## `:streaming off` is set.
+  when httpStub:
+    return callHttpStub(url, key, bodyStr, baseLabel, slurped)
+  debugOut "callHttp start"
+  let u = try: parseUri(url) except CatchableError as e:
+    result.errMsg = "bad url: " & e.msg
+    return
+  let host = u.hostname
+  let plainHttp = u.scheme == "http" and plainHttpHost(host)
+  if u.scheme != "https" and not plainHttp:
+    result.errMsg = "plain http is only allowed for local/LAN hosts, got: " & host
+    return
+  let port =
+    if u.port.len > 0: Port(parseInt(u.port))
+    elif plainHttp: Port(80)
+    else: Port(443)
+  let pathQuery =
+    block:
+      var pq = if u.path.len > 0: u.path else: "/"
+      if u.query.len > 0: pq.add "?" & u.query
+      pq
+
+  var conn: StreamConn
+  var resp: StreamResponse
+  var attempt = 0
+  while true:
+    if isInterrupted():
+      closeCachedStreamConn()
+      result.errMsg = InterruptedByUserMsg
+      return
+    inc attempt
+    try:
+      conn = acquireStreamConn(host, port, plainHttp)
+    except CatchableError as e:
+      result.errMsg = if isInterrupted(): InterruptedByUserMsg
+        else: connectFailMsg(endpointLabel(host, port, plainHttp), plainHttp, e)
+      return
+    conn.setReadTimeoutMs(QuietRecvWakeMs)
+    try:
+      conn.sendRequest("POST", pathQuery, host,
+                       headers = requestHeaders(
+                         extraHeadersProfile, key, "application/json"),
+                       body = bodyStr)
+      hookProviderActivity()
+      var waitCapHit = false
+      let waitStart = getMonoTime()
+      while true:
+        try:
+          resp = conn.readResponseHead()
+          break
+        except StreamTimeoutError:
+          if isInterrupted() or isNetworkQuiet():
+            closeCachedStreamConn()
+            break
+          if getMonoTime() - waitStart >=
+              initDuration(milliseconds = NonStreamTooLongMs):
+            # Black-holed peer: no bytes for the whole non-streaming
+            # ceiling. The wait is bounded after all — at 30min, not 45s
+            # and not never. Surface as network quiet so callModel's
+            # NetworkHealthError path retries it like a dead stream.
+            closeCachedStreamConn()
+            waitCapHit = true
+            break
+          # A non-streaming reply is silent by design: the provider sends
+          # nothing until the whole completion is ready, and reasoning
+          # models generate for minutes — far past the quiet watchdog's
+          # QuietTooLongMs. Feed the watchdog clock on every wake tick so
+          # a healthy slow wait is not killed as a dead link; without this
+          # every :streaming off turn on a slow provider died at 45s and
+          # retried into the same kill. A genuinely dead conn still
+          # surfaces as EOF/IOError; Ctrl-C still interrupts within a tick.
+          hookProviderActivity()
+          continue
+      if resp.status == 0 and resp.headers.len == 0:
+        if waitCapHit:
+          result.errMsg = networkQuietMsg(NonStreamTooLongMs)
+        elif isInterrupted() and not isNetworkQuiet():
+          result.errMsg = InterruptedByUserMsg
+        else:
+          result.errMsg = networkQuietMsg()
+        return
+      hookProviderActivity()
+      break
+    except CatchableError as e:
+      # Same stale-cache recovery as streamHttp: drop and retry once.
+      closeCachedStreamConn()
+      if attempt >= 2:
+        result.errMsg = "request failed: " & e.msg
+        return
+  result.statusCode = resp.status
+  result.retryAfter = resp.headers.getOrDefault("retry-after")
+
+  var body = ""
+  var readErr = ""
+  var bodyCapHit = false
+  let bodyWaitStart = getMonoTime()
+  block readLoop:
+    while true:
+      try:
+        body = readFullBody(conn)
+        break readLoop
+      except StreamTimeoutError:
+        if isInterrupted() or isNetworkQuiet():
+          closeCachedStreamConn()
+          break readLoop
+        if getMonoTime() - bodyWaitStart >=
+            initDuration(milliseconds = NonStreamTooLongMs):
+          # Same ceiling as the head wait: bounded, never a 45s false kill.
+          closeCachedStreamConn()
+          bodyCapHit = true
+          break readLoop
+        # Same feed as the head wait above: provider silence during a
+        # non-streaming generation is expected, not a dead link.
+        hookProviderActivity()
+        continue
+      except CatchableError as e:
+        readErr = e.msg
+        closeCachedStreamConn()
+        break readLoop
+  hookProviderActivity()
+
+  if bodyCapHit:
+    result.errMsg = networkQuietMsg(NonStreamTooLongMs)
+    return
+  if isNetworkQuiet():
+    closeCachedStreamConn()
+    result.errMsg = networkQuietMsg()
+    return
+  if isInterrupted():
+    closeCachedStreamConn()
+    result.errMsg = InterruptedByUserMsg
+    return
+  if readErr.len > 0:
+    result.errMsg = "response read: " & readErr
+    return
+
+  if result.statusCode != 200:
+    result.errBody = body
+    return
+
+  # Parse the single JSON completion object. The Code Assist and
+  # Anthropic wires answer with their native shapes; translate to the
+  # OpenAI completion shape first so the rest of this proc is uniform.
+  var body2 = body
+  if codeAssist:
+    let translated = translateResponse(body)
+    if translated == nil:
+      result.errBody = body
+      result.errMsg = "response parse: not a Code Assist response"
+      return
+    body2 = $translated
+  elif anthropic:
+    let translated = translateAnthropicResponse(body)
+    if translated == nil:
+      result.errBody = body
+      result.errMsg = "response parse: not an Anthropic message"
+      return
+    body2 = $translated
+  let j = try: parseJson(body2)
+           except CatchableError:
+             result.errBody = body
+             result.errMsg = "response parse: " & getCurrentExceptionMsg()
+             return
+  if j == nil or j.kind != JObject:
+    result.errBody = body
+    result.errMsg = "response not a JSON object"
+    return
+  let choices = j{"choices"}
+  if choices == nil or choices.kind != JArray or choices.len == 0:
+    # Provider returned 200 with no choices — usually an inline error body
+    # (e.g. z.ai's overloaded message can slip through on some paths).
+    result.errBody = body
+    if j{"error"} != nil:
+      result.errMsg = "api error in 200 body"
+    return
+  # OpenRouter non-streaming provider error: the error is embedded in
+  # choices[0].error with finish_reason "error", alongside any partial
+  # content. A top-level j{"error"} with choices present can also occur.
+  # Surface the error rather than returning a partial/empty assistant turn.
+  let choiceErr = choices[0]{"error"}
+  let frNode0 = choices[0]{"finish_reason"}
+  let frIsError = frNode0 != nil and frNode0.kind == JString and
+                  frNode0.getStr == "error"
+  if (choiceErr != nil and choiceErr.kind == JObject) or
+     (frIsError and j{"error"} != nil):
+    let errSrc = if choiceErr != nil and choiceErr.kind == JObject: choiceErr
+                 else: j{"error"}
+    let codeNode = errSrc{"code"}
+    if codeNode != nil and codeNode.kind == JInt:
+      result.statusCode = codeNode.getInt
+    result.errBody = body
+    result.errMsg = "api error: " & extractErrorMsg(body)
+    return
+  let message = choices[0]{"message"}
+  if message == nil or message.kind != JObject:
+    result.errBody = body
+    result.errMsg = "response missing choices[0].message"
+    return
+  var content = message{"content"}.getStr("")
+  var reasoning = message{"reasoning_content"}.getStr("")
+  if reasoning.len == 0: reasoning = message{"reasoning"}.getStr("")
+  # Mistral-native chunked content: with reasoning on, message.content is
+  # an array of thinking/text chunks instead of a string (same shape the
+  # streaming path folds). Without it, content is a plain string.
+  let mc = message{"content"}
+  if mc != nil and mc.kind == JArray:
+    for chunk in mc:
+      case chunk{"type"}.getStr("")
+      of "thinking":
+        let th = chunk{"thinking"}
+        if th != nil and th.kind == JArray:
+          for t in th:
+            reasoning &= t{"text"}.getStr("")
+      of "text":
+        content &= chunk{"text"}.getStr("")
+      else: discard
+  var toolCalls =
+    if message{"tool_calls"} != nil and message{"tool_calls"}.kind == JArray:
+      message{"tool_calls"}
+    else: newJArray()
+  let frNode = choices[0]{"finish_reason"}
+  let finishReason =
+    if frNode != nil and frNode.kind == JString and frNode.getStr.len > 0:
+      frNode.getStr
+    else: ""
+  result.finishReason = finishReason
+  slurped = content.len + reasoning.len
+  hookProgress(baseLabel, slurped)
+
+  result.assistantMsg = buildBatchAssistantMsg(content, reasoning,
+    toolCalls, finishReason, message{"reasoning_blocks"})
+  if result.assistantMsg == nil:
+    # No content, no tool_calls, no reasoning, no finish_reason: a genuine
+    # transport anomaly (not a budget-starved empty turn). Surface as a
+    # retryable transport error so callModel's network retry block handles
+    # it. Empty-with-finish_reason is handled above (non-nil msg).
+    result.errBody = body
+    result.errMsg = EmptyReplyMsg
+    return
+  let u2 = j{"usage"}
+  if u2 != nil and u2.kind == JObject:
+    result.usage = parseUsage(u2)
+  debugOut &"callHttp end content={content.len} tools={toolCalls.len} finishReason={finishReason}"
+
+proc callResponses(url, key, bodyStr: string; baseLabel: string;
+                   slurped: var int): StreamOutcome =
+  ## Non-streaming companion to `streamResponses`. Posts `bodyStr` (which
+  ## carries `"stream": false`) and reads the complete response object in
+  ## one shot. Same conn-cache and interrupt behavior as `callHttp`.
+  debugOut "callResponses start"
+  let u = try: parseUri(url) except CatchableError as e:
+    result.errMsg = "bad url: " & e.msg
+    return
+  let host = u.hostname
+  let plainHttp = u.scheme == "http" and plainHttpHost(host)
+  if u.scheme != "https" and not plainHttp:
+    result.errMsg = "plain http is only allowed for local/LAN hosts, got: " & host
+    return
+  let port =
+    if u.port.len > 0: Port(parseInt(u.port))
+    elif plainHttp: Port(80)
+    else: Port(443)
+  let pathQuery =
+    block:
+      var pq = if u.path.len > 0: u.path else: "/"
+      if u.query.len > 0: pq.add "?" & u.query
+      pq
+
+  var conn: StreamConn
+  var resp: StreamResponse
+  var attempt = 0
+  while true:
+    if isInterrupted():
+      closeCachedStreamConn()
+      result.errMsg = InterruptedByUserMsg
+      return
+    inc attempt
+    try:
+      conn = acquireStreamConn(host, port, plainHttp)
+    except CatchableError as e:
+      result.errMsg = if isInterrupted(): InterruptedByUserMsg
+        else: connectFailMsg(endpointLabel(host, port, plainHttp), plainHttp, e)
+      return
+    conn.setReadTimeoutMs(QuietRecvWakeMs)
+    try:
+      conn.sendRequest("POST", pathQuery, host,
+                       headers = requestHeaders(
+                         extraHeadersProfile, key, "application/json"),
+                       body = bodyStr)
+      hookProviderActivity()
+      var waitCapHit = false
+      let waitStart = getMonoTime()
+      while true:
+        try:
+          resp = conn.readResponseHead()
+          break
+        except StreamTimeoutError:
+          if isInterrupted() or isNetworkQuiet():
+            closeCachedStreamConn()
+            break
+          if getMonoTime() - waitStart >=
+              initDuration(milliseconds = NonStreamTooLongMs):
+            # Black-holed peer, bounded at the non-streaming ceiling
+            # (see callHttp). Retried as network quiet by callModel.
+            closeCachedStreamConn()
+            waitCapHit = true
+            break
+          # Non-streaming silence is expected (see callHttp): feed the
+          # quiet watchdog so a long generation is not killed at 45s.
+          hookProviderActivity()
+          continue
+      if resp.status == 0 and resp.headers.len == 0:
+        if waitCapHit:
+          result.errMsg = networkQuietMsg(NonStreamTooLongMs)
+        elif isInterrupted() and not isNetworkQuiet():
+          result.errMsg = InterruptedByUserMsg
+        else:
+          result.errMsg = networkQuietMsg()
+        return
+      hookProviderActivity()
+      break
+    except CatchableError as e:
+      closeCachedStreamConn()
+      if attempt >= 2:
+        result.errMsg = "request failed: " & e.msg
+        return
+  result.statusCode = resp.status
+  result.retryAfter = resp.headers.getOrDefault("retry-after")
+
+  var body = ""
+  var readErr = ""
+  var bodyCapHit = false
+  let bodyWaitStart = getMonoTime()
+  block readLoop:
+    while true:
+      try:
+        body = readFullBody(conn)
+        break readLoop
+      except StreamTimeoutError:
+        if isInterrupted() or isNetworkQuiet():
+          closeCachedStreamConn()
+          break readLoop
+        if getMonoTime() - bodyWaitStart >=
+            initDuration(milliseconds = NonStreamTooLongMs):
+          # Same ceiling as the head wait.
+          closeCachedStreamConn()
+          bodyCapHit = true
+          break readLoop
+        # Same feed as the head wait above.
+        hookProviderActivity()
+        continue
+      except CatchableError as e:
+        readErr = e.msg
+        closeCachedStreamConn()
+        break readLoop
+  hookProviderActivity()
+
+  if bodyCapHit:
+    result.errMsg = networkQuietMsg(NonStreamTooLongMs)
+    return
+  if isNetworkQuiet():
+    closeCachedStreamConn()
+    result.errMsg = networkQuietMsg()
+    return
+  if isInterrupted():
+    closeCachedStreamConn()
+    result.errMsg = InterruptedByUserMsg
+    return
+  if readErr.len > 0:
+    result.errMsg = "response read: " & readErr
+    return
+  if result.statusCode != 200:
+    result.errBody = body
+    return
+
+  let j = try: parseJson(body)
+           except CatchableError:
+             result.errBody = body
+             result.errMsg = "response parse: " & getCurrentExceptionMsg()
+             return
+  if j == nil or j.kind != JObject:
+    result.errBody = body
+    result.errMsg = "response not a JSON object"
+    return
+  if j{"error"} != nil:
+    result.errBody = body
+    result.errMsg = "api error: " & extractErrorMsg(body)
+    return
+  result.finishReason = j{"status"}.getStr("")
+  result.assistantMsg = responsesAssistantMsg(j, false)
+  if result.assistantMsg == nil:
+    result.errBody = body
+    result.errMsg = EmptyReplyMsg
+    return
+  slurped = result.assistantMsg{"content"}.getStr("").len
+  hookProgress(baseLabel, slurped)
+  let u2 = j{"usage"}
+  if u2 != nil and u2.kind == JObject:
+    result.usage = responsesUsage(u2)
+  debugOut &"callResponses end status={result.finishReason}"
+
+proc stripInternalFields*(messages: JsonNode;
+                            keepThinkingFields = false): JsonNode =
+  ## Return a wire-safe copy of `messages` with internal bookkeeping fields
+  ## removed. `usage` is stored on assistant messages for local replay but
+  ## rejected by strict validators (fireworks, glm-5p1, etc.). `finish_reason`
+  ## is attached to empty assistant turns so the turn loop can branch on it
+  ## but is not a wire field. `interrupted` marks user-cancelled turns.
+  ## `agentSent` marks harness-autosend prompts (empty-reply steer, flail
+  ## notes) so replay renders them as `»` items; it never reaches a provider.
+  ## Empty assistant `content` is filled with a placeholder: OpenAI-style
+  ## validators (xAI, OpenAI, Moonshot) 400 on `role: assistant` with an
+  ## empty content string, which is how a thinking-only / length-starved
+  ## turn looks after `reasoning_content` is stripped for non-DeepSeek.
+  ## `reasoning_blocks` is the Anthropic thinking-block record; only the
+  ## Anthropic translation reads it back, so it is stripped unless the
+  ## caller keeps it.
+  if messages == nil or messages.kind != JArray: return messages
+  result = newJArray()
+  for m in messages:
+    var node = m
+    if m.kind == JObject and
+       ("usage" in m or "interrupted" in m or "finish_reason" in m or
+        "agentSent" in m or
+        ("reasoning_blocks" in m and not keepThinkingFields)):
+      var clean = newJObject()
+      for k, v in m.pairs:
+        if k != "usage" and k != "interrupted" and k != "finish_reason" and
+           k != "agentSent" and
+           (k != "reasoning_blocks" or keepThinkingFields):
+          clean[k] = v
+      node = clean
+    if node.kind == JObject and node{"role"}.getStr == "assistant":
+      let tcs = node{"tool_calls"}
+      let hasToolCalls = tcs != nil and tcs.kind == JArray and tcs.len > 0
+      if not hasToolCalls and node{"content"}.getStr.strip.len == 0:
+        if node != m:
+          node["content"] = %EmptyReplyMsg
+        else:
+          var filled = newJObject()
+          for k, v in node.pairs:
+            filled[k] = v
+          filled["content"] = %EmptyReplyMsg
+          node = filled
+    result.add node
+
+proc ensureReasoningField(messages: JsonNode) =
+  ## DeepSeek-R1 with thinking mode rejects any request whose history
+  ## contains an assistant message without a `reasoning_content` field.
+  ## Backfill an empty string on every assistant message missing it —
+  ## covers sessions persisted before the fix and turns where the model
+  ## emitted no reasoning. The field is unknown-but-ignored on other
+  ## OpenAI-compatible providers, so this is safe to apply unconditionally.
+  if messages == nil or messages.kind != JArray: return
+  for m in messages:
+    if m.kind != JObject: continue
+    if m{"role"}.getStr != "assistant": continue
+    if "reasoning_content" notin m:
+      m["reasoning_content"] = %""
+
+proc stripThinkBack*(mode: ThinkBackMode, wireMessages: JsonNode) =
+  ## Enforce `mode` on the wire copy of the history: delete
+  ## `reasoning_content` from assistant messages per the knob. tbNone
+  ## strips everywhere (strict validators reject the field); tbCurrentTurn
+  ## keeps it only inside the active tool loop, i.e. after the last user
+  ## message, so the model sees its own fresh reasoning but old turns
+  ## stop costing tokens; tbAllTurns keeps everything (deepseek 400s
+  ## without the field, glm/kimi Preserved Thinking reward it).
+  ## `wireMessages` must be a mutable copy, not the live history.
+  if wireMessages == nil or wireMessages.kind != JArray: return
+  if mode == tbAllTurns: return
+  var lastUser = -1
+  if mode == tbCurrentTurn:
+    for i in 0 ..< wireMessages.len:
+      if wireMessages[i]{"role"}.getStr == "user":
+        lastUser = i
+  for i in 0 ..< wireMessages.len:
+    let m = wireMessages[i]
+    if m.kind != JObject or m{"role"}.getStr != "assistant": continue
+    if mode == tbCurrentTurn and i >= lastUser: continue
+    if m.contains("reasoning_content"):
+      m.delete("reasoning_content")
+    if m.contains("reasoning_blocks"):
+      m.delete("reasoning_blocks")
+
+proc applyGptOssReasoning(p: Profile, body: JsonNode) =
+  body["reasoning_effort"] = %p.reasoning
+
+proc applyGptReasoning(p: Profile, body: JsonNode) =
+  ## First-party openai / chatgpt chat-completions knob. The ladder is
+  ## per-model (none/minimal/low/medium/high/xhigh/max, see
+  ## `knownGoodReasonings`), all passed through as `reasoning_effort`.
+  body["reasoning_effort"] = %p.reasoning
+
+
+proc applyGlmReasoning(p: Profile, body: JsonNode) =
+  ## Wire mapping for GLM reasoning. Values are `off`/`on` (4.7/5/5.1) or
+  ## `off`/`high`/`max` (5.2). Control surfaces by provider:
+  ## - `thinking.type` ("enabled"/"disabled") on z.ai's first-party API
+  ##   (provider names `zai` / `zai-coding` / `zaicode`), plus
+  ##   `thinking.effort` (`high` default, `max` deeper) on GLM-5.2 only.
+  ##   GLM-5.3 replaces both: forced thinking, top-level `reasoning_effort`
+  ##   (`low`/`high`/`max`); `thinking.type: disabled` is a hard error and
+  ##   `thinking.effort` is silently ignored.
+  ## - `reasoning_effort` (`high`/`max`) on Together for GLM-5.2; Together
+  ##   accepts only those two effort levels and ignores the field on older
+  ##   GLM (which think whenever the parameter is absent).
+  ## - `reasoning: {effort: ...}` on OpenRouter for GLM-5.2 (and 5.3 /
+  ##   omen-alpha); OpenRouter maps `high` to high and `max` to its native
+  ##   `xhigh`. The OpenCode zen gateways serve the same models but reject
+  ##   the object (`json: unknown field "reasoning"` since their Sep 2026
+  ##   validator hardening); they take top-level `reasoning_effort` instead,
+  ##   and their GLM line is thinking-only: `reasoning_effort: none` and
+  ##   `chat_template_kwargs.enable_thinking: false` are both hard errors,
+  ##   so `off` is a silent no-op there (like cerebras).
+  ## - Top-level `reasoning_effort` on Mistral's hosting of `zai-glm-5-2`
+  ##   and `zai-glm-5-3`: the platform ladder none/minimal/low/medium/
+  ##   high/xhigh/max (out-of-ladder values are rejected live). `off` maps
+  ##   to `none` on 5.2; 5.3 is forced thinking (the ladder stops at
+  ##   low/high/max) so `off` is dropped there; the z.ai-native
+  ##   `thinking` object is extra_forbidden on both.
+  ## - `chat_template_kwargs.enable_thinking` (bool) on vLLM stacks (nvidia,
+  ##   hetzner); other vLLM GLM providers (nebius, deepinfra, fireworks)
+  ##   accept the same knob but always think when it's omitted.
+  ## - GLM-5.3 on every remaining hosted stack (baseten, novita, deepinfra,
+  ##   fireworks, venice, nanogpt, cheaperinference, ...) gets a top-level
+  ##   `reasoning_effort` (`low`/`high`/`max`). 5.3 is forced-thinking: with
+  ##   no effort knob the default high/max thinking burns the whole
+  ##   max_tokens budget and the turn comes back as an empty `length` reply.
+  ## Inert stacks (cerebras) accept nothing and always think, so `off` is
+  ## silently a no-op there.
+  # GLM-5.2 and 5.3 are the GLMs with a graded effort knob (variants "2"
+  # and "3"); every other GLM is on/off. Variant encodes the minor version
+  # digit (4.7 -> "7", 5.1 -> "1", 5.2 -> "2", 5.3 -> "3").
+  # Variant may carry a suffix ("2-free", "3-flash"); compare the leading digit.
+  let glm52 = p.family == "glm" and p.version == "5" and p.variant.startsWith("2")
+  let glm53 = p.family == "glm" and p.version == "5" and p.variant.startsWith("3")
+  case providerOf(p)
+  of "zai", "zai-coding", "zaicode":
+    if glm53:
+      case p.reasoning
+      of "low", "high", "max": body["reasoning_effort"] = %p.reasoning
+      else: discard
+    else:
+      case p.reasoning
+      of "off": body["thinking"] = %*{"type": "disabled"}
+      of "on": discard
+      of "high": body["thinking"] = %*{"type": "enabled"}
+      of "max": body["thinking"] = %*{"type": "enabled", "effort": "max"}
+      else: discard
+  of "together":
+    if glm53:
+      case p.reasoning
+      of "low", "high", "max": body["reasoning_effort"] = %p.reasoning
+      else: discard
+    elif glm52:
+      case p.reasoning
+      of "off": body["reasoning"] = %*{"enabled": false}
+      of "max": body["reasoning_effort"] = %"max"
+      else: body["reasoning_effort"] = %"high"
+  of "openrouter":
+    if glm53:
+      # 5.3 (and omen-alpha, same surface) has no off; OpenRouter
+      # normalizes to reasoning.effort passthrough
+      case p.reasoning
+      of "low", "high", "max": body["reasoning"] = %*{"effort": p.reasoning}
+      else: discard
+    elif glm52:
+      case p.reasoning
+      of "off": body["reasoning"] = %*{"enabled": false}
+      of "max": body["reasoning"] = %*{"effort": "xhigh"}
+      else: body["reasoning"] = %*{"effort": "high"}
+  of "opencode", "opencodego":
+    # Zen gateways: same models, different validator. The OpenRouter-style
+    # `reasoning` object is an unknown field; top-level `reasoning_effort`
+    # is the accepted knob, and the GLM line there is thinking-only, so
+    # `off` cannot be honored (sent nothing, like cerebras).
+    if glm53:
+      case p.reasoning
+      of "low", "high", "max": body["reasoning_effort"] = %p.reasoning
+      else: discard
+    elif glm52:
+      case p.reasoning
+      of "off": discard
+      of "max": body["reasoning_effort"] = %"max"
+      else: body["reasoning_effort"] = %"high"
+  of "mistral":
+    if glm53:
+      case p.reasoning
+      of "low", "high", "max": body["reasoning_effort"] = %p.reasoning
+      else: discard
+    else:
+      case p.reasoning
+      of "off": body["reasoning_effort"] = %"none"
+      of "low": body["reasoning_effort"] = %"low"
+      of "on", "high": body["reasoning_effort"] = %"high"
+      of "max": body["reasoning_effort"] = %"max"
+      else: discard
+  of "nvidia", "hetzner":
+    if glm53:
+      case p.reasoning
+      of "low", "high", "max": body["reasoning_effort"] = %p.reasoning
+      else: discard
+    else:
+      case p.reasoning
+      of "off": body["chat_template_kwargs"] = %*{"enable_thinking": false}
+      else: discard
+  else:
+    # Hosted OpenAI-compatible stacks that don't have a dedicated branch
+    # (baseten, novita, deepinfra, fireworks, venice, nanogpt, ...).
+    # GLM-5.3 needs the effort knob or thinking starves the output budget.
+    if glm53:
+      case p.reasoning
+      of "low", "high", "max": body["reasoning_effort"] = %p.reasoning
+      else: discard
+
+proc applyStreamingOptions*(p: Profile, body: JsonNode) =
+  ## Provider-specific additions for SSE fidelity.
+  ##
+  ## Z.ai's first-party API (provider names `zai`, `zai-coding`, `zaicode`)
+  ## gets `tool_stream: true`, which streams tool-call arguments as per-token
+  ## deltas. This was disabled for a long time as a workaround for a
+  ## streamhttp TLS read bug that truncated the per-token deltas mid-stream;
+  ## that bug is fixed in streamhttp >= 0.2.0 (the recv loop drains
+  ## OpenSSL's internal buffer before polling), so streamed tool args now
+  ## arrive complete. Reasoning/thinking streams live regardless (gated by
+  ## `stream:true` + `thinking:enabled`, not `tool_stream`).
+  if p.family == "glm":
+    case providerOf(p)
+    of "zai", "zai-coding", "zaicode":
+      body["tool_stream"] = %true
+    else: discard
+  # OpenRouter's stealth route drops reasoning deltas from the SSE
+  # stream unless include_reasoning is asked for (verified live:
+  # content-only chunks without it, reasoning deltas with it; every
+  # other openrouter reasoning model streams them unasked).
+  if providerOf(p) == "openrouter" and
+     p.model.toLowerAscii == "stealth/space-bunny-alpha":
+    body["include_reasoning"] = %true
+
+proc applyGenerationDefaults*(p: Profile, body: JsonNode) =
+  ## Known-good generation policy: table values with any
+  ## `[params]` overrides already patched in (they resolve inside
+  ## `knownGoodGeneration(p: Profile)`).
+  let d = knownGoodGeneration(p)
+  if d.temperature >= 0.0:
+    body["temperature"] = %d.temperature
+  if d.maxTokens > 0:
+    body[maxTokensField(p)] = %d.maxTokens
+  # kimicode's coding gateway 400s K2.x requests on any temperature
+  # other than 1.0; omit the field so the server default applies.
+  # Table rows can't say "omit" per provider (temperature < 0 would
+  # silence every route to that model), so special-case here like k3.
+  # A user-set [params] temperature survives: overriding the
+  # curated behavior is the point of the override.
+  if providerOf(p) == "kimicode" and p.params.temperature.isNone and
+     body.hasKey("temperature"):
+    body.delete("temperature")
+  # Gemini 3 deprecates temperature/top_p (the 3.8 migration guide says
+  # to strip them; the OpenAI-compat layer rejects or ignores them
+  # depending on tier). Omit so the model's own sampling applies, unless
+  # the user explicitly configured one (same rule as kimicode).
+  if p.family == "gemini" and p.params.temperature.isNone and
+     body.hasKey("temperature"):
+    body.delete("temperature")
+
+proc applyDeepseekReasoning(p: Profile, body: JsonNode) =
+  ## DeepSeek's reasoning surface differs by serving stack. The
+  ## first-party API (provider `deepseek`, now DeepSeek-V4.1-Flash behind
+  ## `deepseek-flash`) exposes `thinking.type` (disabled/enabled) plus
+  ## `reasoning_effort`; documented values are low/high/max, with compat
+  ## aliases (minimal→low, medium/xhigh→high, ultra→max) and integer
+  ## efforts rejected outright (verified live: 400 on `20`). Only
+  ## `thinking.type: disabled` is a true off; `reasoning_effort: none`
+  ## is silently accepted but still thinks on chat completions. Hosted
+  ## stacks (deepinfra, novita, nanogpt, nebius, baseten, together, ...)
+  ## ignore `thinking.type` and expose only `reasoning_effort`,
+  ## vLLM-style, behaving like gpt-oss, where `none` IS honored as 0
+  ## reasoning tokens (verified on deepinfra + novita V4.1-Flash).
+  ## Temperature is pinned to 0.0 on the first-party API for
+  ## deterministic coding output (accepted but inert while thinking;
+  ## top_p floors at 0.95 there).
+  case providerOf(p)
+  of "deepseek":
+    ## First-party API: thinking.type disabled/enabled plus
+    ## reasoning_effort (low/high/max; medium is a compat alias that
+    ## maps to high). disabled is the only true off (0 reasoning
+    ## tokens). Temperature 0.0 for deterministic coding output.
+    case p.reasoning
+    of "low":
+      body["thinking"] = %*{"type": "disabled"}
+      body["temperature"] = %0.0
+    of "medium":
+      body["thinking"] = %*{"type": "enabled"}
+      body["reasoning_effort"] = %"medium"
+      body["temperature"] = %0.0
+    of "high":
+      body["thinking"] = %*{"type": "enabled"}
+      body["reasoning_effort"] = %"high"
+      body["temperature"] = %0.0
+    else: discard
+  else:
+    ## Hosted stacks (nebius, baseten, together, deepinfra, fireworks,
+    ## sambanova, hetzner) ignore thinking.type and expose only
+    ## `reasoning_effort`, vLLM-style. But the meaning of "low" is not
+    ## uniform across them: on fireworks `low` is genuinely minimal (no
+    ## reasoning emitted), while hetzner's vLLM still thinks on `low`.
+    ## The only universally honored no-think value on vLLM DeepSeek is
+    ## `reasoning_effort: "none"` (hetzner returns 0 reasoning tokens).
+    ## Our `low` tier is the no-thinking tier for DeepSeek, so map it to
+    ## `none` on vLLM stacks; medium/high pass through. Without this a
+    ## `low` turn on hetzner deepseek-v4-flash burns its whole 4096
+    ## budget on reasoning and starves into an empty reply.
+    case p.reasoning
+    of "low", "off":
+      body["reasoning_effort"] = %"none"
+    else:
+      body["reasoning_effort"] = %p.reasoning
+
+proc applyMinimaxReasoning(p: Profile, body: JsonNode) =
+  ## MiniMax M-series reasoning toggle on the OpenAI-compatible endpoint
+  ## (api.minimax.io/v1) and vLLM stacks (nvidia, fireworks, together,
+  ## deepinfra, sambanova). The knob is the vLLM-style
+  ## `chat_template_kwargs.enable_thinking`:
+  ## - M2.x (v2.5, v2.7) is a reasoning-only model: enable_thinking=true
+  ##   engages interleaved reasoning, enable_thinking=false cuts it off.
+  ## - M3 (frontier) defaults to thinking on; the knob is the same shape
+  ##   and works the same way. Anthropic-protocol deployments
+  ##   (api.minimax.io/anthropic) also accept
+  ##   `thinking.type = "enabled"/"disabled"`, but we only talk to the
+  ##   OpenAI-compatible surface, so the vLLM knob is what we send.
+  ##
+  ## Allowed values are `on` / `off` (set via `:reasoning`). The model
+  ## has no graded effort knob on this surface — `low/medium/high` are
+  ## rejected by `knownGoodReasonings` for the minimax family and are
+  ## only available to unknown models under `--experimental`.
+  ##
+  ## `reasoning_split = true` (top-level body field) is hardcoded: it
+  ## tells the model to return thinking content as a separate
+  ## `reasoning_details` block instead of leaking it into the
+  ## `content` stream as `<think>...</think>` tags. Without it, the
+  ## model's interleaved thinking shows up inline in the visible text
+  ## and pollutes both the UI transcript and any text the harness hands
+  ## to tools that don't expect it. The split field is also part of
+  ## the official Anthropic-compatible format, which the harness
+  ## already relies on for the round-trip (the assistant message must
+  ## come back with reasoning preserved on history replay).
+  case p.reasoning
+  of "off":
+    body["chat_template_kwargs"] = %*{"enable_thinking": false}
+  of "on":
+    body["chat_template_kwargs"] = %*{"enable_thinking": true}
+  else: discard
+  body["reasoning_split"] = %true
+
+proc applyLongcatReasoning(p: Profile, body: JsonNode) =
+  ## LongCat-2.0 toggles reasoning via `thinking.type`, a binary
+  ## enabled/disabled flag. The default deploy reasons unconditionally,
+  ## so `off` must send `{"type": "disabled"}`; `on` relies on the
+  ## server default and sends nothing.
+  case p.reasoning
+  of "off":
+    body["thinking"] = %*{"type": "disabled"}
+  of "on": discard
+  else: discard
+
+proc applyKimiReasoning(p: Profile, body: JsonNode) =
+  ## Kimi K2.x is served on vLLM stacks (nebius, together, deepinfra,
+  ## baseten, fireworks) and toggles reasoning via
+  ## `chat_template_kwargs.enable_thinking`. Most stacks default to
+  ## thinking-on (and nebius always reasons regardless of the flag);
+  ## baseten defaults off. `on` sends enable_thinking=true, `off` sends
+  ## false (inert on nebius, which can't be turned off).
+  ##
+  ## First-party gateways (kimicode's api.kimi.com/coding, moonshot.ai)
+  ## are the exception: K2.x there is forced-thinking and 400s on
+  ## `chat_template_kwargs`. Send nothing; thinking stays on.
+  if providerOf(p) in ["kimicode", "kimi"]: return
+  case p.reasoning
+  of "off":
+    body["chat_template_kwargs"] = %*{"enable_thinking": false}
+  of "on":
+    body["chat_template_kwargs"] = %*{"enable_thinking": true}
+  else: discard
+
+proc applyQwenReasoning(p: Profile, body: JsonNode) =
+  ## Qwen3.x toggles thinking via the vLLM
+  ## `chat_template_kwargs.enable_thinking` boolean, same shape as Kimi.
+  ## `on` engages interleaved reasoning, `off` cuts it to a direct
+  ## response. Served via aggregator routes (nanogpt) that expose the
+  ## same chat-template knob.
+  ##
+  ## Groq is the exception: it 400s on `chat_template_kwargs` and takes
+  ## the top-level `reasoning_effort` string instead, but only the
+  ## values `none` (no thinking) and `default` (think) — `low`/`high`
+  ## are rejected. `on` maps to `default`, `off` to `none`.
+  ##
+  ## DashScope (first-party qwen/qwen-cn/qwen-us compatible-mode) also
+  ## rejects `chat_template_kwargs`: it takes a top-level
+  ## `enable_thinking` boolean instead.
+  if providerOf(p) in ["qwen", "qwen-cn", "qwen-us"]:
+    case p.reasoning
+    of "off": body["enable_thinking"] = %false
+    of "on": body["enable_thinking"] = %true
+    else: discard
+    return
+  if providerOf(p) == "groq":
+    case p.reasoning
+    of "off": body["reasoning_effort"] = %"none"
+    of "on": body["reasoning_effort"] = %"default"
+    else: discard
+    return
+  case p.reasoning
+  of "off":
+    body["chat_template_kwargs"] = %*{"enable_thinking": false}
+  of "on":
+    body["chat_template_kwargs"] = %*{"enable_thinking": true}
+  else: discard
+
+proc applyHy3Reasoning(p: Profile, body: JsonNode) =
+  ## Hy3 (Tencent Hunyuan v3) carries a graded effort knob, not a binary
+  ## switch. Values are `no_think` (default direct response), `low`, and
+  ## `high`, driven by `:reasoning`. Two wire surfaces:
+  ## - vLLM stacks (novita, nvidia, ...): `chat_template_kwargs` with the
+  ##   `reasoning_effort` key, matching Hy3's own chat template
+  ##   (`reasoning_effort not in ['high', 'low', 'no_think']` raises).
+  ## - OpenRouter: normalized `reasoning.effort` (same three levels).
+  ## Hy4 (v4) reuses this surface but its template accepts only `high`
+  ## (default) and `no_think`; the level set is gated in
+  ## `knownGoodReasonings`. The first-party `tencent` route rides the
+  ## else branch below.
+  ## Empty `p.reasoning` means "no wire param" — the server default
+  ## (`no_think`) applies, which is the intended cheap path.
+  if p.reasoning == "": return
+  case providerOf(p)
+  of "openrouter":
+    body["reasoning"] = %*{"effort": p.reasoning}
+  else:
+    body["chat_template_kwargs"] = %*{"reasoning_effort": p.reasoning}
+
+proc applyMistralReasoning(p: Profile, body: JsonNode) =
+  ## Mistral reasoning is a top-level `reasoning_effort` that accepts
+  ## exactly "none" and "high" (422 on anything else). First-party
+  ## (api.mistral.ai) takes the field directly; OpenRouter rides the
+  ## normalized `reasoning.effort`. Empty `p.reasoning` means "no wire
+  ## param" and the server default (none) applies.
+  if p.reasoning == "": return
+  case providerOf(p)
+  of "openrouter":
+    body["reasoning"] = %*{"effort": p.reasoning}
+  else:
+    body["reasoning_effort"] = %p.reasoning
+
+proc applyInklingReasoning(p: Profile, body: JsonNode) =
+  ## Thinking Machines Inkling exposes a level-based reasoning effort on
+  ## the OpenAI-compatible surface: `reasoning_effort` (low/medium/high),
+  ## same shape as gpt-oss. Reasoning traces stream back on
+  ## `reasoning_content` (parsed generically, DeepSeek-style). On-demand /
+  ## serverless deployments on Baseten and Fireworks, and the Together
+  ## serverless endpoint, all accept this field.
+  body["reasoning_effort"] = %p.reasoning
+
+proc applyMimoReasoning(p: Profile, body: JsonNode) =
+  ## Xiaomi MiMo-V2.5-Pro reasoning toggle. Binary on/off, three wire
+  ## surfaces:
+  ## - First-party API (provider `xiaomi`): `thinking.type`
+  ##   ("enabled"/"disabled"). Default is enabled; `off` sends
+  ##   `disabled`, `on` sends `enabled`. In thinking mode the server
+  ##   forces temperature=1.0 / top_p=0.95 regardless of what we send, so
+  ##   we don't fight it. Reasoning streams back on `reasoning_content`
+  ##   (parsed generically, DeepSeek-style).
+  ## - vLLM stacks: `chat_template_kwargs.enable_thinking` (bool), same
+  ##   shape as Kimi/MiniMax/Qwen. Omitting the kwarg defaults to
+  ##   thinking-on; `off` sends false.
+  ## - OpenRouter: normalized `reasoning.effort` — but MiMo's native knob
+  ##   is binary, so we map `on`->`high` and `off`->`disabled` via
+  ##   `reasoning: {enabled: bool}` (the OpenRouter thinking-toggle shape,
+  ##   same as Laguna/GLM-5.2-off).
+  case providerOf(p)
+  of "xiaomi":
+    case p.reasoning
+    of "off": body["thinking"] = %*{"type": "disabled"}
+    of "on": body["thinking"] = %*{"type": "enabled"}
+    else: discard
+  of "openrouter":
+    case p.reasoning
+    of "off": body["reasoning"] = %*{"enabled": false}
+    of "on": body["reasoning"] = %*{"enabled": true}
+    else: discard
+  else:
+    # vLLM stacks (and any other OpenAI-compatible host): the
+    # chat_template_kwargs.enable_thinking boolean. Default is on; only
+    # send the kwarg when explicitly disabling.
+    case p.reasoning
+    of "off": body["chat_template_kwargs"] = %*{"enable_thinking": false}
+    else: discard
+
+proc applyKolibriReasoning(p: Profile, body: JsonNode) =
+  ## Kolibri (Aleph Alpha, self-served on vLLM via the
+  ## aleph-alpha-inference plugin) exposes its reasoning knob through the
+  ## chat template, not a top-level field: `chat_template_kwargs` carries
+  ## `reasoning_effort` ("low"/"medium"/"high") or `enable_thinking:
+  ## false` for a true off (the kolibri1 reasoning parser reads the same
+  ## switch, so the reply's reasoning/content split follows). Thinking is
+  ## on by default when the kwargs are omitted.
+  ##
+  ## Tesseracted's hosted gateway fronts the same stack but normalizes
+  ## the knob: top-level `reasoning_effort` that also takes "none" for
+  ## a true off (their API docs), no chat_template_kwargs documented.
+  case providerOf(p)
+  of "tesseracted":
+    case p.reasoning
+    of "off": body["reasoning_effort"] = %"none"
+    of "low", "medium", "high": body["reasoning_effort"] = %p.reasoning
+    else: discard
+  else:
+    case p.reasoning
+    of "off":
+      body["chat_template_kwargs"] = %*{"enable_thinking": false}
+    of "low", "medium", "high":
+      body["chat_template_kwargs"] = %*{"reasoning_effort": p.reasoning}
+    else: discard
+
+proc applyLagunaReasoning(p: Profile, body: JsonNode) =
+  ## Laguna models (S 2.1, XS 2.1, M.1) toggle reasoning via
+  ## the OpenAI-compatible `reasoning: {enabled: bool}` field, the same
+  ## shape used by OpenRouter for thinking-enabled models. Reasoning is
+  ## on by default; `off` sends `enabled: false`, `on` sends
+  ## `enabled: true`. The model returns thinking content on the
+  ## `reasoning_content` field (parsed generically, DeepSeek-style).
+  case p.reasoning
+  of "off": body["reasoning"] = %*{"enabled": false}
+  of "on": body["reasoning"] = %*{"enabled": true}
+  else: discard
+
+proc applyGrokReasoning(p: Profile, body: JsonNode) =
+  ## xAI Grok reasoning surface on the OpenAI-compatible /v1/chat/completions
+  ## endpoint. The knob is the top-level `reasoning_effort` string
+  ## (low/medium/high), same shape as gpt-oss. Reasoning streams back on
+  ## `reasoning_content` (parsed generically, DeepSeek-style).
+  ##
+  ## Model-specific behavior:
+  ## - grok-4.7, grok-4.6: reasoning_effort low/medium/high (default)/xhigh.
+  ##   Reasoning cannot be disabled. Known-good default is "high".
+  ## - grok-4.5: reasoning_effort low/medium/high (default high). Reasoning
+  ##   cannot be disabled — there is no "off". We never send an empty/off
+  ##   value; the known-good combos default to "high".
+  ## - grok-4.3: reasoning_effort none/low/medium/high (default low). Accepts
+  ##   "none" to disable, but 3code's level set is low/medium/high only.
+  ## - grok-4.20: reasoning can be enabled/disabled via
+  ##   `reasoning: {enabled: bool}` plus reasoning_effort low/medium/high/
+  ##   xhigh. "off" maps to enabled:false; the level values map to
+  ##   reasoning_effort.
+  ## - grok-build-0.1: reasoning model, accepts reasoning_effort.
+  ##
+  ## OpenRouter normalizes the same `reasoning_effort` field for xAI models.
+  if p.reasoning == "": return
+  let is420 = p.family == "grok" and p.version == "4" and p.variant.startsWith("20")
+  if is420 and p.reasoning == "off":
+    body["reasoning"] = %*{"enabled": false}
+  else:
+    body["reasoning_effort"] = %p.reasoning
+
+proc applyGeminiReasoning(p: Profile, body: JsonNode) =
+  ## Gemini 3 thinking on the OpenAI-compatible endpoint
+  ## (generativelanguage.googleapis.com/v1beta/openai). The compat layer
+  ## maps `reasoning_effort` onto thinking levels: minimal/low/medium/high
+  ## (2.5 models map to thinking_budget instead). Thinking cannot be
+  ## disabled on Gemini 3 (no off/none); 3.8 Flash additionally rejects
+  ## `minimal`. Thought summaries stay off (include_thoughts unset): the
+  ## raw thoughts aren't exposed, and the summary would double the stream.
+  case p.reasoning
+  of "minimal", "low", "medium", "high":
+    body["reasoning_effort"] = %p.reasoning
+  else: discard
+
+proc applyLingReasoning(p: Profile, body: JsonNode) =
+  ## Ling (InclusionAI Ling-3.0-flash) toggles reasoning via a textual
+  ## directive in the system message — `detailed thinking on` /
+  ## `detailed thinking off` — not a body field (the chat template scans
+  ## the system content for the phrase, defaulting to off). The directive
+  ## is baked into LingPreamble as `detailed thinking off`; this proc
+  ## rewrites it to match the active `:reasoning` level. Tool calls follow
+  ## the DeepSeek tool-call block format (no xmlToolCalls recovery needed
+  ## on OpenRouter-normalized routes).
+  let target = if p.reasoning == "off": "detailed thinking off"
+               else: "detailed thinking on"
+  if body{"messages"}.kind == JArray and body{"messages"}.len > 0:
+    var sys = body["messages"][0]
+    if sys{"role"}.getStr == "system":
+      var content = sys{"content"}.getStr
+      if "detailed thinking off" in content:
+        content = content.replace("detailed thinking off", target)
+      elif "detailed thinking on" in content:
+        content = content.replace("detailed thinking on", target)
+      sys["content"] = %content
+
+proc applyOxAlphaReasoning(p: Profile, body: JsonNode) =
+  ## 0xalpha (stealth preview): reasoning is always on; the graded knob
+  ## is low/high/max via `reasoning: {effort}` on openrouter and both
+  ## opencode gateways (same normalization as GLM-5.3 on those routes).
+  case p.reasoning
+  of "low", "high", "max": body["reasoning"] = %*{"effort": p.reasoning}
+  else: discard
+
+proc applyNemotronReasoning(p: Profile, body: JsonNode) =
+  ## Nemotron 3 (NVIDIA): thinking toggle via the vLLM chat-template
+  ## bool on NIM and Zen-hosted routes, same shape as kimi/qwen.
+  case p.reasoning
+  of "off":
+    body["chat_template_kwargs"] = %*{"enable_thinking": false}
+  of "on":
+    body["chat_template_kwargs"] = %*{"enable_thinking": true}
+  else: discard
+
+proc applyClaudeReasoning(p: Profile, body: JsonNode) =
+  ## The OpenAI-shaped body is only an intermediate for the claude
+  ## family; anthropicBody reads `reasoning_effort` and maps it onto
+  ## the model's thinking surface (adaptive + effort, or the legacy
+  ## budget mode on 4.5-and-earlier; see anthropic.nim).
+  body["reasoning_effort"] = %p.reasoning
+
+proc applyReasoning*(p: Profile, body: JsonNode) =
+  ## Per-family wire mapping for `Profile.reasoning`. Adding a new
+  ## family means: (1) set `reasoning` in the known-good combo table,
+  ## (2) write an `applyXReasoning` proc, (3) add a case branch.
+  case p.family
+  of "laguna": applyLagunaReasoning(p, body)
+  of "kolibri": applyKolibriReasoning(p, body)
+  of "gpt-oss": applyGptOssReasoning(p, body)
+  of "gpt": applyGptReasoning(p, body)
+  of "glm": applyGlmReasoning(p, body)
+  of "deepseek": applyDeepseekReasoning(p, body)
+  of "minimax": applyMinimaxReasoning(p, body)
+  of "kimi": applyKimiReasoning(p, body)
+  of "ling": applyLingReasoning(p, body)
+  of "qwen": applyQwenReasoning(p, body)
+  of "longcat": applyLongcatReasoning(p, body)
+  of "hy": applyHy3Reasoning(p, body)
+  of "inkling": applyInklingReasoning(p, body)
+  of "grok": applyGrokReasoning(p, body)
+  of "gemini": applyGeminiReasoning(p, body)
+  of "mimo": applyMimoReasoning(p, body)
+  of "0xalpha": applyOxAlphaReasoning(p, body)
+  of "nemotron": applyNemotronReasoning(p, body)
+  of "mistral": applyMistralReasoning(p, body)
+  of "claude": applyClaudeReasoning(p, body)
+  else: discard
+
+proc applyThinkBack*(p: Profile, body: JsonNode) =
+  ## Explicit per-provider knob for reasoning replay (`knownGoodThinkBack`).
+  ## The history side of the decision lives in callModel: think-back pairs
+  ## keep `reasoning_content` on replayed assistant messages, the rest
+  ## strip it. These fields make the opt-in explicit instead of relying on
+  ## each provider's silent default, which can differ per endpoint
+  ## (z.ai: preserved thinking is on by default on the Coding Plan and off
+  ## on the standard API; Kimi k2.6 keeps nothing unless `thinking.keep`
+  ## is set; k3/k2.7-code always keep).
+  if knownGoodThinkBack(p) == tbNone: return
+  case providerOf(p)
+  of "zai", "zai-coding", "zaicode":
+    # GLM Preserved Thinking: only honored when the full unmodified
+    # reasoning blocks come back in order; `clear_thinking: false` turns
+    # it on for the standard API (the Coding Plan endpoint has it on by
+    # default; sending it anyway is accepted). tbCurrentTurn sends
+    # nothing: interleaved thinking with tool results is the default
+    # when thinking is enabled, and clear_thinking: false would commit
+    # us to replaying cross-turn reasoning too.
+    if knownGoodThinkBack(p) == tbCurrentTurn: return
+    body["clear_thinking"] = %false
+  of "kimi", "kimicode", "moonshot", "moonshot-cn":
+    # Kimi k2.6 ignores historical reasoning unless `keep` is "all".
+    # k3/k2.7-code always keep, and the field is inert there.
+    # tbCurrentTurn omits `keep`: the k2.6 default ignores historical
+    # reasoning but retains current-turn tool-loop reasoning server-side.
+    var thinking = body{"thinking"}
+    if thinking == nil or thinking.kind != JObject:
+      thinking = %*{"type": "enabled"}
+      body["thinking"] = thinking
+    if knownGoodThinkBack(p) == tbAllTurns:
+      thinking["keep"] = %"all"
+  else: discard
+
+# ---------- network worker thread (Tier 2) ----------
+#
+# `streamHttp` fires deltas into a `NetJob` instead of calling hooks. The
+# worker runs `streamHttp`; the main thread drains and replays the deltas
+# through the (unchanged) hook layer on a ~50ms cadence, keeping the UI
+# responsive while the blocking recv loop runs off-thread.
+#
+# ORC constraint: the worker holds no closures and no refs the main thread
+# also mutates. The `NetJobState` is a stack var whose lifetime encloses the
+# worker's run; the only ref handed across is the final `assistantMsg`
+# `JsonNode`, built solely by the worker and read once by main after join.
+
+const NetWorkerPollMs = 50
+
+type
+  NetWorkerArgs = object
+    job: NetJob
+    url: string
+    key: string
+    bodyStr: string
+    baseLabel: string
+    suppressXml: bool
+    responses: bool  # POST /responses instead of /chat/completions
+    codeAssist: bool  # Google Code Assist wire (translate Gemini SSE)
+    anthropic: bool  # Anthropic Messages wire (translate /messages SSE)
+
+proc networkWorker(a: ptr NetWorkerArgs) {.thread.} =
+  ## Runs the full connect+send+SSE loop on a worker thread. Fires deltas
+  ## into `job`; publishes the outcome and sets phase=npDone on exit.
+  ## GC-safe cast is valid: only this worker touches the module-global
+  ## connection cache during a call (calls are serialized one at a time),
+  ## and both the NetJobState and the NetWorkerArgs are main-stack vars
+  ## whose lifetime encloses this run (main joins/detaches before they go
+  ## out of scope). The args are passed by POINTER, not by value: a
+  ## by-value `createThread(t, networkWorker, args)` copies the GC'd
+  ## strings (bodyStr is large) into the thread's arg slot, and the next
+  ## turn's createThread overwriting that slot frees the PREVIOUS turn's
+  ## strings ON THE WORKER THREAD. That is an ORC cross-thread free and
+  ## segfaults (SIGSEGV in netthread.nim publishOutcome -> dealloc). With a
+  ## pointer arg the worker only ever reads the strings; every free happens
+  ## on main, the allocating thread.
+  {.cast(gcsafe).}:
+    setPhase(a.job, npConnecting)
+    var slurped = 0
+    var outcome =
+      if a.responses:
+        streamResponses(a.url, a.key, a.bodyStr, a.baseLabel, slurped, a.job)
+      else:
+        streamHttp(a.url, a.key, a.bodyStr, a.baseLabel, slurped,
+                   a.suppressXml, a.job, a.codeAssist, a.anthropic)
+    # The StreamConn is a ref with internal cycles (Socket + SslContext).
+    # Under ORC, freeing it from a different thread than the one that
+    # allocated it segfaults the cycle collector. The worker owns the
+    # entire connection lifecycle: always close and clear here, on this
+    # thread, before returning. This sacrifices cross-turn connection
+    # reuse on the threaded path (acceptable for Tier 2; the TLS handshake
+    # cost is regained in responsiveness).
+    closeCachedStreamConn()
+    # Serialize the assistant message and drop the ref before publishing.
+    # JsonNode trees form cycles; a ref built on this thread and freed on
+    # the main thread after join corrupts ORC's cycle tracker. The string
+    # crosses safely; main parses it back into a fresh node.
+    if outcome.assistantMsg != nil:
+      outcome.assistantMsgJson = $outcome.assistantMsg
+      outcome.assistantMsg = nil
+    publishOutcome(a.job, outcome)
+    # Free the worker-owned strings on this thread; blocks freed on a
+    # foreign thread leak under ORC (nim-lang/Nim#23361).
+    workerRelease(a.job)
+    # Collect this thread's heap before it dies: cycle-registered refs
+    # (StreamConn/Socket cycles) freed here otherwise strand their global
+    # cycle-collector entries when the thread exits without a collection.
+    GC_fullCollect()
+
+proc drainAndDispatch(job: NetJob; baseLabel: string) =
+  ## Copy unconsumed deltas under the lock, then replay them through the
+  ## real hook callbacks on the main thread. Ordering is preserved because
+  ## the worker appends in order and we drain in order.
+  var batch: seq[NetDelta]
+  drainDeltas(job, batch)
+  for d in batch:
+    case d.kind
+    of ndkActivity:
+      hookProviderActivity()
+    of ndkProgress:
+      hookProgress(baseLabel, d.slurped)
+    of ndkReasoning:
+      hookReasoningDelta(d.reasoning, baseLabel, d.reasoningSlurped, true)
+    of ndkContent:
+      discard hookContentDelta(d.content, baseLabel, d.contentSlurped)
+    of ndkContentFinished:
+      discard hookContentFinished(d.fullContent, baseLabel, d.finishedSlurped)
+    of ndkTrimTrailing:
+      hookTrimTrailingContent(d.trimFullContent, baseLabel, d.trimSlurped)
+    of ndkAfterLive:
+      hookAfterLiveContent(baseLabel, d.afterSlurped)
+
+proc callModelThreaded*(p: Profile, bodyStr, baseLabel: string;
+                        suppressXml: bool; responses = false;
+                        anthropic = false): StreamOutcome =
+  ## The threaded streaming path. Spawns a worker to run `streamHttp`, polls
+  ## the shared state on a ~50ms cadence to replay deltas through the hooks,
+  ## and joins the worker once it signals done (or the user interrupts).
+  var job: NetJobState
+  job.lock.initLock()
+  defer: job.lock.deinitLock()
+  var t: Thread[ptr NetWorkerArgs]
+  # `args` is a stack var that outlives the worker: main joins the worker
+  # below before `args` (and `job`) go out of scope, and on the detach path
+  # the wedge is a getAddrInfo block, after which the worker only reads
+  # args. Passing its address means the worker never owns or frees the
+  # GC'd strings inside.
+  var args = NetWorkerArgs(
+    job: addr job,
+    url: endpointUrl(p, responses, streaming = true),
+    key: bearerFor(p),
+    bodyStr: bodyStr,
+    baseLabel: baseLabel,
+    suppressXml: suppressXml,
+    responses: responses,
+    codeAssist: geminicliProfile(p),
+    anthropic: anthropic)
+  createThread(t, networkWorker, addr args)
+  while job.phase != npDone and not isInterrupted() and not isNetworkQuiet():
+    drainAndDispatch(addr job, baseLabel)
+    sleep(NetWorkerPollMs)
+  if isInterrupted():
+    shutdownCachedStreamFd()
+  # Do NOT call closeCachedStreamConn() here on the quiet path (or on the
+  # interrupt path). The worker may still be inside SSL_write on the cached
+  # conn; StreamConn.close() frees the OpenSSL handle, and main freeing it
+  # out from under the worker segfaults. The fd shutdown above (quiet-watch
+  # already did it on the quiet path) wakes the worker's syscall; the worker
+  # observes the flag, unwinds, and closes the conn itself in networkWorker.
+  # Bounded wait for the worker's outcome: every worker syscall is bounded
+  # (connect by ConnectTimeoutMs, recv by QuietRecvWakeMs, TLS handshake
+  # internally), so the worker publishes within a known worst case. The one
+  # exception is a first-time getAddrInfo wedge (documented, accepted): if
+  # the poll times out we detach rather than block forever. The worker
+  # parks in workerRelease after publishing until reap() fires, so once
+  # outcomeWritten is seen the join below returns promptly.
+  var waited = 0
+  let joinBudget = ConnectTimeoutMs + QuietTooLongMs + 5_000
+  while not job.outcomeWritten and t.running() and waited < joinBudget:
+    drainAndDispatch(addr job, baseLabel)
+    sleep(NetWorkerPollMs)
+    waited += NetWorkerPollMs
+  # Final drain and main-owned copies: the last reads of worker memory;
+  # everything main keeps beyond this point was allocated on the main
+  # thread (drainDeltas/copyOutcome copy payloads byte-wise for exactly
+  # this reason).
+  drainAndDispatch(addr job, baseLabel)
+  result = copyOutcome(addr job)
+  if result.assistantMsgJson.len > 0:
+    result.assistantMsg = parseJson(result.assistantMsgJson)
+    result.assistantMsgJson = ""
+  # Now the worker may free its own strings and exit. A worker that
+  # published (outcomeWritten) is straight-line code away from thread
+  # exit, so joining it is prompt and mandatory: detaching here would
+  # return into this stack frame while the worker still writes `job`.
+  reap(addr job)
+  if job.outcomeWritten or not t.running():
+    joinThread(t)
+  else:
+    # Detached (getAddrInfo wedge): leave the cached conn alone. The worker
+    # owns it and closes it whenever it eventually wakes; main touching it
+    # here would race the worker's SSL handle use.
+    discard
+  if not job.outcomeWritten and isNetworkQuiet():
+    # Broke out of the poll loop on the quiet flag and the detached worker
+    # never published an outcome (it was wedged in an unbounded send/handshake
+    # the send-timeout could not reach, or was detached at the join budget).
+    # Surface a retryable transport error so callModel's retry loop reconnects
+    # on a fresh socket, exactly like a 503. Same message/shape the
+    # non-threaded streamHttp path uses for the same condition.
+    result.errMsg = "network quiet for " & $(QuietTooLongMs div 1000) & "s"
+
+when providerStub:
+  ## Test-only stub provider. Lives in `tests/testdata/stub/provider.nim` and is
+  ## `include`d here so it shares this module's scope (private hook
+  ## callbacks, retry state, `ApiError`, etc.) without exporting them.
+  include "../../tests/testdata/stub/provider.nim"
+
+proc callModel*(p: Profile, messages: JsonNode, usage: var Usage,
+    lastPromptTokens: int, maxTokensOverride = 0): JsonNode =
+  ## `maxTokensOverride`, when > 0, replaces the known-good `max_tokens` in
+  ## the request body. Used by the turn loop's empty-content auto-handling
+  ## to escalate the budget when a `finish_reason: "length"` reply starved
+  ## on reasoning tokens. The body is rebuilt fresh on every callModel so
+  ## an override takes effect without rebuilding anything externally.
+  when providerStub:
+    return callModelStub(p, messages, usage, lastPromptTokens, maxTokensOverride)
+  debugOut "callModel start"
+  # gpt-family `pro` variants (gpt-5.5-pro, ...) are Responses-only
+  # models; chat/completions 404s with "not a chat model". When the
+  # profile would use completions, fail fast so the picker surfaces a
+  # clear message instead of a retry storm. First-party openai already
+  # speaks /responses, where the pro variants are served.
+  let useResponses = responsesApi(p)
+  if not useResponses and p.family == "gpt" and p.variant == "pro":
+    raise newHttpError(404, "", p.model & " is not a chat model; " &
+      "chat/completions rejects it, use a chat variant instead")
+  if p.family == "deepseek":
+    ensureReasoningField(messages)
+  let wireMessages = repairToolCallPairing(stripInternalFields(messages,
+    keepThinkingFields = anthropicProfile(p)))
+  stripThinkBack(knownGoodThinkBack(p), wireMessages)
+  let bodyStr =
+    if useResponses:
+      block:
+        let body = buildResponsesBody(p, wireMessages)
+        if maxTokensOverride > 0 and not chatgptProfile(p):
+          body["max_output_tokens"] = %maxTokensOverride
+        sanitizeUtf8($body)
+    else:
+      block:
+        var body = %*{
+          "model": p.model,
+          "messages": wireMessages,
+          "stream": streamingEnabled,
+        }
+        # `stream_options.include_usage` is a streaming-only field;
+        # non-streaming completions always carry `usage` in the response
+        # body. Fireworks rejects the field outright, so it is gated on
+        # both streaming and provider.
+        if streamingEnabled and providerOf(p) != "fireworks":
+          body["stream_options"] = %*{"include_usage": true}
+        body["tools"] = setup(p).tools
+        body["tool_choice"] = %"auto"
+        applyStreamingOptions(p, body)
+        applyGenerationDefaults(p, body)
+        if maxTokensOverride > 0:
+          body[maxTokensField(p)] = %maxTokensOverride
+        if p.reasoning.len > 0:
+          applyReasoning(p, body)
+        applyThinkBack(p, body)
+        if geminicliProfile(p):
+          # OpenAI-shaped body is only an intermediate: Code Assist
+          # wants the wrapped Gemini-native envelope. Project id is
+          # discovered once (loadCodeAssist/onboardUser) and persisted.
+          sanitizeUtf8(codeAssistBody(p, body, auth_google.projectId()))
+        elif anthropicProfile(p):
+          # Same trick for the Anthropic Messages wire: the OpenAI-shaped
+          # body is an intermediate the translation consumes whole.
+          sanitizeUtf8(anthropicBody(p, body))
+        else:
+          sanitizeUtf8($body)
+  # Exact wire size of the request about to go out. The Zen byte-envelope
+  # guard in the turn loop keys off this; set before any send attempt so
+  # even a failed/retried call reports the size that was rejected.
+  lastRequestBodyBytes = bodyStr.len
+  if "\"usage\"" in bodyStr:
+    stderr.writeLine "3code: BUG: usage in wireMessages"
+    for i, m in wireMessages:
+      if m.kind == JObject and "usage" in m:
+        stderr.writeLine "  wireMessages[" & $i & "] has usage role=" & m{"role"}.getStr
+    stderr.writeLine "3code: original messages:"
+    for i, m in messages:
+      if m.kind == JObject and "usage" in m:
+        stderr.writeLine "  messages[" & $i & "] has usage role=" & m{"role"}.getStr
+  let t0 = epochTime()
+  decayLevel(serverRetryLevel, serverLastTs, t0)
+  decayLevel(rateRetryLevel, rateLastTs, t0)
+  # Context window for the token bar: known-good table first, then the
+  # heuristic. Kept inline (not compact.contextWindowFor) so api does
+  # not import compact; compact imports nothing from api either.
+  let window =
+    block:
+      let kg = knownGoodContextWindow(p)
+      if kg > 0: kg
+      else:
+        let m = p.model.toLowerAscii
+        if m == "stub-model": 12_000
+        elif "gpt-5" in m: 400_000
+        elif "gpt-4" in m: 128_000
+        elif "o1" in m or "o3" in m or "o4" in m: 200_000
+        else: 128_000
+  let baseLabel = hookBeforeCall(lastPromptTokens, window)
+  # Cursor is hidden for the duration of the entire turn by `runTurns`
+  # so the prompt placeholder is the only visible caret. callModel
+  # itself doesn't toggle visibility — touching DECTCEM here would
+  # cause a flicker between callModel iterations within a turn.
+  defer:
+    hookAfterCall()
+  # `patientRetryEnabled` widens the probe window from a short blip-recovery
+  # (~1min, 7 attempts) to a long patient hold (~36h, 64 attempts) so a
+  # session rides out usage-window limits and network dropouts without
+  # surfacing to the prompt. One probe count, not a separate mode:
+  # the backoff curve below is the same either way, only its length changes.
+  const
+    ShortAttempts = 7      # patient retry off: blip recovery, ~1min total
+    LongAttempts = 64      # patient retry on: ~36h hold for the train ride
+  let MaxAttempts = if patientRetryEnabled: LongAttempts else: ShortAttempts
+  const networkSync {.booldefine.} = false
+    ## Fallback switch for the streaming transport. Default (false) runs
+    ## the blocking recv loop on a worker thread so the UI stays
+    ## responsive. Set `-d:networkSync=true` to run it inline on the main
+    ## thread (the old behavior) for debugging.
+  var outcome: StreamOutcome
+  # Resolve the bearer once per call, not once per retry attempt: a
+  # refresh inside the retry loop would stamp a new token mid-flight.
+  let bearer = bearerFor(p)
+  # Publish the profile for the transport's per-profile header lookup
+  # (`requestHeaders`); the threaded path hands the worker no Profile.
+  extraHeadersProfile = p
+  var attempt = 0
+  # Retry-decision state, hoisted out of the loop body so the
+  # `NetworkHealthError` handler can set it and fall through into the
+  # SAME backoff block the HTTP-error path uses. One retry loop, shared
+  # by 5xx/429/transport failures and network-health timeouts alike.
+  var errMsg = ""
+  var code = 0
+  var category = ""
+  while true:
+    inc attempt
+    var slurped = 0
+    # The Codex backend answers stream:false with a 400, so `chatgpt`
+    # profiles ride the streaming transport even when the user turned
+    # streaming off (the body pins "stream": true the same way).
+    let streamTransport = streamingEnabled or chatgptProfile(p)
+    let useCodeAssist = geminicliProfile(p)
+    let useAnthropic = anthropicProfile(p)
+    outcome =
+      if streamTransport:
+        when networkSync:
+          var syncJob: NetJobState
+          syncJob.lock.initLock()
+          defer: syncJob.lock.deinitLock()
+          let o =
+            if useResponses:
+              streamResponses(endpointUrl(p, true, true), bearer, bodyStr,
+                              baseLabel, slurped, addr syncJob)
+            else:
+              streamHttp(endpointUrl(p, false, true), bearer, bodyStr,
+                         baseLabel, slurped, xmlToolCallsFallback(p),
+                         addr syncJob, useCodeAssist, useAnthropic)
+          drainAndDispatch(addr syncJob, baseLabel)
+          o
+        else:
+          callModelThreaded(p, bodyStr, baseLabel, xmlToolCallsFallback(p),
+                            useResponses, useAnthropic)
+      else:
+        if useResponses:
+          callResponses(endpointUrl(p, true, false), bearer, bodyStr,
+                        baseLabel, slurped)
+        else:
+          callHttp(endpointUrl(p, false, false), bearer, bodyStr,
+                   baseLabel, slurped, useCodeAssist, useAnthropic)
+    if isInterruptedMsg(outcome.errMsg):
+      hookStopSpinner()
+      if outcome.assistantMsg == nil:
+        raise newException(ApiError, InterruptedByUserMsg)
+      break
+    # The transport signals a dead link by writing a canonical marker into
+    # `outcome.errMsg` (it cannot raise: the threaded path crosses a thread
+    # boundary via a serialized `StreamOutcome`). Three cases to promote to
+    # `NetworkHealthError` so the retry loop backs off and resends, exactly
+    # like a 5xx, instead of relying on the string heuristic in
+    # `retryCategory` (which returns "" for status 200 and would dead-end
+    # on the first attempt with an `HttpError (code 200)`):
+    #   - `networkQuietMsg`: the quiet watchdog fired (no data for
+    #     `QuietTooLongMs`).
+    #   - A 200 OK that produced no assistant message: a transport/protocol
+    #     anomaly (empty reply with no finish_reason, unparseable body, 200
+    #     carrying an inline error object, mid-stream read error after the
+    #     head arrived). All share the shape `statusCode == 200`,
+    #     `assistantMsg == nil`, `errMsg != ""`; `retryCategory` would not
+    #     retry any of them.
+    try:
+      if isNetworkQuietMsg(outcome.errMsg) or
+         (outcome.statusCode == 200 and outcome.assistantMsg == nil and
+          outcome.errMsg.len > 0):
+        raise newException(NetworkHealthError, outcome.errMsg)
+      code = outcome.statusCode
+      category = retryCategory(outcome.errMsg, outcome.assistantMsg, code)
+      errMsg = outcome.errMsg
+    except NetworkHealthError as e:
+      # Network quiet or 200 transport anomaly: treat as a retryable server
+      # error, same as a 5xx. Sets the shared decision vars and falls into
+      # the single backoff block below; no second retry loop.
+      code = 0
+      category = "server"
+      errMsg = e.msg
+    let retryable = category != ""
+    if not retryable:
+      hookStopSpinner()
+      if outcome.assistantMsg == nil:
+        raise newHttpError(code, errMsg, outcome.errBody)
+      # Promote any leaked GLM/Qwen native `<tool_call>...</tool_call>`
+      # blocks in the assistant content to synthetic OpenAI tool_calls.
+      # Some endpoints (notably nvidia z-ai/glm-5.2) don't reliably
+      # translate the model's chat template into OpenAI deltas mid-turn.
+      if xmlToolCallsFallback(p):
+        let msg = outcome.assistantMsg
+        let content = msg{"content"}.getStr("")
+        if content.contains("<tool_call>"):
+          let parsed = parseXmlToolCalls(content)
+          if parsed.calls.len > 0:
+            msg["content"] = %parsed.cleaned
+            var tcArr =
+              if "tool_calls" in msg: msg["tool_calls"]
+              else: newJArray()
+            for call in parsed.calls: tcArr.add call
+            msg["tool_calls"] = tcArr
+      break
+    if attempt >= MaxAttempts:
+      hookStopSpinner()
+      # Preserve the error class on exhaustion: NetworkHealthError for a
+      # promoted transport anomaly (network quiet or a 200 that produced no
+      # assistant message), HttpError for a status-code failure. The
+      # promotion path sets `code = 0`, while a real 5xx keeps its status in
+      # `code`, so `category == "server" and code == 0` uniquely marks the
+      # promoted cases. Both subclass ApiError, so the turn loop's `except
+      # ApiError` catches them.
+      if category == "server" and code == 0:
+        # Format with the body so a 200 anomaly that carried a provider
+        # error object (e.g. z.ai's overloaded message) surfaces its text,
+        # not just the generic transport errMsg. `code` is 0 here, so no
+        # `(code N)` suffix is appended, matching the network-quiet case.
+        raise newException(NetworkHealthError,
+          formatApiDetail(errMsg, outcome.errBody, code))
+      raise newHttpError(code, errMsg, outcome.errBody)
+    let retryAfter = try: parseInt(outcome.retryAfter) except CatchableError: 0
+    # One shared backoff curve for every retryable category (429, 5xx,
+    # network-health). Power-of-2 off the category's own level, capped at
+    # 2048s (2^11) so the loop stays responsive to recovery: even at the cap
+    # it re-probes every ~34min instead of napping for hours. An explicit
+    # `Retry-After` header wins when present (the provider's own guidance).
+    const BackoffCap = 2048
+    let backoff =
+      if retryAfter > 0:
+        retryAfter
+      elif category == "rate":
+        let isBusy = "busy" in outcome.errBody or
+                     "capacity" in outcome.errBody or
+                     "overloaded" in outcome.errBody
+        let base = if isBusy: max(rateRetryLevel, 4) else: rateRetryLevel
+        min(1 shl base, BackoffCap)
+      else:
+        min(1 shl serverRetryLevel, BackoffCap)
+    # Keep the animation running across the backoff. Stopping it before the
+    # sleep and restarting it after left the whole retry window with a frozen
+    # bar and no animation, so a slow provider looked like the turn had
+    # stalled. During the wait the bar swaps its braille spinner for the
+    # hourglass glyph (braille means an in-flight request), the notice row
+    # above it counts down, and the turn timer keeps ticking; the next
+    # attempt clears the notice and brings the braille back.
+    let detail = formatApiDetail(errMsg, outcome.errBody, code)
+    let retryLabel = detail & ", retry " & $(attempt + 1) &
+      "/" & $MaxAttempts & " in"
+    hookRetryNotice retryLabel & " " & humanDuration(backoff)
+    hookStartSpinner("")
+    hookRetryWait(retryLabel, backoff)
+    block wait:
+      var remaining = backoff * 1000
+      var lastShown = backoff
+      while remaining > 0:
+        if isInterrupted(): break wait
+        let step = min(100, remaining)
+        sleep(step)
+        remaining -= step
+        let shown = (remaining + 999) div 1000
+        if shown != lastShown:
+          lastShown = shown
+          hookRetryWaitTick(shown)
+    if isInterrupted():
+      # Same interrupt class as `InterruptedByUserMsg` (matched by
+      # `isInterruptedMsg`), with the backoff context appended. The turn
+      # loop treats every `isInterruptedMsg` raise identically via
+      # `onTurnInterrupted`; a literal match on the bare message would route
+      # this through the generic-error path, which skips the turn-state
+      # reset and leaves Ctrl-D/Ctrl-C misrouted to a dead turn.
+      hookRetryWaitClear()
+      raise newException(ApiError,
+        InterruptedByUserMsg & " during retry backoff")
+    hookRetryWaitClear()
+    clearNetworkQuiet()
+    # Reset the quiet watchdog's activity timer so the next attempt gets a
+    # fresh QuietTooLongMs window. Without this, the watchdog's idle clock is
+    # still 45s+ stale (it only fires on provider activity, and a backoff has
+    # none), so it re-fires on the next tick and instantly kills attempt N+1
+    # before any provider data can arrive. This was why network-quiet errors
+    # burned through all retries with no backoff taken.
+    hookProviderActivity()
+    if category == "rate":
+      inc rateRetryLevel
+      rateLastTs = epochTime()
+    else:
+      inc serverRetryLevel
+      serverLastTs = epochTime()
+  usage = outcome.usage
+  let elapsed = epochTime() - t0
+  # An interrupted turn is rendered by the caller via `onTurnInterrupted`
+  # (the magenta "interrupted by user" line). Emitting a `· Xs` timing
+  # line (the no-usage branch) or repainting the token bar (the
+  # final-usage branch) here would leave spurious output above the
+  # interrupt message, so skip both when interrupted. Only the
+  # `break` path (streamed some content before the interrupt) reaches
+  # here; the `raise` path (no assistant content) returns above.
+  if isInterrupted():
+    discard  # caller owns the render via `onTurnInterrupted`; no timing/bar line
+  elif usage.totalTokens > 0:
+    # Repaint the bar with accurate values now that `usage` is parsed
+    # — the live values during streaming were rough estimates
+    # (`slurped/4`). `pendingHint` carries the same numbers forward
+    # so the next user-submit's receipt repaints this row (cyan) with
+    # matching content.
+    let assistantContent =
+      if outcome.assistantMsg == nil: ""
+      else: outcome.assistantMsg{"content"}.getStr("")
+    hookFinalUsage(usage, window, elapsed.int, assistantContent,
+                   outcome.streamedLive)
+  else:
+    hookNoUsage(elapsed.int)
+  if outcome.assistantMsg != nil and usage.totalTokens > 0:
+    # Attach this turn's usage inline so replay can render the same
+    # token line without a parallel array that drifts under summarization.
+    # `elapsed` and `ts` carry through to the .3log `tokens` record on
+    # save so resumed sessions keep their cost ledger.
+    outcome.assistantMsg["usage"] = %*{
+      "promptTokens": usage.promptTokens,
+      "completionTokens": usage.completionTokens,
+      "totalTokens": usage.totalTokens,
+      "cachedTokens": usage.cachedTokens,
+      "elapsed": elapsed.int,
+      "ts": now().format("yyyy-MM-dd'T'HH:mm:sszzz"),
+    }
+  debugOut &"callModel end streamedLive={outcome.streamedLive} usage={usage.totalTokens}"
+  return outcome.assistantMsg
+
+proc verifyBody*(p: Profile): string =
+  ## JSON body for the provider-verification ping.  Kept as a named proc
+  ## so the test suite can assert it matches the streaming convention used
+  ## by `callModel` (both must send `"stream": true`).
+  $(if geminicliProfile(p):
+    # Code Assist ping: wrapped Gemini-native envelope, same shape as
+    # a real turn. Project id is empty until login+discovery; the
+    # verify then 400s with a clear message rather than hanging.
+    parseJson(codeAssistBody(p, %*{
+      "model": p.model,
+      "messages": [%*{"role": "user", "content": "ping"}],
+      "max_tokens": 1,
+      "reasoning_effort": "low"
+    }, auth_google.projectId()))
+  elif anthropicProfile(p):
+    # Anthropic ping: /messages translation of the same shape. The
+    # 1-token budget forces the manual-mode thinking degrade inside
+    # the translation, so this stays a valid minimal request.
+    parseJson(anthropicBody(p, %*{
+      "model": p.model,
+      "messages": [%*{"role": "user", "content": "ping"}],
+      "max_tokens": 1
+    }))
+  elif chatgptProfile(p):
+    # Codex backend: SSE-only, server-side storage off, top-level
+    # `instructions` mandatory.
+    %*{
+      "model": p.model,
+      "instructions": "You are a helpful assistant.",
+      "input": [%*{"role": "user", "content": "ping"}],
+      # No max_output_tokens: the Codex backend 400s on it.
+      "store": false,
+      "stream": true
+    }
+  elif responsesApi(p):
+    %*{
+      "model": p.model,
+      "input": [%*{"role": "user", "content": "ping"}],
+      "max_output_tokens": 1,
+      "stream": true
+    }
+  else:
+    %*{
+      "model": p.model,
+      "messages": [%*{"role": "user", "content": "ping"}],
+      maxTokensField(p): 1,
+      "stream": true
+    })
+
+proc verifyProfile*(p: Profile): (bool, string) =
+  if verifyProfileHook != nil:
+    return verifyProfileHook(p)
+  when providerStub:
+    if isStubUrl(p.url):
+      # Test hook: THREECODE_STUB_VERIFY_DELAY_MS stretches the probe so
+      # tty tests can drive the wizard's cancel path mid-verification.
+      let delayMs = try: parseInt(getEnv("THREECODE_STUB_VERIFY_DELAY_MS"))
+                    except ValueError: 0
+      if delayMs > 0: sleep(delayMs)
+      return (true, "")
+  let body = verifyBody(p)
+  # Use the same bounded streaming path as `callModel` (streamhttp) instead
+  # of stdlib `newHttpClient`. The blocking client's `request` reads a
+  # chunked body via `socket.recvLine()` with no timeout, so a provider that
+  # accepts the connection then never sends the first chunk (a transient
+  # network stall) blocks the main thread forever. streamhttp's
+  # `setReadTimeoutMs` mirrors the deadline onto the socket as
+  # `SO_RCVTIMEO`, hard-bounding every `recv`; we retry each bounded window
+  # until `VerifyTimeoutMs` then fail cleanly.
+  let endpoint = endpointUrl(p, responsesApi(p), streaming = true)
+  let u = try: parseUri(endpoint) except CatchableError as e:
+    return (false, "bad url: " & e.msg)
+  let host = u.hostname
+  let plainHttp = u.scheme == "http" and plainHttpHost(host)
+  if u.scheme != "https" and not plainHttp:
+    return (false, "plain http is only allowed for local/LAN hosts, got: " & host)
+  let port =
+    if u.port.len > 0: Port(parseInt(u.port))
+    elif plainHttp: Port(80)
+    else: Port(443)
+  let pathQuery =
+    block:
+      var pq = if u.path.len > 0: u.path else: "/"
+      if u.query.len > 0: pq.add "?" & u.query
+      pq
+  var conn: StreamConn
+  try:
+    conn = if plainHttp:
+             connectPlain(host, port, timeoutMs = ConnectTimeoutMs)
+           else:
+             connectTls(host, port, timeoutMs = ConnectTimeoutMs,
+                        caFile = bundledCaFile())
+  except CatchableError as e:
+    invalidateResolved(host, port)
+    return (false,
+      connectFailMsg(endpointLabel(host, port, plainHttp), plainHttp, e))
+  defer: {.cast(gcsafe).}:
+    try: conn.close() except CatchableError: discard
+  conn.setReadTimeoutMs(QuietRecvWakeMs)
+  try:
+    conn.sendRequest("POST", pathQuery, host,
+      headers = requestHeaders(p, bearerFor(p), "text/event-stream"),
+      body = body)
+  except CatchableError as e:
+    return (false, "send failed: " & e.msg)
+  let deadline = getMonoTime() + initDuration(milliseconds = VerifyTimeoutMs)
+  var resp: StreamResponse
+  while true:
+    try:
+      resp = conn.readResponseHead()
+      break
+    except StreamTimeoutError:
+      if getMonoTime() >= deadline:
+        return (false, "no response within " & $(VerifyTimeoutMs div 1000) & "s")
+    except CatchableError as e:
+      return (false, "read failed: " & e.msg)
+  if resp.status != 200:
+    var snip = ""
+    while getMonoTime() < deadline and snip.len < 200:
+      var line: string
+      try:
+        if not conn.readLine(line): break
+      except StreamTimeoutError:
+        continue
+      except CatchableError:
+        break
+      snip.add line
+    return (false, $resp.status & ": " & snip)
+  # 200 — scan the streamed body for an in-band error. The Codex
+  # backend's `response.created` JSON carries `"error":null`, so a dumb
+  # substring match false-positives; only a `"error":{...}` object or an
+  # SSE `event: error` frame means failure.
+  var sse = ""
+  while getMonoTime() < deadline and sse.len < 2048:
+    var line: string
+    try:
+      if not conn.readLine(line): break
+    except StreamTimeoutError:
+      continue
+    except CatchableError:
+      break
+    sse.add line
+  if sse.contains("event: error") or sse.contains("\"error\":{"):
+    let start = max(0, sse.find("{"))
+    return (false, sse[start ..< min(start + 200, sse.len)])
+  (true, "")
+
+proc fetchModels*(url, key: string): (seq[string], string) =
+  ## GET /models on the provider. Returns (models, error) — error is empty on
+  ## success. Callers are responsible for displaying the error.
+  if fetchModelsHook != nil:
+    return fetchModelsHook(url, key)
+  when providerStub:
+    if isStubUrl(url):
+      return (stubModels(), "")
+  if codexModelsHook != nil and url == auth_openai.CodexApiUrl:
+    return (codexModelsHook(url), "")
+  try:
+    let client = newHttpClient(timeout = 20_000,
+                               userAgent = ModelUserAgent,
+                               sslContext = bundledSslContext())
+    defer: client.close()
+    if url.startsWith("https://api.anthropic.com"):
+      # The Anthropic models listing rejects a Bearer; it wants the
+      # Messages-protocol pair (x-api-key + pinned version).
+      client.headers["x-api-key"] = key
+      client.headers["anthropic-version"] = AnthropicVersionHeader
+    else:
+      client.headers["Authorization"] = "Bearer " & key
+    let resp = guardedHttp(client.get(url & "/models"), IOError,
+                           "fetching " & url)
+    if resp.code.int != 200:
+      return (@[], "HTTP " & $resp.code.int & " — " &
+                   resp.body[0 ..< min(120, resp.body.len)])
+    let j = parseJson(resp.body)
+    let arr = if j.kind == JArray: j
+              elif "data" in j and j["data"].kind == JArray: j["data"]
+              else:
+                return (@[], "unexpected response shape: " &
+                             resp.body[0 ..< min(120, resp.body.len)])
+    var models: seq[string]
+    for item in arr:
+      if item.kind == JString: models.add item.getStr
+      elif item.kind == JObject and "id" in item: models.add item["id"].getStr
+    return (models, "")
+  except CatchableError as e:
+    return (@[], e.msg)
+
+proc installInterruptHook*() =
+  setControlCHook(proc() {.noconv.} =
+    requestTurnInterrupt())
