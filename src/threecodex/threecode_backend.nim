@@ -85,8 +85,7 @@ proc newThreeCodeBackend*(model = "", cwd = "", resume = false,
   b.session = initAgentSession(opts)
   # `initAgentSession` disables engine output (headless mode), which makes
   # `syncWrite` - and with it the terminal tab title - a silent no-op. 3cx
-  # owns its own terminal, so turn it back on.
-  termengine.engineOutputEnabled = true
+  # owns its own terminal, so the vendor's terminal output stays disabled.
 
   # `name` drives the header, so prefer the model when one was requested.
   b.name = if model.len > 0: model else: b.session.profileLabel()

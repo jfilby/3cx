@@ -795,6 +795,17 @@ proc applyChunk*(app: App, chunk: Chunk) =
     let plain = stripBullet(chunk.text)
     if streamed.len > 0 and (plain == streamed or plain.startsWith(streamed)):
       discard
+    elif plain == "interrupted by user":
+      # The vendor's `onTurnInterrupted` fires for spurious interrupts (e.g. rate-
+      # limited turns that surface as interrupts). We don't want to show this
+      # to the user since they didn't actually interrupt.
+      discard
+    elif plain.startsWith("○") or plain.startsWith("◔") or
+         plain.startsWith("◑") or plain.startsWith("◕") or
+         plain.startsWith("●"):
+      # The vendor's `contextLabel` generates a context-usage indicator like
+      # "○ 0%" that ends up in the input bar. We don't want to show this either.
+      discard
     else:
       app.chat.addMessage(rTool, chunk.text)
 
