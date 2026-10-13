@@ -83,6 +83,10 @@ method runCommand*(b: Backend, cmd: string): string {.base.} =
   ## Execute `cmd` and return its plain-text result for the transcript.
   "commands are not supported by this backend"
 
+method contextUsageLine*(b: Backend): string {.base.} =
+  ## Context window usage as "83.6K (8%)" for the status bar, or "" if unknown.
+  ""
+
 # ---------------------------------------------------------------------------
 # Mock backend
 # ---------------------------------------------------------------------------

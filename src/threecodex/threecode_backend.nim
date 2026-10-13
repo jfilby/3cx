@@ -27,6 +27,7 @@
 
 import std/[deques, locks, strutils]
 import threecode/library
+import threecode/compact
 import threecode/engine as termengine
 # `classifyCommand` / `CommandKind` are how 3code itself decides whether a line is
 # a command, so reuse that rather than re-deriving the rule from a leading '/'.
@@ -204,6 +205,20 @@ proc usageLine*(b: ThreeCodeBackend): string =
     return ""
   result = $u.totalTokens & " tokens" &
            (if u.cachedTokens > 0: " (" & $u.cachedTokens & " cached)" else: "")
+
+proc contextUsageLine*(b: ThreeCodeBackend): string =
+  ## Context window usage as "83.6K (8%)" for the status bar, or "" if
+  ## unknown. Uses the vendor's `contextWindowFor` heuristic and the
+  ## session's current `promptTokens`.
+  let u = b.session.usage()
+  if u.promptTokens == 0:
+    return ""
+  let window = compact.contextWindowFor(b.name)
+  if window <= 0:
+    return ""
+  let pct = int(u.promptTokens.float / window.float * 100.0)
+  let tokens = $u.promptTokens
+  result = tokens & " (" & $pct & "%)"
 
 proc close*(b: ThreeCodeBackend) =
   ## Interrupt, join the worker, then persist and release the session.

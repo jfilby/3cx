@@ -188,6 +188,18 @@ proc drawBar(tb: var TerminalBuffer, y: int, text: string, bg: BackgroundColor,
   tb.write(0, y, visible)
   applyCanvas(tb)
 
+proc padStatus(left, right: string, w: int): string =
+  ## Left- and right-justify two chunks across a bar `w` columns wide, padding
+  ## the gap with spaces. When the two would collide the left chunk wins, so
+  ## the truncated bar stays readable rather than wrapping.
+  ##
+  ## Tabs would be simpler, but every terminal expands them to its own stops -
+  ## so the right-hand chunk lands somewhere different everywhere.
+  let lw = displayWidth(left)
+  let rw = displayWidth(right)
+  let gap = max(w - lw - rw, 1)
+  result = left & " ".repeat(gap) & right
+
 # ---------------------------------------------------------------------------
 # Transcript
 # ---------------------------------------------------------------------------
@@ -356,19 +368,23 @@ proc render*(tb: var TerminalBuffer, app: App) =
       tb.drawLine(lay.msgTop + row, sideMargin, app.transcript[idx], bodyWidth,
                   cs, ce)
 
-  # Separator above the prompt.
+  # Separator above the input area.
   tb.setForegroundColor(colRule)
   tb.drawHorizLine(0, w - 1, lay.inputTop - 1)
 
-  # Prompt: the `>` gutter only tracks the cursor row.
+  # Input area: its own filled surface, so the prompt reads as a box rather
+  # than text floating on the canvas - the way OpenCode's prompt does. The
+  # fill goes down first; the spans below then re-assert the same background,
+  # because a span naming no background of its own paints the canvas colour
+  # and would punch holes back through the fill.
+  tb.setBackgroundColor(colBarBg)
+  tb.setForegroundColor(colBarFg)
+  tb.setStyle({})
+  tb.fill(0, lay.inputTop, w - 1, lay.statusY - 1, " ")
+  applyCanvas(tb)
+
   let firstVisible = app.input.firstVisibleLine(lay.inputRows)
-  let cursorRow = lay.inputTop + (app.input.line - firstVisible)
-
   if w >= minWidth:
-    tb.setForegroundColor(colPrompt)
-    tb.write(0, cursorRow, "\u276f")
-    applyCanvas(tb)
-
     for row in 0 ..< lay.inputRows:
       let idx = firstVisible + row
       if idx >= app.input.lines.len:
@@ -378,29 +394,33 @@ proc render*(tb: var TerminalBuffer, app: App) =
         line = cursorLine(app.input.lines[idx], app.input.col)
       else:
         line.addSpan Span(text: app.input.lines[idx], fg: colText)
-      tb.drawLine(lay.inputTop + row, sideMargin + 1, line, bodyWidth - 1)
+      for s in line.spans.mitems:
+        if s.bg == bgNone:
+          s.bg = colBarBg
+      tb.drawLine(lay.inputTop + row, sideMargin, line, bodyWidth)
 
-  # Status bar. A copy takes the strip for a moment: a clipboard has no way to
-  # acknowledge, so a flash is the only confirmation the user gets that the
-  # OSC 52 payload went anywhere.
-  #
-  # The keybinding hints are deliberately the quietest thing on screen - they
-  # are there until you have learned them, and a lit-up bar competes with the
-  # transcript for the eye. A copy is the one moment worth breaking that for,
-  # so it takes the success colour. `barDim` decides whether *quiet* means
-  # `styleDim`: dimming white toward the light theme's black bar keeps it
-  # readable, but toward the dark theme's blue bar it washes out entirely.
-  let (status, statusFg, statusStyle) =
-    if app.copyMsg.len > 0 and epochTime() < app.copyMsgUntil:
-      (" " & app.copyMsg, colOk, {})
-    elif app.streaming:
-      (" streaming\u2026  ctrl+c cancel  esc to tail  ctrl+d quit ",
-       colText, {})
-    else:
-      (" enter send  ctrl+j newline  \u2191/\u2193 history  " &
-       "pgup/pgdn scroll  ctrl+d quit ", colDim,
-       if currentTheme.barDim: {styleDim} else: {})
-  drawBar(tb, lay.statusY, status, colBarBg, statusFg, statusStyle)
+  # Status bar: left shows the busy indicator or the current directory; the
+  # right always carries the context usage and the command hint. Laid out with
+  # explicit padding rather than tabs, which every terminal expands to its own
+  # stops.
+  let home = getHomeDir()
+  let dir = getCurrentDir().replace(home, "~")
+  let ctx = app.backend.contextUsageLine()
+  let copying = app.copyMsg.len > 0 and epochTime() < app.copyMsgUntil
+  let left = if copying:
+               " " & app.copyMsg
+             elif app.streaming:
+               " \u25cc\u25cc\u25cc\u25cc\u25cc\u25cc\u25cc\u25cc\u25cc\u25cc  esc interrupt"
+             else:
+               " " & dir
+  let right = if ctx.len > 0: ctx & "  ctrl+p commands "
+              else: "ctrl+p commands "
+  let (statusFg, statusStyle) =
+    if copying: (colOk, {})
+    elif app.streaming: (colText, {})
+    else: (colDim, if currentTheme.barDim: {styleDim} else: {})
+  drawBar(tb, lay.statusY, padStatus(left, right, w), colBarBg, statusFg,
+          statusStyle)
 
 # ---------------------------------------------------------------------------
 # Input handling

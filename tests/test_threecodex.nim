@@ -943,12 +943,12 @@ suite "themes":
       app.sel.start(Cell(row: 0, col: 0))
       app.sel.extendTo(Cell(row: 1, col: 4))
       render(tb, app)
-      # The prompt row holds the block cursor, one past the `❯` gutter; the
-      # transcript row it selects over is above it.
-      check tb[3, 8].bg == t.cursorBg
-      check tb[3, 8].fg == t.cursor
-      check tb[3, 2].bg == t.selectBg
-      check tb[3, 2].fg == t.select
+      # The input row holds the block cursor at the left margin; the transcript
+      # row the selection starts on sits below the header bar.
+      check tb[2, 8].bg == t.cursorBg
+      check tb[2, 8].fg == t.cursor
+      check tb[2, 2].bg == t.selectBg
+      check tb[2, 2].fg == t.select
 
   test "the two themes are opposites":
     themed()
