@@ -4,7 +4,10 @@
 ## exercised without a tty. That matters: escape-sequence handling is exactly
 ## the sort of code that is painful to debug through a live terminal.
 
-import std/[sequtils, strutils, unicode, unittest]
+import std/[sequtils, strutils, times, unicode, unittest]
+when defined(posix):
+  # posix defines its own `Key`, which would collide with illwill's.
+  import std/posix except Key
 import illwill
 import ../src/threecodex/keyevent
 
@@ -172,3 +175,33 @@ suite "keyevent":
     check r.pending() == 0
     discard r.parse("\x1b[1;5", flushEsc = false)
     check r.pending() > 0
+
+  test "the ctrl-c signal is latched and reported as a key":
+    # The one input the decoder never sees: the driver consumes 0x03, so the
+    # byte count on stdin is irrelevant to whether Ctrl-C happened. The hook
+    # may only latch - anything more runs in signal context.
+    installCtrlCHook()
+    discard posix.raise(SIGINT)
+    let evs = newInputReader().poll(0)
+    check evs.len == 1
+    check evs[0].kind == evKey
+    check evs[0].key == Key.CtrlC
+    # Consumed, not sticky: nothing is left over for the next frame.
+    check newInputReader().poll(0).len == 0
+
+  test "repeated ctrl-c signals latch once and do not raise":
+    installCtrlCHook()
+    for _ in 0 ..< 3:
+      discard posix.raise(SIGINT)
+    let evs = newInputReader().poll(0)
+    check evs.len == 1
+    check evs[0].key == Key.CtrlC
+
+  test "flushQueuedMouseReports returns in milliseconds, not minutes":
+    # `posix.sleep` counts seconds where the rest of the UI counts
+    # milliseconds. A 50 there suspended shutdown for 50s, which is long enough
+    # for a user to assume the app had died and hit Ctrl-C - and the second
+    # signal used to land in a teardown that had already finished.
+    let t0 = epochTime()
+    flushQueuedMouseReports()
+    check (epochTime() - t0) < 5.0

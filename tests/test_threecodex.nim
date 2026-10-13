@@ -11,6 +11,15 @@ import ../src/threecodex/[uwidth, markdown, inputbox, keyevent, session, selecti
                            clipboard, types, backend, config, theme]
 import ../src/threecodex/app
 
+type
+  # A backend that only counts interrupts, so the quit keys can be checked
+  # against what the backend saw rather than against the screen.
+  RecordingBackend = ref object of Backend
+    interrupts: int
+
+method interrupt(b: RecordingBackend) =
+  inc b.interrupts
+
 suite "app style mapping":
   # On POSIX illwill emits `ESC[<ordinal>m`, so a Style flag *is* an SGR code.
   # Getting this wrong is invisible in unit tests and obvious on screen: bold
@@ -574,6 +583,57 @@ suite "uwidth columns":
   test "a selection past the end of a line stops at the end":
     check sliceColumns("abc", 1, 99) == "bc"
 
+suite "quit keys":
+  # Ctrl-C and Ctrl-D are where this app nearly took itself down: the SIGINT
+  # handler used to run the whole teardown in signal context, so a second
+  # Ctrl-C landing mid-teardown raised from inside the handler and segfaulted,
+  # and the 50ms "wait for the terminal" sleep was really 50 *seconds*, so
+  # Ctrl-D returned to a console with no prompt for a minute.
+  #
+  # The contract now is 3code's own: Ctrl-C cancels - the in-flight turn, or
+  # the draft - and Ctrl-D on an empty prompt is the only way out.
+
+  proc keyLayout(): Layout =
+    Layout(msgTop: 2, msgHeight: 10, inputTop: 12, inputRows: 3, statusY: 15)
+
+  proc keyEventApp(streaming: bool, text = ""): App =
+    result = App(chat: Chat(), backend: RecordingBackend(), streamIdx: -1,
+                 streaming: streaming)
+    result.input = newInputBox()
+    result.input.paste(text)
+
+  test "ctrl-c cancels the turn instead of quitting":
+    var app = keyEventApp(streaming = true, text = "half typed")
+    app.handleEvent(InputEvent(kind: evKey, key: Key.CtrlC), keyLayout(), 0)
+    let b = cast[RecordingBackend](app.backend)
+    check b.interrupts == 1
+    check not app.quit
+    check app.input.text == "half typed"    # the draft is not touched
+
+  test "ctrl-c clears the draft when nothing is streaming":
+    var app = keyEventApp(streaming = false, text = "half typed")
+    app.handleEvent(InputEvent(kind: evKey, key: Key.CtrlC), keyLayout(), 0)
+    check cast[RecordingBackend](app.backend).interrupts == 0
+    check app.input.isEmpty
+    check not app.quit
+
+  test "ctrl-c on an empty prompt is a no-op, not an exit":
+    var app = keyEventApp(streaming = false)
+    app.handleEvent(InputEvent(kind: evKey, key: Key.CtrlC), keyLayout(), 0)
+    check not app.quit
+
+  test "ctrl-d quits on an empty prompt":
+    var app = keyEventApp(streaming = false)
+    app.handleEvent(InputEvent(kind: evKey, key: Key.CtrlD), keyLayout(), 0)
+    check app.quit
+
+  test "ctrl-d deletes forward when there is a draft":
+    var app = keyEventApp(streaming = false, text = "ab")
+    app.input.moveHome()                 # cursor in front of the 'a'
+    app.handleEvent(InputEvent(kind: evKey, key: Key.CtrlD), keyLayout(), 0)
+    check not app.quit
+    check app.input.text == "b"
+
 suite "mouse selection":
   # Positions are transcript coordinates, so a selection survives scrolling and
   # a re-wrap: rows keep their identity and only the rendering re-slices them.
@@ -1040,3 +1100,4 @@ suite "preferences":
     applyTheme(loadConfig().theme)
     check currentTheme.name == "dark"
     discard useTheme("light")
+

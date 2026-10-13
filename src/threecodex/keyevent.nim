@@ -11,6 +11,12 @@
 ##    (Ctrl+Up) as `ESC [ 1`, fails to match, and *discards the sequence* - the
 ##    key press disappears rather than degrading to a plain Up.
 ##
+## 4. **Ctrl-C never arrives as a byte at all.** illwill leaves `ISIG` alone, so
+##    the tty driver turns `0x03` into SIGINT and nothing reaches stdin. That
+##    is worth keeping - Ctrl-C has to terminate a wedged process - but it does
+##    mean the decoder cannot be the only input path. `installCtrlCHook` latches
+##    the signal and `poll` reports it as the `Key.CtrlC` the app expects.
+##
 ## None of that information is missing from the terminal: `ESC [ 1 ; 5 A`
 ## encodes Ctrl+Up perfectly well. illwill simply throws it away. This module
 ## reads stdin directly instead, reassembles escape sequences across reads, and
@@ -24,7 +30,7 @@
 ## `poll` falls back to translating illwill's `getKey`, which keeps the app
 ## buildable everywhere.
 
-import std/[sequtils, strutils, unicode]
+import std/[atomics, sequtils, strutils, unicode]
 import illwill
 when defined(posix):
   # posix defines its own `Key`, which would collide with illwill's.
@@ -377,6 +383,39 @@ proc parse*(r: InputReader, data: string, flushEsc = true): seq[InputEvent] =
     r.buf = if pos < r.buf.len: r.buf[pos ..< ^1] else: ""
 
 # ---------------------------------------------------------------------------
+# Ctrl-C: the terminal reports it as a signal, not as a byte
+# ---------------------------------------------------------------------------
+
+var sigintPending: Atomic[bool]
+  ## Latched by the SIGINT hook, taken by `poll`.
+  ##
+  ## A signal handler may only run async-signal-safe code, and nothing Ctrl-C
+  ## has to do qualifies: interrupting a turn takes locks and allocates, and
+  ## tearing the terminal down writes to stdout. So the handler does the one
+  ## legal thing - latch a flag - and the main loop, which is allowed to do
+  ## all of it, does the work. The old hook ran the whole teardown in signal
+  ## context and then called `quit(0)`; a second Ctrl-C landing mid-teardown
+  ## found illwill already de-initialised, `checkInit` raised, and unwinding
+  ## out of a signal handler segfaulted.
+
+proc sigintHook() {.noconv.} =
+  ## The SIGINT handler. Runs on whichever thread the kernel picks and between
+  ## any two instructions of the program, hence the single atomic store.
+  sigintPending.store(true, moRelease)
+
+proc installCtrlCHook*() =
+  ## Route SIGINT to `sigintHook` rather than the runtime's default.
+  ##
+  ## Call once, before the event loop starts. Without it SIGINT kills the
+  ## process outright - the byte never reaches the decoder, so the app sees no
+  ## Ctrl-C at all.
+  setControlCHook(sigintHook)
+
+proc takeCtrlCEvent(): bool =
+  ## Take the latched Ctrl-C, if the hook left one.
+  sigintPending.exchange(false, moAcquire)
+
+# ---------------------------------------------------------------------------
 # Reading from stdin (POSIX)
 # ---------------------------------------------------------------------------
 
@@ -438,7 +477,13 @@ when defined(posix):
     ## stragglers queue silently: wait out the emulator's latency, then drop
     ## everything queued, and only then let `illwillDeinit` restore echo. Must
     ## be the last tty operation before `illwillDeinit`, on every exit path.
-    discard posix.sleep(50)
+    ##
+    ## `posix.usleep` counts *microseconds*. The POSIX `sleep` next door counts
+    ## seconds, and the original `posix.sleep(50)` therefore held the whole
+    ## shutdown for 50 of them - Ctrl-D put the screen back and then left the
+    ## user staring at a console with no prompt for the better part of a
+    ## minute, which is exactly the window in which they reached for Ctrl-C.
+    discard posix.usleep(50 * 1000)
     discard tcflush(STDIN_FILENO, TCIFLUSH)
 
   proc stdinReady(timeoutMs: int): bool =
@@ -470,6 +515,11 @@ when defined(posix):
 
   proc poll*(r: InputReader, timeoutMs = 0): seq[InputEvent] =
     ## Wait up to `timeoutMs` for input and return any decoded events.
+    ##
+    ## Ctrl-C is checked before stdin: the signal leaves no byte behind, so the
+    ## keyboard is empty at the moment the user is least expecting it to be.
+    if takeCtrlCEvent():
+      return @[keyEvent(Key.CtrlC)]
     if not stdinReady(timeoutMs):
       return
     let data = drainStdin()
@@ -489,7 +539,10 @@ else:
     ## Non-POSIX fallback: translate illwill's byte-oriented `getKey`.
     ##
     ## Still one byte per event, so Unicode input and modifiers remain
-    ## unavailable here - see the module docs.
+    ## unavailable here - see the module docs. The Ctrl-C latch works the same
+    ## way it does on POSIX.
+    if takeCtrlCEvent():
+      return @[keyEvent(Key.CtrlC)]
     discard r
     discard timeoutMs
     let k = getKey()

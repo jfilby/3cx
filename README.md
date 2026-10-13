@@ -211,7 +211,12 @@ line in its `themes` table.
 | `Ctrl+D` | Delete forward, or quit when the prompt is empty |
 | `PgUp` / `PgDn`, mouse wheel | Scroll the transcript |
 | `Esc` | Cancel the in-flight turn; if idle, jump to the live tail |
-| `Ctrl+C` | Quit |
+| `Ctrl+C` | Cancel the in-flight turn; if idle, clear the prompt |
+
+Ctrl-C never exits: the terminal turns it into SIGINT rather than a byte, so
+the signal is latched by a handler that may only set a flag, and the main loop
+turns it into the same key the table above describes. Ctrl-D on an empty prompt
+is the way out.
 
 ## Layout
 
@@ -339,6 +344,13 @@ and the terminal driver rewrites a carriage return (`0x0D`) into a newline
 maps *both* onto `Key.Enter`; a decoder that keeps Enter and Ctrl+J distinct
 would otherwise see every Enter as a newline. `enableRawInput` clears `ICRNL`
 (and `IXON`, so Ctrl+S cannot freeze the terminal) after `illwillInit`.
+
+`ISIG` is deliberately left on, so Ctrl-C still terminates a wedged process —
+but it also means the byte never reaches the decoder. `installCtrlCHook`
+catches the signal with a handler that does nothing but latch a flag (a signal
+handler may not allocate, take a lock or write to the terminal), and `poll`
+reports it as `Key.CtrlC`. That is what makes Ctrl-C "cancel the turn" rather
+than "kill the UI", and why a second Ctrl-C during shutdown is harmless.
 
 The parser is separated from the reader — `parse` is pure, bytes in and events
 out — so it is unit tested without a tty.

@@ -58,7 +58,8 @@ type
     scroll*: int          ## Lines scrolled back from the tail; exported so the
                           ## edge auto-scroll can be tested with a known window.
     transcript*: seq[Line]  ## Rows as last rendered; see `visibleStart`.
-    quit: bool
+    quit*: bool             ## Set by Ctrl-D on an empty prompt and `/quit`;
+                            ## exported so the exit keys are testable.
     sel*: Selection       ## Mouse selection, in transcript coordinates.
     selecting: bool       ## Left button held: a drag is in flight.
     pointerX: int         ## Last pointer cell, for edge auto-scroll.
@@ -87,19 +88,6 @@ proc getBuffer(): TerminalBuffer =
   if gBuffer == nil or gBuffer.width != w or gBuffer.height != h:
     gBuffer = newTerminalBuffer(w, h)
   result = gBuffer
-
-proc exitProc() {.noconv.} =
-  # First thing, before anything slow: an SGR mouse report queued after the
-  # last input read would be echoed onto the restored command line as
-  # literal text ("51;108;19M"). See `stopMouseTracking`.
-  stopMouseTracking()
-  resetExactPalette()
-  illwillDeinit()
-  # After illwillDeinit restored echo: the last tty operation before exit, so
-  # reports the terminal delivered after the early flush are dropped here.
-  flushQueuedMouseReports()
-  showCursor()
-  quit(0)
 
 # ---------------------------------------------------------------------------
 # Drawing helpers
@@ -387,7 +375,7 @@ proc render*(tb: var TerminalBuffer, app: App) =
     if app.copyMsg.len > 0 and epochTime() < app.copyMsgUntil:
       (" " & app.copyMsg, colOk, {})
     elif app.streaming:
-      (" streaming\u2026  esc to scroll to tail  ctrl+d to quit ",
+      (" streaming\u2026  ctrl+c cancel  esc to tail  ctrl+d quit ",
        colText, {})
     else:
       (" enter send  ctrl+j newline  \u2191/\u2193 history  " &
@@ -660,6 +648,10 @@ proc handleEvent*(app: App, ev: InputEvent, lay: Layout, start: int) =
     of Key.CtrlC:
       # opencode-style: Ctrl-C never exits. It cancels the in-flight turn,
       # or clears the prompt when idle; Ctrl-D on an empty prompt is the exit.
+      #
+      # The byte never arrives: `ISIG` is on, so the driver turns it into
+      # SIGINT and `poll` reassembles the key from the latched signal. This
+      # branch is therefore the *whole* Ctrl-C implementation, not a fallback.
       if app.streaming:
         app.backend.interrupt()
       elif not app.input.isEmpty:
@@ -832,9 +824,15 @@ proc drainBackend(app: App) =
 
 proc run*(chat: Chat, backend: Backend) =
   ## Run the UI until the user quits, saving the transcript on the way out.
+  # First, before the terminal is touched: from here on Ctrl-C must be handled
+  # rather than fatal, because the default SIGINT disposition would kill the
+  # process with the screen still in full-screen mode and nothing to put it
+  # back. Ctrl-C never reaches the decoder as a byte anyway - `enableRawInput`
+  # leaves `ISIG` on, so the driver turns 0x03 into a signal - and the hook
+  # latches it for `InputReader.poll` to hand back as `Key.CtrlC`.
+  installCtrlCHook()
   illwillInit(fullScreen = true, mouse = true)
   applyExactPalette(currentTheme)
-  setControlCHook(exitProc)
   discard enableRawInput()   # stop ICRNL rewriting Enter into Ctrl+J
 
   var app = App(chat: chat, input: newInputBox(), backend: backend,
