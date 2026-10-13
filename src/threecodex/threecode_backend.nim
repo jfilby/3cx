@@ -27,6 +27,7 @@
 
 import std/[deques, locks, strutils]
 import threecode/library
+import threecode/engine as termengine
 # `classifyCommand` / `CommandKind` are how 3code itself decides whether a line is
 # a command, so reuse that rather than re-deriving the rule from a leading '/'.
 import threecode/ui
@@ -82,6 +83,10 @@ proc newThreeCodeBackend*(model = "", cwd = "", resume = false,
   var b = ThreeCodeBackend()
   initLock(b.lock)
   b.session = initAgentSession(opts)
+  # `initAgentSession` disables engine output (headless mode), which makes
+  # `syncWrite` - and with it the terminal tab title - a silent no-op. 3cx
+  # owns its own terminal, so turn it back on.
+  termengine.engineOutputEnabled = true
 
   # `name` drives the header, so prefer the model when one was requested.
   b.name = if model.len > 0: model else: b.session.profileLabel()

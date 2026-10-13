@@ -41,11 +41,17 @@ import ./clipboard
 import ./types
 import ./backend
 import ./version
+import threecode/tabtitle
 
 const
   sideMargin  = 2      ## Columns of breathing room on each side.
   minWidth    = 24     ## Below this the layout stops trying to be pretty.
   copyFlashSecs = 1.5  ## How long a "copied" message holds the status bar.
+
+const
+  spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    ## The terminal-tab spinner glyphs, rotating while a turn streams. The
+    ## same braille frames 3code's own GUI footer uses.
 
 type
   App* = ref object
@@ -60,6 +66,9 @@ type
     transcript*: seq[Line]  ## Rows as last rendered; see `visibleStart`.
     quit*: bool             ## Set by Ctrl-D on an empty prompt and `/quit`;
                             ## exported so the exit keys are testable.
+    turnError: bool        ## The in-flight turn produced an error chunk; the
+                            ## tab title settles to ✗ instead of ✓. Also set on
+                            ## user interrupt, which surfaces as a ckError.
     sel*: Selection       ## Mouse selection, in transcript coordinates.
     selecting: bool       ## Left button held: a drag is in flight.
     pointerX: int         ## Last pointer cell, for edge auto-scroll.
@@ -508,6 +517,7 @@ proc submitInput(app: App) =
   app.streamIdx = app.chat.messages.len - 1
   app.backend.start(text)
   app.streaming = true
+  app.turnError = false
   app.scroll = 0
   discard app.chat.saveSession()
 
@@ -789,6 +799,7 @@ proc applyChunk*(app: App, chunk: Chunk) =
       app.chat.addMessage(rTool, chunk.text)
 
   of ckError:
+    app.turnError = true
     app.chat.addMessage(rSystem, chunk.text)
 
   of ckNone:
@@ -799,14 +810,17 @@ proc applyChunk*(app: App, chunk: Chunk) =
   # longer where it pointed, so it goes instead.
   app.sel.clear()
 
-proc drainBackend(app: App) =
+proc drainBackend(app: App): bool =
   ## Move everything the backend has produced into the chat.
   ##
   ## Called once per frame, so it drains the whole queue rather than a single
   ## item: a worker thread can queue many events between two frames, and
   ## rendering them one frame at a time would make fast replies crawl.
+  ##
+  ## Returns true on the frame a turn ends, so the caller can settle the
+  ## terminal tab title once the frame is on screen.
   if not app.streaming:
-    return
+    return false
 
   while true:
     let chunk = app.backend.nextChunk()
@@ -817,6 +831,8 @@ proc drainBackend(app: App) =
   if app.backend.isDone():
     app.streaming = false
     discard app.chat.saveSession()
+    return true
+  false
 
 # ---------------------------------------------------------------------------
 # Main loop
@@ -844,7 +860,12 @@ proc run*(chat: Chat, backend: Backend) =
   var
     lastW = -1
     lastH = -1
+    spinIdx = 0
   try:
+    # The terminal tab title: brand + project label while idle. Set before
+    # the loop starts so the tab is correct from the first frame.
+    tabtitle.setTabTitleLabel(getCurrentDir().extractFilename)
+    tabtitle.paintTabTitleIdle()
     while not app.quit:
       var tb = getBuffer()
       let lay = app.computeLayout(tb.width, tb.height)
@@ -861,10 +882,20 @@ proc run*(chat: Chat, backend: Backend) =
       for ev in app.reader.poll(0):
         app.handleEvent(ev, lay, start)
       app.dragScroll(lay)
-      app.drainBackend()
+      let turnEnded = app.drainBackend()
       render(tb, app)
 
       tb.display()
+
+      # Tab title writes go after the frame, like the OSC 52 below: a sequence
+      # emitted mid-diff could tear against illwill's output. While a turn
+      # streams the spinner glyph rotates; on the frame it ends the spinner is
+      # replaced by the outcome mark.
+      if app.streaming:
+        tabtitle.paintTabTitleWorking(spinnerFrames[spinIdx])
+        spinIdx = (spinIdx + 1) mod spinnerFrames.len
+      elif turnEnded:
+        tabtitle.settleTabTitle(not app.turnError)
 
       # After the frame, so the sequence shares no bytes with the diff illwill
       # is writing. A terminal that honours OSC 52 needs no repaint either.
