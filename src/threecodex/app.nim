@@ -297,6 +297,16 @@ proc stripBullet(s: string): string =
     inc i
   s[i .. ^1]
 
+proc anyAssistantMessage(chat: Chat, plain: string): bool =
+  ## True if `plain` matches the content of any committed assistant message.
+  ## The vendor's headlessTranscriptHook can emit the same text as both aevDelta
+  ## (streamed) and aevTool (committed), so we check all assistant messages to
+  ## catch duplicates regardless of where the streamed content ended up.
+  for msg in chat.messages:
+    if msg.role == rAssistant and msg.content == plain:
+      return true
+  false
+
 proc render*(tb: var TerminalBuffer, app: App) =
   ## Paint one frame.
   ##
@@ -794,6 +804,12 @@ proc applyChunk*(app: App, chunk: Chunk) =
                    else: ""
     let plain = stripBullet(chunk.text)
     if streamed.len > 0 and (plain == streamed or plain.startsWith(streamed)):
+      discard
+    elif anyAssistantMessage(app.chat, plain):
+      # The vendor's headlessTranscriptHook emits both aevDelta (streamed) and
+      # aevTool (committed) for the same content. After streaming ends, the
+      # streaming check above no longer catches the duplicate, so also compare
+      # against any committed assistant message.
       discard
     elif plain == "interrupted by user":
       # The vendor's `onTurnInterrupted` fires for spurious interrupts (e.g. rate-
