@@ -1,7 +1,7 @@
 # Vendored: 3code
 
 Upstream: https://github.com/capocasa/3code
-Pinned commit: `ffa46cf415f984244a0ceb0d0be4e64885517bab` (2026-10-06, v0.8.2)
+Pinned commit: `e04cba80d26d7e6115ad1650e1e4ccdda4d2bdde` (2026-10-11, v0.8.3)
 License: MIT — see `LICENSE`.
 
 Only `src/`, `config.nims` and `nimble.lock` are copied; tests, docs and the

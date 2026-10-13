@@ -93,7 +93,7 @@ var
     privateBar:  MagentaFg,          # private mode repaints the bar in this
   )
   LightPalette*: ColorSpec = (
-    # Invert: white -> black, off-white -> dark grey,
+    # Invert the white family: white -> black, off-white -> dark grey,
     # dim white -> a lighter dark grey. Colourful colors (cyan/green/red/
     # magenta) are unchanged, handled at their call sites.
     brightWhite: "\x1b[30m",        # black

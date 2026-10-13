@@ -42,6 +42,7 @@ when defined(posix):
   from std/posix import kill, Pid
 import sandwall
 import sandwall/wall as sandwallWall
+import defaults
 import types
 import util
 
@@ -62,24 +63,18 @@ type Policy* = seq[Rule]
   ## of the codebase reads `Policy`.
 
 proc defaultPolicyText*(): string =
-  ## Deny root, keep temp dirs and the project dir writable, network
-  ## open. System dirs (/usr, /bin, /etc, ...) are read-only via the
-  ## sandwall baseline; deny / fences the rest, home included. The
-  ## POSIX `allow *` passes all traffic through the wall proxy; Windows
-  ## has no host rules because there they would airgap the AppContainer
-  ## (the net fence is a separate backend), while no rules grants it
-  ## the internet capability. The project dir is spelled `allow ./`
-  ## (a bare `allow` is equivalent; the explicit target reads better).
-  when defined(windows):
-    "deny /\n" &
-    "allow ~/AppData/Local/Temp\n" &
-    "allow ./\n"
-  else:
-    "deny /\n" &
-    "allow /tmp\n" &
-    "allow /var/tmp\n" &
-    "allow ./\n" &
-    "allow *\n"
+  ## The shipped default policy, held in `threecode/defaults` as one
+  ## inspectable literal block per OS: temp dirs and the project dir
+  ## writable, the dev caches and toolchain homes the covered builds
+  ## need, VCS user config readable (git and cargo are *fatal* on an
+  ## unreadable config file), network open on POSIX. `deny /` fences
+  ## the rest of $HOME - token files (~/.npmrc, ~/.cargo/credentials,
+  ## ~/.git-credentials), ~/.ssh, everything else. Windows ships no
+  ## VCS config rules: streamexec seeds the bash child's redirected
+  ## HOME with a gitconfig copy instead, because the child runs as a
+  ## separate user and git's ownership check would otherwise reject
+  ## every repo.
+  defaults.defaultPolicyText
 
 proc repoPolicyPath*(projectDir: string): string =
   projectDir / PolicyFile
@@ -464,6 +459,11 @@ proc resolveRawPath(p: string): string =
   var dir = result
   var tail = ""
   while dir.len > 0:
+    when defined(windows):
+      # A bare drive prefix is the cwd ON that drive, not an ancestor:
+      # resolving it would map a nonexistent C:\foo onto the project
+      # dir and let the gate treat it as ./foo.
+      if dir.len in 2..3 and dir[1] == ':': break
     try:
       let r = expandFilename(dir)
       if r.len > 0:

@@ -33,7 +33,7 @@ import threecode/[types, util, prompts, shell, session, compact,
                   config, actions, api, display, ui, update, fatprompt,
                   toolstream, turns, transcript, sandbox, box, wall,
                   auth_xai, auth_openai, auth_google, auth_anthropic,
-                  streamexec, cli, search]
+                  streamexec, cli, search, tabtitle]
 when not defined(android):
   import tinotify
 else:
@@ -628,7 +628,7 @@ proc main() =
 
   var activeColorKeys: Table[string, string]
   (activeCurrent, activeProviders, activeColorKeys) = loadStateOrEmpty(configPath())
-  # Per-directory sticky current: this directory's last `/provider` / `/model`
+  # Per-directory sticky current: this directory's last `:provider` / `:model`
   # wins over the global config when it still resolves. An explicit --model
   # or a resumed session's own profile still wins over both.
   block:
@@ -857,6 +857,8 @@ proc main() =
     # The startup paint is a render boundary the tty harness synchronizes
     # on: without the frame event the first captured frame can predate the
     # chrome (or miss it entirely when the PTY burst is coalesced).
+    tabtitle.setTabTitleLabel(getCurrentDir())
+    tabtitle.paintTabTitleIdle()
     emitTestFrameEvent()
     startupTrace("first-prompt-painted")
     if prompt != "" and runInitialPrompt(prompt):
@@ -882,7 +884,7 @@ proc main() =
         break
       if line == "": continue
       let t = line.strip
-      if t in ["exit", "quit", "/q", "/quit", "/exit"]: break
+      if t in ["exit", "quit", ":q", ":quit", ":exit"]: break
       let commandResult = handleCommandResult(line, messages, session, prof, editor)
       if commandResult.recognized:
         if commandResult.disposition == cdModal:

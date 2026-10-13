@@ -16,7 +16,7 @@
 ##   reuses these formatters so a replayed item matches the live rendering.
 ##
 ## The three-tier colour palette (bold cyan for hints, plain cyan for notes,
-## a dim-white for subtle FYI output) is mode-aware: the greyscale palette is
+## a dim-white for subtle FYI output) is mode-aware: the white family is
 ## resolved per `ColorMode` at startup (see `util.applyPalette`), so it reads
 ## on both light and dark backgrounds. SGR `dim` (`\x1b[2m`) is still avoided,
 ## since it drops below readable contrast on light backgrounds and has no
@@ -32,7 +32,7 @@ import terminal as termui
 #   err            = non-bold magenta (never indented)
 #   subtle         = dim white        (FYI: skill markers, tool output)
 # Bold cyan stays on the startup screen and the live token bar only. The
-# greyscale palette (`BrightWhiteFg`, `OffWhiteFg`, `GreyFg`) is resolved per
+# white family (`BrightWhiteFg`, `OffWhiteFg`, `GreyFg`) is resolved per
 # `ColorMode` in `util.applyPalette`.
 
 template hint*(args: varargs[untyped]) =
@@ -121,12 +121,12 @@ proc renderHelpS*(): string =
       if i + 5 <= line.len and line[i ..< i + 5] == "3code":
         result.add BrightWhiteFg & "3code" & ansiResetCode
         i += 5
-      elif line[i] == '/' and i + 1 < line.len and
+      elif line[i] == ':' and i + 1 < line.len and
            line[i + 1] in {'a'..'z', 'A'..'Z', '?', '!'}:
         var j = i + 1
         while j < line.len and line[j] in {'a'..'z', 'A'..'Z', '?', '!'}:
           inc j
-        # `/command` tokens in the greyscale palette: `BrightWhiteFg` so they
+        # `:command` tokens in the white family: `BrightWhiteFg` so they
         # participate in light/dark mode switching (plain white is
         # invisible on a light background).
         result.add BrightWhiteFg & line[i ..< j] & Reset

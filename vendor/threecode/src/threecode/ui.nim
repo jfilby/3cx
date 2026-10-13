@@ -11,17 +11,19 @@
 
 import std/[algorithm, atomics, json, options, os, sequtils, strformat, strutils, tables, terminal, times]
 import types, util, prompts, session, config, api, compact, display, minline,
-  fatprompt, streamexec, sandbox, actions, engine as termengine, auth_xai,
-  auth_anthropic, auth_openai, auth_google, oauth
+  fatprompt, streamexec, sandbox, actions, tabtitle, engine as termengine,
+  auth_xai, auth_anthropic, auth_openai, auth_google, oauth
 
-const CommandNames* = ["/help", "/tokens", "/clear", "/model", "/provider",
-                      "/reasoning", "/streaming", "/notify", "/prompt", "/show",
-                      "/log", "/sessions", "/session", "/summarize", "/version",
-                      "/sandbox", "/sb", "/retry", "/private",
-                      "/q", "/quit", "/exit"]
+const CommandNames* = [":help", ":tokens", ":clear", ":model", ":provider",
+                      ":reasoning", ":streaming", ":notify", ":tab-title", ":prompt",
+                      ":show", ":log", ":sessions", ":session", ":summarize", ":version",
+                      ":sandbox", ":sb", ":retry", ":private",
+                      ":q", ":quit", ":exit"]
 
 type WizardReadLineHook* = proc(prompt: string, hidden,
                                 noHistory: bool): string {.closure.}
+
+type WizardOauthLoginHook* = proc(entry: string): string {.closure.}
 
 type WizardVerifyCancelHook* = proc(jobDone: proc(): bool {.closure.};
                                     cancelJob: proc() {.closure.}): bool {.closure.}
@@ -52,6 +54,7 @@ type
 
 var wizardReadLineHook*: WizardReadLineHook
 var wizardVerifyCancelHook*: WizardVerifyCancelHook
+var wizardOauthLoginHook*: WizardOauthLoginHook
 
 proc handleCommandResult*(cmd: string, messages: var JsonNode,
                           session: var Session, prof: var Profile,
@@ -59,21 +62,21 @@ proc handleCommandResult*(cmd: string, messages: var JsonNode,
 
 proc classifyCommand*(cmd: string): CommandKind =
   let c = cmd.strip
-  if c.len == 0 or c[0] != '/':
+  if c.len == 0 or c[0] != ':':
     return ckUnknown
   let sp = c.find({' ', '\t'})
   let name = if sp < 0: c else: c[0 ..< sp]
   let arg = if sp < 0: "" else: c[sp+1 .. ^1].strip
   let parts = arg.splitWhitespace()
-  if name.startsWith("/!"):
+  if name.startsWith(":!"):
     return ckMutating
   case name
-  of "/help", "/?", "/tokens", "/show", "/log", "/sessions", "/session", "/prompt", "/version":
+  of ":help", ":?", ":tokens", ":show", ":log", ":sessions", ":session", ":prompt", ":version":
     ckSafeImmediate
-  of "/streaming", "/notify", "/retry", "/private":
+  of ":streaming", ":notify", ":retry", ":private", ":tab-title":
     if parts.len == 0 or (parts.len == 1 and parts[0] == "list"): ckSafeImmediate
     else: ckMutating
-  of "/provider":
+  of ":provider":
     if parts.len == 0:
       ckSafeImmediate
     elif parts.len == 1 and parts[0] == "list":
@@ -83,20 +86,20 @@ proc classifyCommand*(cmd: string): CommandKind =
       ckModal
     else:
       ckMutating
-  of "/model":
+  of ":model":
     if parts.len == 0 or (parts.len == 1 and parts[0] == "list"): ckSafeImmediate
     else: ckMutating
-  of "/reasoning":
+  of ":reasoning":
     if parts.len == 0 or (parts.len == 1 and parts[0] == "list"): ckSafeImmediate
     else: ckMutating
-  of "/sandbox", "/sb":
-    # `/sandbox` and `/sandbox show` are safe; the allow/deny/readonly
+  of ":sandbox", ":sb":
+    # `:sandbox` and `:sandbox show` are safe; the allow/deny/readonly
     # verbs append to the sandbox file and reload, so they mutate.
     if parts.len == 0 or (parts.len == 1 and parts[0] == "show"): ckSafeImmediate
     else: ckMutating
-  of "/clear", "/summarize":
+  of ":clear", ":summarize":
     ckMutating
-  of "/quit", "/q", "/exit":
+  of ":quit", ":q", ":exit":
     ckQuit
   else:
     ckUnknown
@@ -154,10 +157,10 @@ proc completionFor*(line: string): seq[string] =
       result.add '@' & p
     return
   if words.len == 1:
-    if last == "" or last.startsWith("/"):
+    if last == "" or last.startsWith(":"):
       return @CommandNames
     return
-  if words[0] == "/provider":
+  if words[0] == ":provider":
     if words.len == 2:
       for pr in activeProviders: result.add pr.name
       return
@@ -177,29 +180,33 @@ proc completionFor*(line: string): seq[string] =
         for m in curatedFor(pr.name):
           if pr.findModel(m) < 0: result.add shortModel(m)
       return
-  if words[0] == "/model" and words.len == 2:
+  if words[0] == ":model" and words.len == 2:
     let prov = currentProvider()
     for m in orderedModels(prov):
       if experimentalEnabled or knownGoodFamily(prov.name, m) != "":
         result.add shortModel(m)
     return
-  if words[0] == "/reasoning" and words.len == 2:
+  if words[0] == ":reasoning" and words.len == 2:
     if not experimentalEnabled:
       for r in ReasoningLevels: result.add r
     return
-  if words[0] == "/streaming" and words.len == 2:
+  if words[0] == ":streaming" and words.len == 2:
     result.add "on"
     result.add "off"
     return
-  if words[0] == "/notify" and words.len == 2:
+  if words[0] == ":notify" and words.len == 2:
     result.add "on"
     result.add "off"
     return
-  if words[0] == "/retry" and words.len == 2:
+  if words[0] == ":tab-title" and words.len == 2:
     result.add "on"
     result.add "off"
     return
-  if words[0] == "/private":
+  if words[0] == ":retry" and words.len == 2:
+    result.add "on"
+    result.add "off"
+    return
+  if words[0] == ":private":
     if words.len == 2:
       for v in ["on", "off", "list", "allow", "deny"]: result.add v
       return
@@ -211,7 +218,7 @@ proc completionFor*(line: string): seq[string] =
         if pr.name == words[2]:
           for m in orderedModels(pr): result.add shortModel(m)
       return
-  if words[0] in ["/sandbox", "/sb"] and words.len == 2:
+  if words[0] in [":sandbox", ":sb"] and words.len == 2:
     result.add "show"
     result.add "allow"
     result.add "readonly"
@@ -463,6 +470,21 @@ proc claudeOauthLogin*(): string =
   runOauthLogin("  sign in with your Claude Pro / Max account",
     auth_anthropic.loginBrowser, auth_anthropic.storeTokens)
 
+proc oauthLoginFor*(name: string): string =
+  ## A subscription twin's browser login by provider name, shared by the
+  ## add and edit wizards. `wizardOauthLoginHook` substitutes the browser
+  ## flow in tests.
+  if wizardOauthLoginHook != nil:
+    return wizardOauthLoginHook(name)
+  case name.toLowerAscii
+  of "supergrok": xaiOauthLogin()
+  of "chatgpt": chatgptOauthLogin()
+  of "geminicli": geminiOauthLogin()
+  of "claudecode": claudeOauthLogin()
+  else:
+    errLn "no browser login for " & name
+    raise newException(minline.InputCancelled, "not a login twin")
+
 proc readFirstProviderField(editor: var minline.LineEditor): string =
   ## First wizard field: catalog name, URL, API key, or a subscription
   ## login (`supergrok`, `chatgpt`, `geminicli`, `claudecode`). Regular
@@ -528,11 +550,7 @@ proc promptNewProvider*(editor: var minline.LineEditor,
     # host. Named `supergrok`/`chatgpt`/`geminicli`/`claudecode` so an
     # API-key `xai`/`openai`/`google`/`anthropic` can sit beside it.
     ensureUniqueName(entryLower)
-    auth =
-      if entryLower == "supergrok": xaiOauthLogin()
-      elif entryLower == "chatgpt": chatgptOauthLogin()
-      elif entryLower == "geminicli": geminiOauthLogin()
-      else: claudeOauthLogin()
+    auth = oauthLoginFor(entryLower)
     key = ""
     name = entryLower
     url =
@@ -846,9 +864,21 @@ proc promptEditProvider*(editor: var minline.LineEditor,
         let newUrl = readOptional(editor,
           &"  url [{existing.url}]  : ").strip(chars = {'/', ' '})
         if newUrl == "": existing.url else: newUrl
-    let newKey = readOptional(editor,
-      "  api key [keep existing] : ", hidden = true)
-    let key = if newKey == "": existing.key else: newKey
+    # Subscription twins (supergrok, chatgpt, claudecode, geminicli)
+    # authenticate with a login token from the auth store, not an api
+    # key: no key field. Renewal is the optional browser re-login here;
+    # a dead grant surfaces "re-login: :provider edit <name>" on use.
+    let key =
+      if existing.auth == "oauth":
+        let relogin = readOptional(editor,
+          "  re-login [enter = keep, y = browser] : ")
+        if relogin.toLowerAscii.startsWith("y"):
+          discard oauthLoginFor(existing.name)
+        existing.key
+      else:
+        let newKey = readOptional(editor,
+          "  api key [keep existing] : ", hidden = true)
+        if newKey == "": existing.key else: newKey
     let models = promptModelsSelection(editor, name, url, key,
                                        existing.models)
     return ProviderRec(name: name, url: url, key: key,
@@ -1287,6 +1317,37 @@ proc cmdNotify(arg: string): string =
   else:
     return errLnS("usage: :notify [on|off]")
 
+proc cmdTabTitleList(): string =
+  let mark = if tabTitleEnabled: "on" else: "off"
+  hintLnS("tab title: " & mark &
+    "  (on = brand + spinner glyph in the terminal tab, off = leave it alone)")
+
+proc cmdTabTitleSelect(target: string): string =
+  case target.toLowerAscii
+  of "on":
+    tabTitleEnabled = true
+    # Commands are idle-only, so the idle title can go up right away;
+    # otherwise the toggle looks dead until the next turn ends.
+    tabtitle.paintTabTitleIdle()
+  of "off":
+    tabTitleEnabled = false
+  else:
+    return errLnS(&"unknown value: {target} (choose on or off)")
+  writeConfigFile(configPath(), activeCurrent, activeProviders)
+  cmdTabTitleList()
+
+proc cmdTabTitle(arg: string): string =
+  let parts = arg.splitWhitespace()
+  case parts.len
+  of 0:
+    return cmdTabTitleList()
+  of 1:
+    if parts[0] == "list":
+      return cmdTabTitleList()
+    return cmdTabTitleSelect(parts[0])
+  else:
+    return errLnS("usage: :tab-title [on|off]")
+
 proc cmdRetryList(): string =
   let mark = if patientRetryEnabled: "on" else: "off"
   hintLnS("patient retry: " & mark &
@@ -1426,9 +1487,9 @@ proc commandTitle(name, arg: string; ok: bool): string =
   if not ok and name notin CommandNames:
     return "command"
   case name
-  of "/?:?":
+  of ":?":
     "help"
-  of "/provider":
+  of ":provider":
     let parts = arg.splitWhitespace()
     if parts.len == 0:
       "providers"
@@ -1437,18 +1498,18 @@ proc commandTitle(name, arg: string; ok: bool): string =
       "provider " & (if parts[0] == "remove": "rm" else: parts[0])
     else:
       "profile"
-  of "/model":
+  of ":model":
     if arg.len == 0: "models" else: "profile"
-  of "/reasoning":
+  of ":reasoning":
     if arg.len == 0: "reasoning" else: "profile"
-  of "/streaming":
+  of ":streaming":
     "streaming"
-  of "/notify":
+  of ":notify":
     "notify"
-  of "/retry":
+  of ":retry":
     "retry"
   else:
-    name.strip(chars = {'/'})
+    name.strip(chars = {':'})
 
 # ---------- Session preamble + user-input prep ----------
 
@@ -1653,7 +1714,7 @@ proc handleCommandResult*(cmd: string, messages: var JsonNode,
   ## helpers; their stdout is captured here so the outer controller can commit
   ## one high-level transcript item.
   let c = cmd.strip
-  if c.len == 0 or c[0] != '/':
+  if c.len == 0 or c[0] != ':':
     return CommandResult(recognized: false)
   let sp = c.find({' ', '\t'})
   let name = if sp < 0: c else: c[0 ..< sp]
@@ -1674,7 +1735,7 @@ proc handleCommandResult*(cmd: string, messages: var JsonNode,
     var wizardBody = ""
     try:
       case name
-      of "/provider":
+      of ":provider":
         wizardBody = cmdProvider(arg, editor, prof)
         session.profileName = prof.name
         # Usage errors (`:provider add <extra>`) never enter the wizard;
@@ -1699,7 +1760,7 @@ proc handleCommandResult*(cmd: string, messages: var JsonNode,
   template respErr(b: string) = body.add cmdErrorS(b)
   block dispatch:
     case name
-    of "/?:!":
+    of ":!":
       # Direct shell command through the model's sandboxed executor;
       # output goes to scrollback only, never to the model. `c[2..^1]`
       # keeps the text after `:!` verbatim (unlike `arg`, which is
@@ -1730,9 +1791,9 @@ proc handleCommandResult*(cmd: string, messages: var JsonNode,
         body.add toolResultBytes(akBash, output, code, session.toolLog.len)
         if code != 0:
           ok = false
-    of "/help", "/?":
+    of ":help", ":?":
       body.add renderHelpS()
-    of "/tokens":
+    of ":tokens":
       if session.usage.totalTokens == 0:
         resp "no tokens used yet"
       else:
@@ -1742,7 +1803,7 @@ proc handleCommandResult*(cmd: string, messages: var JsonNode,
           "  " & tokenSlot("↓", session.usage.completionTokens) &
           "  total " & humanTokens(session.usage.totalTokens)
         resp line
-    of "/clear":
+    of ":clear":
       messages = %* [{"role": "system", "content": buildSystemPrompt(prof)}]
       # Fresh promptState like the akClear path: the next refresh builds
       # anew instead of resume-substituting the old conversation's
@@ -1767,28 +1828,30 @@ proc handleCommandResult*(cmd: string, messages: var JsonNode,
         acquireSessionLock(session.savePath)
         updateActiveDirLockSession(session.savePath)
       resp "════════════════════════════════════════"
-    of "/model":
+    of ":model":
       body.add cmdModel(arg, prof)
       session.profileName = prof.name
-    of "/provider":
+    of ":provider":
       body.add cmdProvider(arg, editor, prof)
       session.profileName = prof.name
-    of "/reasoning":
+    of ":reasoning":
       body.add cmdReasoning(arg, prof)
-    of "/streaming":
+    of ":streaming":
       body.add cmdStreaming(arg)
-    of "/notify":
+    of ":notify":
       body.add cmdNotify(arg)
-    of "/retry":
+    of ":tab-title":
+      body.add cmdTabTitle(arg)
+    of ":retry":
       body.add cmdRetry(arg)
-    of "/private":
+    of ":private":
       body.add cmdPrivate(arg, prof)
-    of "/prompt":
+    of ":prompt":
       resp buildSystemPrompt(prof)
-    of "/version":
+    of ":version":
       resp "3code v" & Version
-    of "/sandbox", "/sb":
-      # `/sandbox show` (or bare) dumps the rules; allow/readonly/deny
+    of ":sandbox", ":sb":
+      # `:sandbox show` (or bare) dumps the rules; allow/readonly/deny
       # append a line and reload. The path arg is written verbatim so
       # relative paths stay portable in the file.
       let verb = if parts.len == 0: "show" else: parts[0]
@@ -1826,16 +1889,16 @@ proc handleCommandResult*(cmd: string, messages: var JsonNode,
             respErr "could not write sandbox file at " & sf
       else:
         ok = false
-        respErr "unknown /sandbox verb: " & verb &
+        respErr "unknown :sandbox verb: " & verb &
           "  (show, on, off, allow, readonly, deny, edit)"
-    of "/show":
+    of ":show":
       body.add showToolS(arg, session.toolLog)
-    of "/log":
+    of ":log":
       body.add listToolsS(session.toolLog)
-    of "/session":
+    of ":session":
       resp sessionIdFromPath(session.savePath)
-    of "/sessions":
-      # Directory-scoped by default, like `-l`; `/sessions all` widens to
+    of ":sessions":
+      # Directory-scoped by default, like `-l`; `:sessions all` widens to
       # every directory and shows each session's cwd, like `-la`.
       let askedAll = arg.strip.toLowerAscii in ["all", "-a", "--all"]
       let paths =
@@ -1846,10 +1909,10 @@ proc handleCommandResult*(cmd: string, messages: var JsonNode,
              else: "no saved sessions for this directory")
       else:
         body.add printSessionListS(paths, session.savePath, askedAll)
-    of "/summarize":
+    of ":summarize":
       if prof.name == "":
         ok = false
-        respErr "no provider configured. use /provider add"
+        respErr "no provider configured. use :provider add"
       else:
         let n = summarizeHistory(messages, prof)
         if n == 0:

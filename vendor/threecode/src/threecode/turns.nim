@@ -11,6 +11,7 @@ when defined(posix):
   import std/posix except Time
 import types, util, prompts, session, compact, config, actions, api,
   display, fatprompt, streamexec, toolstream, transcript
+import tabtitle
 import engine as termengine
 
 const
@@ -22,12 +23,15 @@ const
   FlailStreakJaccard* = 0.5  ## avg pairwise token overlap the ring must reach to flag
   FlailStreakNearDup* = 0.8  ## pairwise Jaccard at which two ring calls count as near-duplicates
   FlailStreakCluster* = 4    ## near-duplicates forming a tight repeat cluster flag on their own
+  FlailStreakStale* = 4      ## consecutive results adding no new output line before the streak can flag
+  FlailSeenLinesMax* = 4096  ## per-run output-line memory cap; past it the epoch restarts empty
 
 type
   FlailVerdict* = enum
-    fvOk        ## not a loop; run the tool
-    fvEscalate  ## loop: inject an escalation message, skip the tool
-    fvAbort     ## still looping after all escalations: abort the turn
+    fvOk        ## not a loop; plain run
+    fvEscalate  ## loop: run the tool anyway, note rides on the result
+    fvAbort     ## still looping after all escalations: run this call,
+                ## then abort the turn
 
   FlailDetector* = object
     ## Detects agentic doom loops cheaply, in the harness, spending zero
@@ -63,8 +67,11 @@ type
     ## forcing a change in the *shape* of the call, so the middle rung of
     ## the ladder demands exactly that before the final warning.
     ##
-    ## Each escalation fires once; a flagged call after the last escalation
-    ## aborts the turn. A genuinely novel call resets the ladder.
+    ## Each escalation fires once per model batch: models that emit many
+    ## tool calls in one response get one nudge per response, never a
+    ## whole ladder inside a single batch. A flagged call in a later batch
+    ## after the last escalation aborts the turn. A genuinely novel call
+    ## resets the ladder.
     window*: seq[string]      ## recent fingerprints, oldest first, <= FlailWindowSize
     escalations*: int
     lastNoProgress*: bool     ## did the previous executed call report no change?
@@ -72,6 +79,9 @@ type
     streakName*: string       ## tool name of the current same-tool run
     streakLen*: int           ## length of the current same-tool run
     streakTokens*: seq[HashSet[string]]  ## ring of per-call distinctive tokens
+    staleStreak*: int         ## consecutive executed streak calls that added no new output line
+    seenLines*: HashSet[string]  ## output lines (normalized) already delivered in this run
+    flaggedInBatch*: bool     ## a loop already fired in this model batch (one rung per batch)
 
 proc canonicalJson(node: JsonNode): string =
   ## Stable serialization with sorted object keys, so key-order variants of
@@ -248,15 +258,57 @@ proc countInWindow(det: FlailDetector, fp: string): int =
   for w in det.window:
     if w == fp: inc result
 
-proc noteResult*(det: var FlailDetector, name, argsStr: string, madeChange: bool) =
+proc normalizeOutLine(line: string): string =
+  ## One output line reduced for the staleness memory: whitespace collapsed,
+  ## digits normalized, so counters, timings, pids and progress lines that
+  ## differ only in numbers compare equal (a doom loop re-running one command
+  ## reads stale even when its output carries fresh numbers).
+  for ch in line.strip():
+    if ch.isDigit: result.add '#'
+    elif ch in Whitespace:
+      if result.len == 0 or result[^1] != ' ': result.add ' '
+    else:
+      result.add ch
+
+proc noteResult*(det: var FlailDetector, name, argsStr: string, madeChange: bool,
+                 output = "") =
   ## Record whether the just-executed call actually changed anything. Called
-  ## after execution with the tool's own verdict (exit code 0 vs failure).
-  ## Read-only tools pass madeChange=true so they never arm the no-progress
-  ## signal. The per-fingerprint record powers the spaced-repeat signal: a
-  ## call that failed before and keeps coming back inside the window is a
-  ## stuck cycle even when other calls interleave.
+  ## after execution with the tool's own verdict (exit code 0 vs failure)
+  ## and its full output. Read-only tools pass madeChange=true so they never
+  ## arm the no-progress signal. The per-fingerprint record powers the
+  ## spaced-repeat signal: a call that failed before and keeps coming
+  ## back inside the window is a stuck cycle even when other calls
+  ## interleave. The output feeds the streak signal's staleness arm:
+  ## consecutive results that add no new line are a run going nowhere.
   det.lastNoProgress = isMutating(name) and not madeChange
-  det.progress[fingerprint(name, argsStr)] = madeChange
+  let fp = fingerprint(name, argsStr)
+  let isRepeat = fp in det.progress  # sampled before recording this sighting
+  det.progress[fp] = madeChange
+
+  # Staleness memory for the streak signal. A NOVEL call is fresh by
+  # definition: it asks a question this run has not asked (a new window,
+  # a new file, a new flag) and whatever comes back - matches, a repeated
+  # line shape from another window, or nothing at all - is new information
+  # about that question. Only a REPEATED call can re-deliver: same
+  # question, same answer (20261007T100839 mistral session, second
+  # incident: a fixed grep walked over successive windows armed the
+  # stale streak through no-match windows (empty output) and windows
+  # whose whole yield was a header shape an earlier window had already
+  # shown; every call probed a new window). A repeat is fresh only when
+  # its output adds a line this run has not delivered before.
+  var fresh = not isRepeat
+  for line in output.splitLines():
+    let n = normalizeOutLine(line)
+    if n.len == 0: continue
+    if n notin det.seenLines:
+      fresh = true
+      det.seenLines.incl n
+  if det.seenLines.len > FlailSeenLinesMax:
+    det.seenLines.clear()
+  if fresh:
+    det.staleStreak = 0
+  else:
+    inc det.staleStreak
 
 proc observeCall*(det: var FlailDetector, name, argsStr: string): FlailVerdict =
   ## Record one tool call and decide what to do with it. Called once per
@@ -288,6 +340,8 @@ proc observeCall*(det: var FlailDetector, name, argsStr: string): FlailVerdict =
     det.streakName = name
     det.streakLen = 0
     det.streakTokens = @[]
+    det.staleStreak = 0
+    det.seenLines.clear()
   inc det.streakLen
   if det.streakLen >= FlailStreakArm:
     if toks.len > 0:
@@ -298,7 +352,14 @@ proc observeCall*(det: var FlailDetector, name, argsStr: string): FlailVerdict =
         det.streakTokens.add toks
         if det.streakTokens.len > FlailStreakMin:
           det.streakTokens.delete 0
+  # The staleness arm: token shape alone cannot tell a scan from a loop,
+  # because a fixed query walked over successive windows of one subject
+  # tokenizes every call identically. Results can: a scan delivers a new
+  # window's lines every call, a loop re-delivers what the model has
+  # already seen. Only a run whose last FlailStreakStale results added no
+  # new output line may flag (20261007T100839 mistral session).
   let stuckStreak = det.streakTokens.len == FlailStreakMin and
+    det.staleStreak >= FlailStreakStale and
     streakRingStuck(det.streakTokens)
 
   # Push onto the bounded window.
@@ -322,27 +383,49 @@ proc observeCall*(det: var FlailDetector, name, argsStr: string): FlailVerdict =
   #    never flagged; progress distinguishes a stuck loop from a poll.
   # 4. Stuck streak: the last FlailStreakMin calls were all to the same
   #    tool and are mostly the same call (ring-wide overlap or a tight
-  #    near-duplicate cluster, see streakRingStuck), and the same-tool run
-  #    is at least FlailStreakArm long. Catches emission-stuck loops whose
-  #    calls are cosmetic variants of each other; the arm gate keeps short
-  #    healthy bursts of same-command-prefix iteration out.
+  #    near-duplicate cluster, see streakRingStuck), the same-tool run
+  #    is at least FlailStreakArm long, and the last FlailStreakStale
+  #    results added no new output line. Catches emission-stuck loops
+  #    whose calls are cosmetic variants of each other; the arm gate
+  #    keeps short healthy bursts of same-command-prefix iteration out,
+  #    and the staleness arm keeps systematic scans out - one fixed query
+  #    walked over successive windows of a file tokenizes every call
+  #    identically but delivers fresh lines each time, which is progress,
+  #    not a loop.
   let knownFailing = not det.progress.getOrDefault(fp, true)
   let isLoop = consecutive or (det.lastNoProgress and seen >= 1) or
     (knownFailing and seen >= FlailSpacedThreshold - 1) or stuckStreak
   if not isLoop:
-    # Genuinely new or harmless: a clearly novel call resets the ladder.
-    if seen == 0:
+    # Genuinely new or harmless: a clearly novel call resets the ladder -
+    # unless a flag already fired in this batch, where the novel call was
+    # emitted before the model could have seen any note and the ladder
+    # must stay frozen until the next batch.
+    if seen == 0 and not det.flaggedInBatch:
       det.escalations = 0
     return fvOk
 
+  if det.flaggedInBatch:
+    # A loop already fired in this model batch: the model emitted several
+    # tool calls in one response (mistral emits up to a dozen) and has not
+    # seen any note yet. The recovery ladder is one rung per response -
+    # three ESCALATEs and an ABORT inside a single batch would sentence the
+    # whole batch before the first nudge could land (20261007T100839
+    # mistral session, second incident: calls #266-277 burned every rung
+    # in one response). Reuse the current rung; the caller resets the flag
+    # when the next batch starts.
+    return fvEscalate
+
   # Flagged as a loop.
+  det.flaggedInBatch = true
   if det.escalations < FlailMaxEscalations:
     inc det.escalations
     return fvEscalate
   fvAbort
 
 proc flailEscalationMessage*(step: int): string =
-  ## The tool-role message injected in place of the repeated tool result.
+  ## The tool-role note prepended to the repeated call's result. The call
+  ## still executes, so the model gets both the warning and the real
+  ## output and can judge its own response.
   ## Three graduated recovery attempts before the abort: step 1 names the
   ## loop and demands a strategy change; step 2 forces the only recovery
   ## known to work on GLM 5.x emission-stuck loops (reply in prose first,
@@ -353,7 +436,7 @@ proc flailEscalationMessage*(step: int): string =
   ## No fake role prefix ("SYSTEM:") on the wire: the tool-result slot is
   ## already where every provider expects harness-authored text, and no API
   ## defines an in-content role label. The same text is what the user sees
-  ## under the magenta `»` marker, so it stays plain imperative prose.
+  ## under the bold `»` marker, so it stays plain imperative prose.
   ##
   ## Steps 1-2 never invite the model to stop and ask the user: these
   ## messages persist in context for the rest of the session, and GLM
@@ -415,6 +498,7 @@ proc onTurnInterrupted*() =
   stopTurnInputForFinalRender()
   stopSpinner(clearLiveFooter = false)
   discard stopBarTick()
+  tabtitle.settleTabTitle(false)
   commitTurnEndNotice(errLnS(InterruptedByUserMsg))
   emitTestFrameEvent()
   clearInterrupted()
@@ -680,6 +764,7 @@ proc runTurns*(p: Profile, messages: var JsonNode, session: var Session): bool =
     maxTokensOverride = 0          # > 0 replaces known-good max_tokens
     lengthEscalations = 0          # "length" retries so far this turn
     steerAttempts = 0              # "stop"/unknown steering retries
+    loopSteers = 0                 # reasoning-loop cut re-prompts this turn
     emptyRetries = 0               # bare empty-reply resends after smart-handling
     flailDet: FlailDetector        # identical-consecutive-tool-call guard
     nextCheckpoint = 0             # id of the marker on the next assistant message
@@ -698,8 +783,12 @@ proc runTurns*(p: Profile, messages: var JsonNode, session: var Session): bool =
     MaxLengthEscalations = 3
     MaxSteerAttempts = 1
     MaxEmptyRetries = 12
+    MaxLoopSteers = 2
     EmptyReplySteerMsg = "Your last reply came back empty. Answer now, " &
                         "or continue with a tool call."
+    ReasoningLoopSteerMsg = "Your last reply was cut because your reasoning " &
+                        "kept repeating itself. Answer now, or continue with " &
+                        "a tool call."
   decayEmptyRetryLevel(epochTime())
   # Publish the conversation id for the OpenCode Zen/Go session header
   # (stable across turns → routing/token-cache affinity). Recomputed every
@@ -765,7 +854,7 @@ proc runTurns*(p: Profile, messages: var JsonNode, session: var Session): bool =
       # rewriting the prompt.
       saveSession(session, messages)
       commitTurnEndNotice(errLnS(e.msg))
-      endTurnAfterTranscriptAppend()
+      endTurnAfterTranscriptAppend(failed = true)
       turnEnded = true
       return false
     session.usage.promptTokens += usage.promptTokens
@@ -796,12 +885,46 @@ proc runTurns*(p: Profile, messages: var JsonNode, session: var Session): bool =
     # the empty-reply recovery, not commit as a one-character reply.
     let replyIsEmpty = cutVisibleContent(content).strip.len == 0
     if replyIsEmpty and toolCalls.len == 0:
-      # Empty assistant turn. Try the targeted recoveries first (escalate the
-      # budget on "length", steer on "stop"/unknown), then fall back to a
-      # bare resend. A hostile or broken provider can't pin the turn: each
-      # path has its own ceiling, and the final resend loop is bounded by
-      # MaxEmptyRetries. This is a conversational concern, kept out of
-      # callModel's transport retry block.
+      # Empty assistant turn. Try the targeted recoveries first (reasoning
+      # loop steer, escalate the budget on "length", steer on
+      # "stop"/unknown), then fall back to a bare resend. A hostile or
+      # broken provider can't pin the turn: each path has its own ceiling,
+      # and the final resend loop is bounded by MaxEmptyRetries. This is a
+      # conversational concern, kept out of callModel's transport retry
+      # block.
+      if finishReason == ReasoningLoopFinish and loopSteers < MaxLoopSteers:
+        # The stream guard cut the model out of a thinking repetition loop
+        # (see api.nim). Budget escalation is the wrong medicine - the
+        # model is stuck, not starved - and a bare resend would just re-cut,
+        # so steer with a note that names the failure, then give up cleanly
+        # once the steers are spent (below).
+        inc loopSteers
+        messages.add msg
+        messages.add %*{"role": "user", "content": ReasoningLoopSteerMsg,
+                        "agentSent": true}
+        saveSession(session, messages)
+        commitTranscriptBytes(
+          formatItem(agentPromptItem(ReasoningLoopSteerMsg)), true)
+        incEmptyRetryLevel()
+        if emptyReplyWait():
+          saveSession(session, messages)
+          onTurnInterrupted()
+          turnEnded = true
+          return true
+        debugOut &"runTurns: reasoning-loop steer-retry {loopSteers}/{MaxLoopSteers}"
+        continue
+      if finishReason == ReasoningLoopFinish:
+        # Still looping after MaxLoopSteers re-prompts: the model cannot
+        # leave the loop on its own. Commit the empty turn and end with a
+        # notice instead of feeding the bare-resend loop a cut every time.
+        messages.add msg
+        saveSession(session, messages)
+        commitTurnEndNotice(
+          errLnS("reasoning loop - giving up after " & $MaxLoopSteers &
+            " re-prompts"))
+        endTurnAfterTranscriptAppend(failed = true)
+        turnEnded = true
+        break
       let budgetStarved =
         finishReason == "length" or
         usage.completionTokens >= knownGoodGeneration(wire).maxTokens or
@@ -811,18 +934,25 @@ proc runTurns*(p: Profile, messages: var JsonNode, session: var Session): bool =
         # A forced-thinking model that spent the whole budget on reasoning
         # and returned nothing will usually do it again at 2x the budget:
         # the thinking scales with effort, not with headroom. Demote the
-        # effort first (high -> low; verified against Z.ai: effort high
-        # starves 400-token budgets that effort low finishes in 1k) and
-        # only raise the budget once effort is already at the floor or
-        # the family has no graded knob. Budget bumps are also clamped
-        # by the model's real output cap (131k on GLM-5.3), so a starved
-        # turn at the cap would otherwise just re-derive the same
-        # override and burn identical retries.
+        # effort first (one rung down the model's own ladder; verified
+        # against Z.ai: effort high starves 400-token budgets that effort
+        # low finishes in 1k) and only raise the budget once effort is
+        # already at the floor or the family has no graded knob. The
+        # ladder must be the model's own supported set, stepped down one
+        # entry at a time: a hardcoded high -> low sent Mistral (none/high
+        # only) a value its API rejects with 400, turning the recovery
+        # into a dead turn. Budget bumps are also clamped by the model's
+        # real output cap (131k on GLM-5.3), so a starved turn at the cap
+        # would otherwise just re-derive the same override and burn
+        # identical retries.
         var demoted = false
-        if wire.reasoning == "max":
-          wire.reasoning = "high"; demoted = true
-        elif wire.reasoning == "high":
-          wire.reasoning = "low"; demoted = true
+        block demote:
+          let ladder = defaultReasoningsFor(providerOf(wire), wire.model,
+            wire.family)
+          let idx = ladder.find(wire.reasoning)
+          if idx <= 0: break demote
+          wire.reasoning = ladder[idx - 1]
+          demoted = true
         if not demoted:
           let cur =
             if maxTokensOverride > 0: maxTokensOverride
@@ -853,11 +983,8 @@ proc runTurns*(p: Profile, messages: var JsonNode, session: var Session): bool =
         messages.add %*{"role": "user", "content": EmptyReplySteerMsg,
                         "agentSent": true}
         saveSession(session, messages)
-        let backoff = emptyReplyBackoffS()
         commitTranscriptBytes(
-          formatItem(agentPromptItem(EmptyReplySteerMsg,
-            "auto: empty reply, re-prompting for a final answer in " &
-            $backoff & "s")), true)
+          formatItem(agentPromptItem(EmptyReplySteerMsg)), true)
         incEmptyRetryLevel()
         if emptyReplyWait():
           saveSession(session, messages)
@@ -894,7 +1021,7 @@ proc runTurns*(p: Profile, messages: var JsonNode, session: var Session): bool =
       commitTurnEndNotice(
         errLnS("empty reply - giving up after " & $MaxEmptyRetries &
           " retries"))
-      endTurnAfterTranscriptAppend()
+      endTurnAfterTranscriptAppend(failed = true)
       turnEnded = true
       break
     if dmailEnabled:
@@ -913,6 +1040,19 @@ proc runTurns*(p: Profile, messages: var JsonNode, session: var Session): bool =
         lastRequestBodyBytes >= SummarizeByteGuardBytes:
       action = caSummarize
       byteGuard = true
+    # Tesseracted message-count guard: the gateway (hosted Kolibri-1)
+    # rejects a request with more than 80 `messages` entries with an
+    # opaque 400, far under the token window, so like the byte guard
+    # this fires the same collapse on the axis the route actually
+    # validates. Self-hosted kolibri carries no such cap and stays
+    # unguarded. See MaxMessagesTesseracted for the cap and headroom.
+    var msgGuard = false
+    var msgGuardCount = 0
+    if action == caNone and providerOf(p) == "tesseracted" and
+        messages.len >= MaxMessagesTesseracted:
+      action = caSummarize
+      msgGuard = true
+      msgGuardCount = messages.len
     case action
     of caSummarize:
       let summarized = summarizeHistory(messages, p)
@@ -922,6 +1062,8 @@ proc runTurns*(p: Profile, messages: var JsonNode, session: var Session): bool =
             (if summarized == 1: "" else: "s") &
             (if byteGuard:
                &" (request body {humanBytes(lastRequestBodyBytes)}; gateway byte guard)"
+             elif msgGuard:
+               &" ({msgGuardCount} messages; tesseracted message-count guard)"
              else:
                &" (context at {humanTokens(usage.promptTokens)}/{humanTokens(window)} tokens)")), true)
         saveSession(session, messages)
@@ -975,6 +1117,10 @@ proc runTurns*(p: Profile, messages: var JsonNode, session: var Session): bool =
       var dmailRevert = false  # akDMail: history truncated, continue loop
       var flailAbort = false  # flail detector fired past all escalations
       var flailAbortNote = ""  # the abort note sent to the model
+      # One escalation rung per model response: the model cannot have
+      # reacted to a note it has not seen yet, so flags later in this same
+      # batch reuse the current rung instead of advancing the ladder.
+      flailDet.flaggedInBatch = false
       for i in 0 ..< toolCalls.len:
         let tc = toolCalls[i]
         let id = tc{"id"}.getStr
@@ -989,49 +1135,31 @@ proc runTurns*(p: Profile, messages: var JsonNode, session: var Session): bool =
         let name = if fn != nil and fn.kind == JObject: fn{"name"}.getStr else: ""
         let argsStr =
           if fn != nil and fn.kind == JObject: fn{"arguments"}.getStr("") else: ""
+        # Loop verdicts never skip execution: the result is real data for
+        # the model to judge, and the scrollback shows exactly what was
+        # tried. The note rides on top of the tool result content, shows
+        # as a `»` agent-prompt item, and `flailNote` on the tool message
+        # lets the resumed replay render both the tool banner and the
+        # note instead of burying the note in the output.
+        var flailNote = ""
         case flailDet.observeCall(name, argsStr)
         of fvOk: discard
         of fvEscalate:
-          # The model re-emitted the exact same call it just made. Skip
-          # execution, pair the tool_call with the escalation notice (so
-          # the request/response pairing stays intact), and show the exact
-          # note sent to the model as a `»` agent-prompt item. `agentSent`
-          # on the tool message makes the resumed replay render the same
-          # item instead of a tool banner.
-          let note = flailEscalationMessage(flailDet.escalations)
-          debugOut &"flail: identical repeat of {name}, escalation {flailDet.escalations}/{FlailMaxEscalations}"
-          session.toolLog.add ToolRecord(
-            banner: "! " & name & " (flailing)",
-            output: note, code: -1, kind: akError)
-          messages.add %*{"role": "tool", "tool_call_id": id,
-                          "content": note, "agentSent": true}
-          commitTranscriptBytes(
-            formatItem(agentPromptItem(note,
-              "auto: skipped a repeated tool call")), true)
-          continue
+          flailNote = flailEscalationMessage(flailDet.escalations)
+          debugOut &"flail: repeat of {name}, escalation " &
+            "{flailDet.escalations}/{FlailMaxEscalations}; executing anyway"
         of fvAbort:
-          # Still looping after all recovery attempts. Pair the tool_call,
-          # then stop the turn and hand control back to the user with a
-          # visible warning.
-          debugOut &"flail: repeat of {name} after {FlailMaxEscalations} escalations; aborting turn"
-          let note =
+          # Still looping after all recovery attempts. This call executes
+          # too; once its result is paired the turn stops and control
+          # returns to the user. The abort note's live rendering is the
+          # turn-end notice, not a per-call `»` item.
+          debugOut &"flail: repeat of {name} after " &
+            "{FlailMaxEscalations} escalations; aborting turn"
+          flailAbortNote =
             "Turn aborted: the same tool call was repeated after three " &
             "warnings; you did not change course."
-          flailAbortNote = note
-          session.toolLog.add ToolRecord(
-            banner: "! " & name & " (flail abort)",
-            output: note, code: -1, kind: akError)
-          messages.add %*{"role": "tool", "tool_call_id": id,
-                          "content": note, "agentSent": true}
-          # Pair any remaining tool_calls in this batch too: the
-          # assistant message carries them all and an unpaired id breaks
-          # strict providers on the next request.
-          for j in i + 1 ..< toolCalls.len:
-            messages.add %*{"role": "tool",
-              "tool_call_id": toolCalls[j]{"id"}.getStr,
-              "content": note, "agentSent": true}
+          flailNote = flailAbortNote
           flailAbort = true
-          break
         let (args, argsMalformed, parseErr) =
           block:
             var a: JsonNode
@@ -1095,7 +1223,7 @@ proc runTurns*(p: Profile, messages: var JsonNode, session: var Session): bool =
         # counts heaviest. Successful calls never arm the signal, so
         # legitimate polling is untouched. Uses the tool's own exit
         # verdict, so it costs nothing extra at runtime.
-        flailDet.noteResult(name, argsStr, madeChange = code == 0)
+        flailDet.noteResult(name, argsStr, madeChange = code == 0, output = r)
 
         session.toolLog.add ToolRecord(banner: bannerFor(act), output: r,
           code: code, kind: act.kind, plan: act.plan)
@@ -1111,7 +1239,22 @@ proc runTurns*(p: Profile, messages: var JsonNode, session: var Session): bool =
         if isReceiptCap:
           deferredReceipt = ""
           emitFatPromptEvent clearPendingHintEvent()
-        messages.add %*{"role": "tool", "tool_call_id": id, "content": r}
+        if flailNote.len > 0 and not flailAbort:
+          commitTranscriptBytes(formatItem(agentPromptItem(flailNote)), true)
+        var toolMsg = %*{"role": "tool", "tool_call_id": id, "content": r}
+        if flailNote.len > 0:
+          toolMsg["content"] = %(flailNote & "\n\n" & r)
+          toolMsg["flailNote"] = %flailNote
+        messages.add toolMsg
+        if flailAbort:
+          # Pair any remaining tool_calls in this batch too: the
+          # assistant message carries them all and an unpaired id breaks
+          # strict providers on the next request.
+          for j in i + 1 ..< toolCalls.len:
+            messages.add %*{"role": "tool",
+              "tool_call_id": toolCalls[j]{"id"}.getStr,
+              "content": flailAbortNote, "agentSent": true}
+          break
         if hasQueuedAutosend():
           # Let the current assistant tool batch finish so the tool-call
           # pairing stays faithful to what the model requested, then return
@@ -1200,10 +1343,8 @@ proc runTurns*(p: Profile, messages: var JsonNode, session: var Session): bool =
         continue
       if flailAbort:
         saveSession(session, messages)
-        commitTurnEndNotice(
-          formatItem(agentPromptItem(flailAbortNote,
-            "auto: turn aborted - rephrase, give a hint, or take over")))
-        endTurnAfterTranscriptAppend()
+        commitTurnEndNotice(formatItem(agentPromptItem(flailAbortNote)))
+        endTurnAfterTranscriptAppend(failed = true)
         turnEnded = true
         return false
       saveSession(session, messages)

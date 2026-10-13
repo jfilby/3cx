@@ -9,7 +9,7 @@
 ## ```nim
 ## let s = initAgentSession(AgentOptions(model: "deepinfra.deepseek-v3.2"))
 ## let reply = s.prompt("what does this project do?")     # blocking
-## echo s.command("/tokens")                              # slash commands
+## echo s.command(":tokens")                              # colon commands
 ## s.close()
 ## ```
 ##
@@ -314,10 +314,10 @@ proc promptAsync*(s: AgentSession; text: string): Thread[TurnJob] =
   createThread(result, promptThread, TurnJob(s: s, text: text))
 
 proc command*(s: AgentSession; cmd: string): string =
-  ## Run a slash command (`/tokens`, `/model ...`, `/sandbox show`, ...)
+  ## Run a colon command (`:tokens`, `:model ...`, `:sandbox show`, ...)
   ## exactly as the REPL would and return its plain-text body. Modal
-  ## commands that need an interactive terminal (`/provider add/edit`)
-  ## return an error string. `/quit` raises `AgentError` — quitting is
+  ## commands that need an interactive terminal (`:provider add/edit`)
+  ## return an error string. `:quit` raises `AgentError` — quitting is
   ## the embedder's `close`.
   case classifyCommand(cmd)
   of ckModal:
@@ -327,7 +327,7 @@ proc command*(s: AgentSession; cmd: string): string =
   else: discard
   let res = handleCommandResult(cmd, s.messages, s.state, s.profile, s.editor)
   if not res.recognized:
-    return "unknown command: " & cmd.strip & "  (try /help)"
+    return "unknown command: " & cmd.strip & "  (try :help)"
   normalizeItem(res.body)
 
 proc interrupt*(s: AgentSession) =

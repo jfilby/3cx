@@ -27,6 +27,11 @@ var notifyEnabled*: bool = true
   ## When true, a native desktop notification fires when a turn ends.
   ## Default on. Toggled at runtime via `:notify on/off`, persisted in
   ## `[settings]`; an explicit `off` opts out.
+var tabTitleEnabled*: bool = true
+  ## When true, the terminal tab title carries the `3` brand plus a live
+  ## spinner glyph while a turn runs (OSC 0). Default on. Toggled at
+  ## runtime via `:tab-title on/off`, persisted in `[settings]`; an
+  ## explicit `off` opts out.
 var sandboxEnabled*: bool = true
   ## When true, every tool call is confined to the filesystem sandbox
   ## (the single active policy: repo `.sandbox`, else
@@ -239,7 +244,7 @@ type
   InputEventKind* = enum
     ieNone
     ieLine       ## user submitted a prompt line (idle or buffered during turn)
-    ieCommand    ## user submitted a slash /command during turn
+    ieCommand    ## user submitted a colon :command during turn
     ieInterrupt  ## ESC / Ctrl-C pressed during turn
     ieQuit       ## Ctrl-D on empty line; exit the REPL
 
@@ -306,6 +311,17 @@ proc responsesApi*(p: Profile): bool =
   ## anthropic may join the same dispatch later.
   let prov = providerOf(p)
   prov == "openai" or prov == "chatgpt"
+
+func proModeWire*(model: string): string =
+  ## Base model when `model` is a GPT-5.6/6 `-pro` selection, "" when
+  ## it is not. Those pro tiers are `reasoning.mode` on first-party
+  ## /responses, not model ids; the pre-5.6 Pro ids (`gpt-5.5-pro` and
+  ## older) are real models and pass through untouched. Lives in types
+  ## (not api) for the same reason as `responsesApi`: api and compact
+  ## both translate model ids on the wire without an import cycle.
+  if model.endsWith("-pro") and
+      (model.startsWith("gpt-5.6") or model.startsWith("gpt-6")):
+    result = model[0 .. ^5]
 
 proc isInterruptedMsg*(msg: string): bool =
   ## Matches the bare `InterruptedByUserMsg` and variants that append

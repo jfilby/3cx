@@ -30,4 +30,4 @@ switch("d", "ssl")
 # "3code vdevel" and the banner shows the same. Keep it in step with
 # threeCodeVersion in src/threecodex/version.nim and the pinned commit in
 # vendor/threecode/VENDOR.md.
-switch("d", "version=0.8.2")
+switch("d", "version=0.8.3")

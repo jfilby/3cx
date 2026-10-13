@@ -18,8 +18,8 @@ const
   appName* = "3cx"
   appVersion* = "0.1.0"
 
-  threeCodeVersion* = "0.8.2"
-  threeCodeCommit* = "ffa46cf"
+  threeCodeVersion* = "0.8.3"
+  threeCodeCommit* = "e04cba8"
 
 const illwillVer* =
   block:

@@ -338,7 +338,7 @@ const
                   "sandbox_wall_warn", "max_timeout", "max-timeout",
                   "browserfetch",
                   "tone", "mode", "bash_path", "bash-path",
-                  "bash", "auto_update"]
+                  "bash", "auto-update", "tab-title"]
   SearchKeys = ["exa-key", "brave-key", "key", "engine"]
   ColorKeys = ["bright-white", "off-white", "dim-white", "token-bar",
                "private-bar"]
@@ -401,7 +401,7 @@ proc validateConfig*(path: string; entries: seq[RawEntry]): string =
     of "settings":
       if ent.key in ["notify", "streaming", "sandbox", "sandbox_enabled",
                       "patient_retry", "patient-retry",
-          "sandbox_wall_warn"] and
+          "sandbox_wall_warn", "auto-update", "tab-title"] and
           ent.value.strip.toLowerAscii notin BoolValues:
         return &"{path}:{ent.line}: bad value '{ent.value}' for '{ent.key}' " &
                "(expected on/off/true/false/yes/no/1/0)"
@@ -507,7 +507,8 @@ proc parseConfigFile*(path: string): (string, seq[ProviderRec], Table[string, st
       # meaningful for a subscription login, so re-mark the known
       # subscription twins here instead of asking the user to re-add.
       if prov.auth == "" and prov.key == "" and
-         prov.name.toLowerAscii in ["supergrok", "chatgpt", "claudecode"]:
+         prov.name.toLowerAscii in
+           ["supergrok", "chatgpt", "claudecode", "geminicli"]:
         prov.auth = "oauth"
       providers.add prov
       prov = ProviderRec()
@@ -535,6 +536,13 @@ proc parseConfigFile*(path: string): (string, seq[ProviderRec], Table[string, st
           case v.toLowerAscii
           of "on", "true", "yes", "1": notifyEnabled = true
           of "off", "false", "no", "0": notifyEnabled = false
+          else: discard
+        of "tab-title":
+          # Same boolean dialect as `notify`. Default on; an explicit `off`
+          # keeps 3code off the terminal tab title entirely.
+          case v.toLowerAscii
+          of "on", "true", "yes", "1": tabTitleEnabled = true
+          of "off", "false", "no", "0": tabTitleEnabled = false
           else: discard
         of "streaming":
           # Same boolean dialect as `notify`. Default is on (set in types.nim);
@@ -711,10 +719,10 @@ proc mergeForeignEdits(path: string; current: var string,
   # right before the buffer serializes it.
   let (savedNotify, savedStreaming, savedSandbox, savedPatient,
        savedWallWarn, savedMaxTimeout, savedColorMode, savedBash,
-       savedBashSrc) =
+       savedBashSrc, savedTabTitle) =
     (notifyEnabled, streamingEnabled, sandboxEnabled, patientRetryEnabled,
      sandboxWallWarn, maxTimeoutSetting, colorModePref, bashPathOverride,
-     bashSourcePref)
+     bashSourcePref, tabTitleEnabled)
   let savedParams = activeParams
   let (diskCurrent, diskProviders, _, _, _, _) =
     try: parseConfigFile(path)
@@ -732,6 +740,7 @@ proc mergeForeignEdits(path: string; current: var string,
   colorModePref = savedColorMode
   bashPathOverride = savedBash
   bashSourcePref = savedBashSrc
+  tabTitleEnabled = savedTabTitle
   activeParams = savedParams
   # Same baseline-diff for the `current` line: an instance that never
   # switched in-session still holds the startup value, so a different
@@ -820,6 +829,8 @@ proc writeConfigFile*(path: string, current: string,
     buf.add "streaming = \"off\"\n"
   if not notifyEnabled:
     buf.add "notify = \"off\"\n"
+  if not tabTitleEnabled:
+    buf.add "tab-title = \"off\"\n"
   if not sandboxEnabled:
     buf.add "sandbox = \"off\"\n"
   if not patientRetryEnabled:
@@ -978,11 +989,16 @@ proc resolveFamily*(prov: ProviderRec, prof: Profile): string =
   ## Family is resolved at profile-build time:
   ## 1. KnownGoodCombos hardcode (always wins; ignores config and -x)
   ## 2. provider-level `family = ...` — only honored under --experimental
-  ## 3. default → "glm"
+  ## 3. google/geminicli default → "gemini": every model they serve is
+  ##    Gemini, so a not-yet-curated id (a brand-new launch before it gets
+  ##    a KnownGoodCombos row) rides the right preamble and wire knobs
+  ##    under --experimental instead of the glm default
+  ## 4. default → "glm"
   let kg = knownGoodFamily(prof)
   if kg != "": return kg
   if experimentalEnabled and prov.family.strip != "":
     return prov.family.strip.toLowerAscii
+  if canonicalKnownGoodProvider(prov.name) == "google": return "gemini"
   "glm"
 
 func paramsModelMatches*(spec, model: string): bool =

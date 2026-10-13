@@ -33,7 +33,8 @@ proc contextWindowFor*(model: string): int =
   elif "glm-5.2" in m or "glm-5.3" in m: 1_000_000
   elif "omen-alpha" in m: 500_000
   elif "glm" in m: 200_000
-  elif "mistral" in m or "mixtral" in m: 128_000
+  elif "mistral-large-4" in m: 524_288
+  elif "mistral" in m or "mixtral" in m: 262_144
   elif "minimax-m3" in m: 1_000_000
   elif "space-bunny" in m: 1_000_000
   elif "minimax" in m: 204_800
@@ -72,6 +73,24 @@ const
     ## route would still accept the request. Other providers are not
     ## guarded: several accept multi-MB bodies and would get pointless
     ## lossy summarization.
+  MaxMessagesTesseracted* = 72
+    ## Proactive message-count ceiling for the tesseracted gateway
+    ## (hosted Kolibri-1). Tesseracted caps the conversation history at
+    ## 80 messages — a gateway envelope, not model or vLLM behavior: the
+    ## aleph-alpha-inference plugin carries no request validation, and
+    ## self-hosted vLLM serves unbounded message counts — and rejects a
+    ## longer `messages` array with an opaque 400, "Provide between 1 and
+    ## 80 messages" (observed 2026-10-08 on a session killed at 82
+    ## messages while the token count sat at 12% of the window, so the
+    ## token threshold cannot predict it; message count and token count
+    ## are different axes). The catalog (llmtr.com) also lists 60k-char
+    ## and 32k-token history caps, but the same session pushed ~150KB /
+    ## 38k-token requests through, so only the count axis is guarded. The
+    ## guard sits 8 under the cap: it fires after a reply is appended,
+    ## and the tool results of that reply land after the check, so one
+    ## parallel batch can still push the next request past 80 — the
+    ## reactive one-shot 400 recovery catches that burst; everything else
+    ## collapses before the route can 400 it.
   OverflowFallbackSummary* = "Earlier turns were dropped without a recap " &
     "because the provider rejected the conversation as too large and the " &
     "summarizer call failed as well; the recent messages below are " &
@@ -184,12 +203,19 @@ proc callSummarizer(p: Profile, messages: JsonNode): string =
   clipSummarizerPayload(payload)
   var body: JsonNode
   var endpoint: string
+  # Same pro-slug translation as the main turn path (api.nim): the
+  # first-party /responses endpoint has no gpt-5.6/6 `-pro` model ids.
+  # The chatgpt twin keeps its slug (the Codex backend serves it
+  # natively); compact posts to p.url directly either way.
+  let proBase = if providerOf(p) == "openai" and '/' notin p.model:
+                  proModeWire(p.model)
+                else: ""
   if useResponses:
     # Responses API (first-party openai): same role/content messages in
     # `input` (system is accepted), `max_output_tokens` budget, summary
     # text extracted from output[] below.
     body = %*{
-      "model": p.model,
+      "model": (if proBase != "": proBase else: p.model),
       "input": payload,
       "max_output_tokens": SummarizeMaxTokens,
       "stream": false
