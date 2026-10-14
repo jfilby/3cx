@@ -256,7 +256,12 @@ proc applyExactPalette*(t: Theme) =
   let (fgRgb, bgRgb) =
     if t.bg == bgWhite: ("rgb:0000/0000/0000", "rgb:ffff/ffff/ffff")
     else:               ("rgb:ffff/ffff/ffff", "rgb:0000/0000/0000")
-  stdout.write(oscSetColor0, oscSetColor4, oscSetColor7)
+  let slot4Rgb =
+    if t.bg == bgWhite: "1c3f/1c3f/7a7a"
+    else: "2a2a/2a2a/2a2a"
+  stdout.write(oscSetColor0)
+  stdout.write("\x1b]4;4;rgb:" & slot4Rgb & "\x07")
+  stdout.write(oscSetColor7)
   stdout.write("\x1b]10;" & fgRgb & "\x07")
   stdout.write("\x1b]11;" & bgRgb & "\x07")
   stdout.flushFile()
