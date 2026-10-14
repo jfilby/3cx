@@ -140,7 +140,7 @@ own.
 ## Themes
 
 `/themes` lists the themes and marks the one in force; `/themes <name>` switches
-to it and remembers the choice. Light is the default, dark is the other one.
+to it and remembers the choice. Dark is the default, light is the other one.
 
 ```
 ❯ /themes

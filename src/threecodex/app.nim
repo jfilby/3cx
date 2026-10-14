@@ -352,8 +352,8 @@ proc render*(tb: var TerminalBuffer, app: App) =
   let start = app.visibleStart(lay.msgHeight)
 
   # Header.
-  let title = " 3cx  " &
-              (if app.backend.name.len > 0: app.backend.name else: "no backend")
+  let title = "  3cx" &
+              (if app.backend.name.len > 0: "   " & app.backend.name else: "   no backend")
   drawBar(tb, 0, title, colBarBg, colBarFg)
   tb.setForegroundColor(colRule)
   tb.drawHorizLine(0, w - 1, 1)
@@ -393,10 +393,20 @@ proc render*(tb: var TerminalBuffer, app: App) =
       if idx == app.input.line:
         line = cursorLine(app.input.lines[idx], app.input.col)
       else:
-        line.addSpan Span(text: app.input.lines[idx], fg: colText)
+        line.addSpan Span(text: app.input.lines[idx], fg: colBarFg)
+      # The input surface is the bar colour, so typed text uses the bar
+      # foreground rather than the canvas one: in the light theme colText is
+      # black and would disappear on the black bar.
       for s in line.spans.mitems:
+        if s.fg == colText:
+          s.fg = colBarFg
         if s.bg == bgNone:
           s.bg = colBarBg
+      if idx == 0 and firstVisible == 0:
+        tb.setForegroundColor(colPrompt)
+        tb.setBackgroundColor(colBarBg)
+        tb.setStyle({styleBright})
+        tb.write(0, lay.inputTop + row, "❯")
       tb.drawLine(lay.inputTop + row, sideMargin, line, bodyWidth)
 
   # Status bar: left shows the busy indicator or the current directory; the
@@ -407,14 +417,16 @@ proc render*(tb: var TerminalBuffer, app: App) =
   let dir = getCurrentDir().replace(home, "~")
   let ctx = app.backend.contextUsageLine()
   let copying = app.copyMsg.len > 0 and epochTime() < app.copyMsgUntil
+  let spinIdx = int(epochTime() * 8) mod spinnerFrames.len
   let left = if copying:
                " " & app.copyMsg
              elif app.streaming:
-               " \u25cc\u25cc\u25cc\u25cc\u25cc\u25cc\u25cc\u25cc\u25cc\u25cc  esc interrupt"
+               " " & spinnerFrames[spinIdx] & "  working...   esc interrupt"
              else:
                " " & dir
-  let right = if ctx.len > 0: ctx & "  ctrl+p commands "
-              else: "ctrl+p commands "
+  let right = if ctx.len > 0: ctx & "   ctrl+p commands "
+             else: "ctrl+p commands   ctrl+d quit "
+
   let (statusFg, statusStyle) =
     if copying: (colOk, {})
     elif app.streaming: (colText, {})

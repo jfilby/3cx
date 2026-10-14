@@ -881,8 +881,8 @@ suite "themes":
     render(tb, app)     # not UFCS: the buffer comes first
     result = tb
 
-  test "light is the default, and both themes are listed":
-    check defaultTheme.name == "light"
+  test "dark is the default, and both themes are listed":
+    check defaultTheme.name == "dark"
     check themeNames() == @["light", "dark"]
     check themes.len == themeNames().len
 

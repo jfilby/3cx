@@ -127,7 +127,7 @@ const
     barFg: fgWhite)
 
   themes* = [lightTheme, darkTheme] ## Every theme `/themes` can pick, in order.
-  defaultTheme* = lightTheme         ## Used when nothing has chosen a theme.
+  defaultTheme* = darkTheme          ## Used when nothing has chosen a theme.
 
 var currentTheme* = defaultTheme
   ## The theme in effect. Replaced by `/themes`; read through the `col*`
@@ -192,7 +192,7 @@ proc applyTheme*(name: string) =
   ## Adopt the theme saved in the preferences, if there is a usable one.
   ##
   ## An absent or unrecognised name is not an error - it just means the default.
-  discard useTheme(name)
+  currentTheme = themeByName(name)
 
 proc themeHelp*(): string =
   ## Text for a bare `/themes`: every theme, and which one is live.
