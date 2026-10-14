@@ -796,6 +796,28 @@ proc handleEvent*(app: App, ev: InputEvent, lay: Layout, start: int) =
   if app.scroll > maxScroll:
     app.scroll = maxScroll
 
+proc overlapsAssistant(app: App, plain, streamed: string): bool =
+  ## True when `plain` is a committed echo of the in-flight or a past assistant
+  ## reply (possibly reworded or carrying a bullet). Such commits come through
+  ## 3code's headless transcript hook as `ckTool` lines and are not extra
+  ## information, so they must not become their own tool messages.
+  if plain.len < 12:
+    return false
+  var tailLen = min(24, plain.len)
+  var candidates: seq[string]
+  if streamed.len >= 12:
+    candidates.add streamed
+  for m in app.chat.messages:
+    if m.role == rAssistant and m.content.len >= 12:
+      candidates.add m.content
+  for c in candidates:
+    let n = min(tailLen, c.len)
+    if n >= 12 and c[^n .. ^1] == plain[^n .. ^1]:
+      return true
+    if plain in c or c in plain:
+      return true
+  false
+
 proc applyChunk*(app: App, chunk: Chunk) =
   ## Fold one backend event into the chat.
   ##
@@ -826,16 +848,12 @@ proc applyChunk*(app: App, chunk: Chunk) =
     discard
 
   of ckTool, ckNotice:
-    # 3code's `aevTool` is its committed-transcript-line hook, not a tool-specific
-    # event: once per paint, the assistant's *partial* reply is emitted too, each
-    # one a word or two longer than the last. Treating each as a tool result
-    # paints a staircase of near-identical lines. Skip any commit that is the
-    # message we are already streaming.
     let streamed = if app.streamIdx >= 0 and app.streamIdx < app.chat.messages.len:
                      app.chat.messages[app.streamIdx].content
                    else: ""
     let plain = stripBullet(chunk.text)
-    if streamed.len > 0 and (plain == streamed or plain.startsWith(streamed)):
+    if streamed.len > 0 and (plain == streamed or plain.startsWith(streamed) or
+                          streamed.startsWith(plain)):
       discard
     elif anyAssistantMessage(app.chat, plain):
       # The vendor's headlessTranscriptHook emits both aevDelta (streamed) and
@@ -843,14 +861,18 @@ proc applyChunk*(app: App, chunk: Chunk) =
       # streaming check above no longer catches the duplicate, so also compare
       # against any committed assistant message.
       discard
+    elif overlapsAssistant(app, plain, streamed):
+      # Committed transcript echo of a reply we already have, possibly with
+      # slightly different wording: keep it out of the transcript.
+      discard
     elif plain == "interrupted by user":
       # The vendor's `onTurnInterrupted` fires for spurious interrupts (e.g. rate-
       # limited turns that surface as interrupts). We don't want to show this
       # to the user since they didn't actually interrupt.
       discard
-    elif plain.startsWith("○") or plain.startsWith("◔") or
-         plain.startsWith("◑") or plain.startsWith("◕") or
-         plain.startsWith("●"):
+    elif chunk.text.strip().startsWith("○") or chunk.text.strip().startsWith("◔") or
+         chunk.text.strip().startsWith("◑") or chunk.text.strip().startsWith("◕") or
+         chunk.text.strip().startsWith("●"):
       # The vendor's `contextLabel` generates a context-usage indicator like
       # "○ 0%" that ends up in the input bar. We don't want to show this either.
       discard
