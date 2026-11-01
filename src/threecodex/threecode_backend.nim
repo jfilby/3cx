@@ -25,10 +25,10 @@
 ## through `nextChunk`, which must not block. Hence the lock-protected queue:
 ## that is the entire concurrency story.
 
-import std/[deques, locks, strutils]
+import std/[deques, locks, os, strutils]
 import threecode/library
 import threecode/compact
-import threecode/engine as termengine
+import threecode/config
 # `classifyCommand` / `CommandKind` are how 3code itself decides whether a line is
 # a command, so reuse that rather than re-deriving the rule from a leading '/'.
 import threecode/ui
@@ -74,8 +74,21 @@ proc newThreeCodeBackend*(model = "", cwd = "", resume = false,
   ## Open a 3code session and wrap it as a `Backend`.
   ##
   ## Raises `AgentError` when no provider is configured, the model does not
-  ## resolve, or another live 3code process holds the directory/session lock -
-  ## the same failures the CLI reports.
+  ## resolve, another live 3code process holds the directory/session lock, or
+  ## the config file exists but cannot be read.
+
+  # `loadStateOrEmpty` calls the vendor's `die` when a config file exists but
+  # cannot be opened, and `die` quits the process instead of raising. The CLI
+  # wants that; 3cx instead reports the problem and exits rather than dying
+  # inside the library with no explanation. Turn the same condition into the
+  # AgentError the caller already handles.
+  let cfgPath = configPath()
+  if fileExists(cfgPath):
+    try:
+      discard readFile(cfgPath)
+    except CatchableError as e:
+      raise newException(AgentError, "cannot read " & cfgPath & ": " & e.msg)
+
   var opts = AgentOptions(experimental: experimental)
   if model.len > 0: opts.model = model
   if cwd.len > 0: opts.cwd = cwd

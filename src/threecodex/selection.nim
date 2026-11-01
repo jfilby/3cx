@@ -125,6 +125,13 @@ proc splitSelected*(s: string, fromCol, toCol: int): tuple[before, sel, after: s
   ## the styling of the text either side of it.
   if fromCol < 0 or toCol <= fromCol:
     return (s, "", "")
-  result.before = sliceColumns(s, 0, fromCol)
-  result.sel = sliceColumns(s, fromCol, toCol)
-  result.after = sliceColumns(s, toCol, lineEndCol)
+  # Split the bytes once instead of slicing three times: independent column
+  # slices overlap when a bound lands on a wide rune, and the glyph would be
+  # painted in both the selected and the trailing part.
+  let
+    start = colToOffset(s, fromCol)
+    stop = offsetRight(s, colToOffset(s, max(toCol - 1, 0)))
+  result.before = s[0 ..< start]
+  result.sel = s[start ..< stop]
+  if stop < s.len:
+    result.after = s[stop .. ^1]

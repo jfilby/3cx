@@ -122,7 +122,10 @@ proc killToEnd*(ib: var InputBox) =
   if ib.col < line.len:
     ib.lines[ib.line] = line.substr(0, ib.col - 1)
   elif ib.line < ib.lines.high:
-    ib.lines.delete(ib.line)
+    # At the end of a row, Ctrl+K removes the newline: the next row joins the
+    # current one instead of replacing it (which used to discard the prefix).
+    ib.lines[ib.line].add ib.lines[ib.line + 1]
+    ib.lines.delete(ib.line + 1)
 
 proc killToStart*(ib: var InputBox) =
   let line = ib.currentLine
@@ -153,12 +156,23 @@ proc moveRight*(ib: var InputBox) =
     inc ib.line
     ib.col = 0
 
+proc clampCol(line: string, col: int): int =
+  ## Keep a column on a rune boundary when moving between rows.
+  ##
+  ## A byte offset that pointed between runes in the row we came from can land
+  ## in the middle of a multi-byte rune in the row we land on. Slicing there
+  ## would produce invalid UTF-8 and a replacement glyph in the prompt.
+  result = min(max(col, 0), line.len)
+  if result > 0 and result < line.len and
+      (ord(line[result]) and 0xC0) == 0x80:
+    result = offsetLeft(line, result)
+
 proc moveUp*(ib: var InputBox): bool =
   ## Move up one row. Returns false when already on the first row, in which case
   ## the caller should treat the key as a history recall instead.
   if ib.line > 0:
     dec ib.line
-    ib.col = min(ib.col, ib.lines[ib.line].len)
+    ib.col = clampCol(ib.lines[ib.line], ib.col)
     return true
   false
 
@@ -166,7 +180,7 @@ proc moveDown*(ib: var InputBox): bool =
   ## Move down one row. Returns false when already on the last row.
   if ib.line < ib.lines.high:
     inc ib.line
-    ib.col = min(ib.col, ib.lines[ib.line].len)
+    ib.col = clampCol(ib.lines[ib.line], ib.col)
     return true
   false
 

@@ -17,6 +17,11 @@ type
   RecordingBackend = ref object of Backend
     interrupts: int
 
+proc rowText(tb: TerminalBuffer, y: int): string =
+  ## The glyphs painted on row `y`, for asserting on chrome text.
+  for x in 0 ..< tb.width:
+    result.add $tb[x, y].ch
+
 method interrupt(b: RecordingBackend) =
   inc b.interrupts
 
@@ -135,6 +140,21 @@ suite "app chunk assignment":
     let app = App(chat: Chat(), backend: newMockBackend("test"), streamIdx: -1, streaming: false)
     applyChunk(app, Chunk(kind: ckNone, text: "ignored"))
     check app.chat.messages.len == 0
+
+suite "layout":
+  # A frame is painted straight into a fixed-size buffer, and illwill's drawing
+  # procs take Natural coordinates: a layout that produces a negative row
+  # raises a RangeDefect instead of merely looking wrong.
+
+  test "a tall prompt on a short terminal is capped instead of crashing":
+    var chat = Chat()
+    chat.addMessage(rUser, "hello")
+    for h in 4 .. 9:
+      var app = App(chat: chat, input: newInputBox(),
+                    backend: newMockBackend("mock"), streamIdx: -1)
+      app.input.paste("1\n2\n3\n4\n5\n6")
+      var tb = newTerminalBuffer(40, h)
+      render(tb, app)      # regression: this raised at height <= 6
 
 suite "transcript role labels":
   # `/model <name>` changes which model answers, so the header and the assistant
@@ -261,10 +281,12 @@ suite "markdown":
     check lines[0].spans[0].bold
 
   test "bullet list gets a bullet marker":
-    check "• a" in renderMarkdown("- a\n- b", 40).texts()
+    let lines = renderMarkdown("- a\n- b", 40).texts()
+    check lines.anyIt(it.contains("• a"))
 
   test "ordered list keeps its numbers":
-    check "1. a" in renderMarkdown("1. a\n2. b", 40).texts()
+    let lines = renderMarkdown("1. a\n2. b", 40).texts()
+    check lines.anyIt(it.contains("1. a"))
 
   test "horizontal rule spans the full width":
     let lines = renderMarkdown("---", 20)
@@ -282,6 +304,13 @@ suite "markdown":
   test "fenced code is emitted verbatim with a gutter":
     let lines = renderMarkdown("```nim\necho 1\n```", 40).texts()
     check lines.anyIt(it.contains("│ echo 1"))
+
+  test "fenced code keeps the indentation the author wrote":
+    # Leading spaces used to be stripped before wrapping, so every code block
+    # came out left-aligned and the body of a proc flattened onto the `=`.
+    let lines = renderMarkdown("```nim\nproc f() =\n  echo 1\n```", 40).texts()
+    check lines.anyIt(it.contains("│ proc f() ="))
+    check lines.anyIt(it.contains("      echo 1"))
 
   test "unterminated fence still renders its contents":
     let lines = renderMarkdown("```\nplain", 40).texts()
@@ -305,6 +334,20 @@ suite "markdown":
     for w in 8 .. 20:
       let lines = renderMarkdown("### head\n\n- " & repeat("word ", 10), w)
       check lines.widest() <= w
+
+  test "wrapped list rows hang under the list body":
+    # The continuation indent has to be painted, not just counted: otherwise
+    # a bullet's wrapped rows snap back to column zero.
+    let lines = renderMarkdown("- " & repeat("word ", 8), 20).texts()
+    check lines.len > 1
+    check lines[0].startsWith("  • word")
+    check lines[1].startsWith("    word")
+
+  test "an ordered marker wider than the row does not wedge the wrapper":
+    # Regression: when the hanging indent alone filled the row, the wrapper
+    # flushed the same empty line forever and the TUI froze on that message.
+    let lines = renderMarkdown("123456789. item", 8)
+    check lines.len > 1
 
   test "renderPlain does not interpret markdown":
     let lines = renderPlain("- not a bullet\n# not a heading", 40).texts()
@@ -386,6 +429,36 @@ suite "inputbox":
     for c in "abcdef": ib2.insertChar(c)
     ib2.killToStart()
     check ib2.text == ""
+
+  test "killToEnd at the end of a row joins the next row":
+    # Regression: this used to delete the whole current row, losing the text
+    # before the cursor, instead of joining the rows at the newline.
+    var ib = newInputBox()
+    for c in "abc": ib.insertChar(c)
+    ib.insertNewline()
+    for c in "def": ib.insertChar(c)
+    discard ib.moveUp()
+    check ib.line == 0 and ib.col == 3
+    ib.killToEnd()
+    check ib.text == "abcdef"
+    check ib.line == 0 and ib.col == 3
+
+  test "moving between rows keeps the cursor on a rune boundary":
+    # A byte column that is valid in one row can fall inside a multi-byte rune
+    # in the next one; slicing there would corrupt the buffer.
+    var ib = newInputBox()
+    for r in "éé".runes: ib.insertRune(r)
+    ib.insertNewline()
+    for c in "ab": ib.insertChar(c)
+    ib.moveHome()
+    ib.moveRight()                       # column 1, one byte into the first é
+    check ib.moveUp()
+    check ib.col == 0                   # snapped before the first é
+    check ib.currentLine == "éé"
+
+    discard ib.moveDown()                # row "ab", column 0
+    for c in "xy": ib.insertChar(c)      # keep the buffer well-formed
+    check ib.text == "éé\nxyab"
 
   test "forward delete joins the next row":
     var ib = newInputBox()
@@ -555,6 +628,17 @@ suite "backend":
     b.chunkSize = 5
     b.start("x")
     check b.nextChunk().text.len == 5
+
+  test "interrupting the mock ends the turn":
+    let b = newMockBackend()
+    b.chunkSize = 2
+    b.start("x")
+    discard b.nextChunk()
+    check not b.isDone()
+    b.interrupt()
+    check b.nextChunk().kind == ckNone
+    check b.isDone()
+
 suite "uwidth columns":
   # A mouse selection is addressed by display column, which is not the same as
   # a byte offset: what the terminal reports is a column, and the text
@@ -705,6 +789,14 @@ suite "mouse selection":
     check splitSelected("hello world", 0, lineEndCol) == ("", "hello world", "")
     check splitSelected("hello world", -1, -1) == ("hello world", "", "")
     check splitSelected("hello world", 6, 2) == ("hello world", "", "")
+
+  test "a selection edge inside a wide rune paints it once":
+    # Regression: three independent column slices overlapped on the split
+    # rune, so the highlight repeated the glyph and shifted the text after it.
+    check splitSelected("a日b", 1, 2) == ("a", "日", "b")
+    check splitSelected("a日b", 0, 2) == ("", "a日", "b")
+    check splitSelected("a日b", 2, 3) == ("a", "日", "b")
+    check splitSelected("a日b", 3, 4) == ("a日", "b", "")
 
 suite "mouse coordinates":
   # The terminal reports screen cells; the transcript is addressed by row and
@@ -919,6 +1011,24 @@ suite "themes":
       check tb[0, 0].bg == t.barBg                # header
       check tb[0, 0].fg == t.barFg
       check tb[20, 9].bg == t.barBg               # status bar
+
+  test "the status bar hints the slash prefix, not an unbound key":
+    # `ctrl+p commands` used to sit in the footer although nothing handled
+    # ctrl+p, and commands are typed with a leading `/` by design.
+    themed()
+    discard useTheme("dark")
+    var tb = newTerminalBuffer(80, 10)
+    var app = frameApp()
+    render(tb, app)
+    let status = rowText(tb, 9)
+    check "/ commands" in status
+    check "ctrl+d quit" in status
+    check "ctrl+p" notin status
+
+    # A long working directory must not push the hints off the right edge.
+    let narrow = rowText(paint(lightTheme), 9)
+    check "/ commands" in narrow
+    check "ctrl+d quit" in narrow
 
   test "switching repaints the whole frame":
     # Same chat, same layout, opposite palette: nothing may be left holding the

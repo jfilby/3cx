@@ -22,7 +22,7 @@ to keep in sync.
   ● Hi! 👋
 ────────────────────────────────────────────────────────────────
 ❯
- enter send  ctrl+j newline  ↑/↓ history  pgup/pgdn scroll  ctrl+d quit
+ enter send   / commands   ctrl+d quit
 ```
 
 ## Build and run
@@ -40,8 +40,9 @@ the CLI does:
 3code provider add <name|url|api-key> --key KEY
 ```
 
-If no provider resolves, 3cx says so on stderr and falls back to the offline
-mock rather than dying — handy for working on the UI without spending tokens.
+If no provider resolves, 3cx reports the reason on stderr and exits before
+opening the UI; it never substitutes a mock reply for the real agent. Pass
+`--mock` to use the offline canned backend deliberately.
 
 Other tasks:
 
@@ -72,16 +73,16 @@ built for linux/amd64
 
 | Flag | Meaning |
 | --- | --- |
-| `--mock` | Offline canned backend; no provider needed |
+| `--mock` | Offline canned backend for UI development; never selected automatically |
 | `-m, --model NAME` | `provider[.model]`, overrides the 3code config |
 | `-C, --cwd DIR` | Working directory for tools and the sandbox |
 | `-r, --resume` | Resume the latest 3code session for this directory |
 | `-v, --version` | Version report, including the vendored 3code revision |
 | `-h, --help` | Usage |
 
-Everything also reads from the environment: `THREECX_BACKEND=mock`,
-`THREECX_MODEL`, `THREECX_CWD`, `THREECX_RESUME=1`, `THREECX_SESSION_DIR`,
-`THREECX_THEME`.
+Everything also reads from the environment: `THREECX_MODEL`, `THREECX_CWD`,
+`THREECX_RESUME=1`, `THREECX_SESSION_DIR`, `THREECX_THEME`. The mock backend
+has no environment switch: `--mock` is the only way to select it.
 
 ## Slash commands
 

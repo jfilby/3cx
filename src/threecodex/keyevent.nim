@@ -380,7 +380,9 @@ proc parse*(r: InputReader, data: string, flushEsc = true): seq[InputEvent] =
     pos += st.consumed
 
   if pos > 0:
-    r.buf = if pos < r.buf.len: r.buf[pos ..< ^1] else: ""
+    # Inclusive end: `..< ^1` would stop one byte short and drop the last byte
+    # of an incomplete sequence that followed a decoded event in the same read.
+    r.buf = if pos < r.buf.len: r.buf[pos .. ^1] else: ""
 
 # ---------------------------------------------------------------------------
 # Ctrl-C: the terminal reports it as a signal, not as a byte

@@ -34,7 +34,7 @@ const illwillVer* =
         segments = listing.split('/')
         base = segments[segments.len - 1]
       if base.startsWith("illwill-"):
-        base["illwill-".len ..< ^1].split('-')[0]
+        base["illwill-".len .. ^1].split('-')[0]
       else:
         "unknown"
     else:

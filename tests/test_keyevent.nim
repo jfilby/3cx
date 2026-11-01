@@ -156,6 +156,20 @@ suite "keyevent":
     check evs[0].key == Key.Up and evs[0].mods.ctrl
     check r.pending() == 0
 
+  test "an incomplete sequence after a decoded event is kept whole":
+    # Regression: the leftover buffer was trimmed with `..< ^1`, which dropped
+    # the byte before the last one, so "a" followed by the start of a sequence
+    # lost the '[' and the rest decoded as loose runes.
+    var r = newInputReader()
+    let first = r.parse("a\x1b[", flushEsc = false)
+    check first.len == 1
+    check $(first[0].rune) == "a"
+    check r.pending() == 2
+    let rest = r.parse("1;5A", flushEsc = false)
+    check rest.len == 1
+    check rest[0].key == Key.Up and rest[0].mods.ctrl
+    check r.pending() == 0
+
   test "garbage bytes are dropped rather than stalling the parser":
     # A stray continuation byte or an unterminated unknown sequence must not
     # wedge the reader - the buffer has to keep draining.

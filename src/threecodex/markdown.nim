@@ -175,7 +175,8 @@ proc parseBlocks(md: string): seq[Block] =
       continue
 
     if inCode:
-      codeLines.add raw.strip(leading = true, trailing = false)
+      # Code is verbatim: leading spaces are indentation the user wrote.
+      codeLines.add raw
       continue
 
     if trimmed.len == 0:
@@ -262,23 +263,44 @@ proc wrapContent(content: seq[Span], prefix: string, prefixFg: ForegroundColor,
   ## start at `contIndent`. A newline inside `content` forces a break, and a
   ## token too long for any single row is hard-broken so that nothing ever
   ## overflows the viewport.
+  ##
+  ## Both indents are painted, not just counted: a hanging indent that only
+  ## feeds the width arithmetic puts every continuation flush against column
+  ## zero, so a wrapped bullet stops lining up under its own marker. They are
+  ## clamped to one column short of the row so a long ordered-list marker in a
+  ## narrow transcript cannot leave the wrapper with nowhere to draw.
+  let
+    rowWidth = max(width, 1)
+    firstPad = min(max(indent, 0), rowWidth - 1)
+    contPad = min(max(contIndent, 0), rowWidth - 1)
   var
     cur: Line
-    x = indent
+    x = 0
     pendingSpace = false
+    lineHasText = false ## False until a glyph of the content lands on this row.
+    curHasPrefix = false
     stalls = 0
     wrapped: seq[Line]  ## Accumulator; `flush` is a nested proc and cannot capture
                     ## `result`.
 
+  if firstPad > 0:
+    cur.addSpan Span(text: " ".repeat(firstPad), fg: prefixFg)
+    x = firstPad
+    curHasPrefix = true
   if prefix.len > 0:
     cur.addSpan Span(text: prefix, fg: prefixFg)
     x += displayWidth(prefix)
+    curHasPrefix = true
 
   proc flush() =
     wrapped.add cur
     cur = Line()
-    x = contIndent
+    if contPad > 0:
+      cur.addSpan Span(text: " ".repeat(contPad), fg: prefixFg)
+    x = contPad
     pendingSpace = false
+    lineHasText = false
+    curHasPrefix = false
 
   # Flatten the content, keeping explicit newlines as break markers so that
   # fenced code (which relies on them) survives wrapping intact.
@@ -304,21 +326,43 @@ proc wrapContent(content: seq[Span], prefix: string, prefixFg: ForegroundColor,
     while i < sp.text.len:
       let (tok, isSpace) = nextToken(sp.text, i)
       if isSpace:
-        pendingSpace = true
+        if lineHasText:
+          pendingSpace = true
+          continue
+        # Leading whitespace on an explicit line is indentation, not a word
+        # break: draw it so fenced code keeps its shape. Prose never arrives
+        # here with leading spaces - `parseBlocks` trims every paragraph line.
+        let avail = rowWidth - x
+        if avail <= 0:
+          flush()
+          inc stalls
+          if stalls > 4:
+            break
+          continue
+        let n = min(tok.len, avail)
+        cur.addSpan Span(text: tok[0 ..< n], fg: sp.fg, bold: sp.bold,
+                         italic: sp.italic, underline: sp.underline)
+        x += n
+        lineHasText = true
+        stalls = 0
         continue
 
       var rest = tok
       while rest.len > 0:
-        stalls = 0
-        var avail = width - x
+        var avail = rowWidth - x
         if avail <= 0:
           flush()
+          inc stalls
+          if stalls > 4:
+            rest = ""
+            break
           continue
 
-        if pendingSpace and x > contIndent:
+        if pendingSpace and x > contPad:
           if displayWidth(rest) + 1 <= avail:
             cur.addSpan Span(text: " ", fg: sp.fg)
             inc x
+            lineHasText = true
           else:
             flush()
             continue
@@ -328,6 +372,8 @@ proc wrapContent(content: seq[Span], prefix: string, prefixFg: ForegroundColor,
           cur.addSpan Span(text: rest, fg: sp.fg, bold: sp.bold,
                            italic: sp.italic, underline: sp.underline)
           x += displayWidth(rest)
+          lineHasText = true
+          stalls = 0
           break
 
         let (head, tail) = takeFitting(rest, avail)
@@ -345,9 +391,11 @@ proc wrapContent(content: seq[Span], prefix: string, prefixFg: ForegroundColor,
         cur.addSpan Span(text: head, fg: sp.fg, bold: sp.bold, italic: sp.italic,
                          underline: sp.underline)
         rest = tail
+        lineHasText = true
+        stalls = 0
         flush()
 
-  if cur.spans.len > 0:
+  if lineHasText or curHasPrefix:
     wrapped.add cur
 
   result = wrapped

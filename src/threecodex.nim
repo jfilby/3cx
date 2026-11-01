@@ -19,7 +19,7 @@ proc usage() =
   echo ""
   echo "usage: 3cx [options]"
   echo ""
-  echo "  --mock              use the offline mock backend (no provider needed)"
+  echo "  --mock              use the offline mock backend (UI development only)"
   echo "  -m, --model NAME    provider[.model], overrides the 3code config"
   echo "  -C, --cwd DIR       working directory for tools and the sandbox"
   echo "  -r, --resume        resume the latest 3code session for this directory"
@@ -32,7 +32,6 @@ proc usage() =
 proc parseArgs(): Options =
   result.model = getEnv("THREECX_MODEL")
   result.cwd = getEnv("THREECX_CWD")
-  result.useMock = getEnv("THREECX_BACKEND") == "mock"
   result.resume = getEnv("THREECX_RESUME") == "1"
 
   var i = 1
@@ -75,23 +74,23 @@ proc main() =
   if opts.useMock:
     backend = newMockBackend()
   else:
-    # The 3code backend raises AgentError for the same conditions the CLI
-    # reports (no provider, unresolvable model, locks held). Surface them as
-    # plain text before the terminal goes full-screen, then fall back to the
-    # mock so the session is still usable rather than dead on arrival.
+    # No silent fallback: a mock reply presented as the agent is worse than a
+    # clear failure. A backend that cannot start ends the launch here, before
+    # the terminal is taken over - so there is nothing to restore.
     try:
       let b = newThreeCodeBackend(model = opts.model, cwd = opts.cwd,
                                   resume = opts.resume)
       backend = b
     except CatchableError as e:
       stderr.writeLine "3cx: cannot start 3code: " & e.msg
-      stderr.writeLine "3cx: falling back to the mock backend (--mock to skip this)"
-      backend = newMockBackend()
+      stderr.writeLine "3cx: configure a provider with `3code provider add`, " &
+                       "or pass --mock to use the offline UI."
+      quit(QuitFailure)
 
   if chat.messages.len == 0:
     var welcome = "Welcome to **3cx**. Type a message and press enter."
     if backend.name == "mock":
-      welcome.add "\n\nThis build is wired to the mock backend, so replies are canned."
+      welcome.add "\n\nThis session is using the mock backend, so replies are canned."
     welcome.add "\n\n`/help` lists the agent's commands; `/themes` switches between " &
       "light and dark."
     chat.addMessage(rSystem, welcome)

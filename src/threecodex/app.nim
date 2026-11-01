@@ -190,15 +190,18 @@ proc drawBar(tb: var TerminalBuffer, y: int, text: string, bg: BackgroundColor,
 
 proc padStatus(left, right: string, w: int): string =
   ## Left- and right-justify two chunks across a bar `w` columns wide, padding
-  ## the gap with spaces. When the two would collide the left chunk wins, so
-  ## the truncated bar stays readable rather than wrapping.
+  ## the gap with spaces. When the two would collide, the left chunk is cut
+  ## first: the right-hand side carries the key hints, and those are worth more
+  ## than the tail of a long working-directory path.
   ##
   ## Tabs would be simpler, but every terminal expands them to its own stops -
   ## so the right-hand chunk lands somewhere different everywhere.
-  let lw = displayWidth(left)
   let rw = displayWidth(right)
-  let gap = max(w - lw - rw, 1)
-  result = left & " ".repeat(gap) & right
+  let budget = max(w - rw - 1, 0)
+  let l = if displayWidth(left) > budget: truncateToWidth(left, budget)
+          else: left
+  let gap = max(w - displayWidth(l) - rw, 1)
+  result = l & " ".repeat(gap) & right
 
 # ---------------------------------------------------------------------------
 # Transcript
@@ -253,13 +256,21 @@ type
     statusY*: int
 
 proc computeLayout(app: App, w, h: int): Layout =
+  ## Where each part of the window lands for a given size.
+  ##
+  ## The prompt is capped so the header, one transcript row, its separator and
+  ## the status bar always fit. A six-row prompt on a six-row terminal used to
+  ## put `inputTop` above the top of the buffer, and illwill's drawing procs
+  ## take Natural coordinates - so the next frame raised a RangeDefect rather
+  ## than painting.
   let
     statusY = h - 1
-    inputRows = app.input.visibleLineCount(maxVisibleLines)
+    maxInputRows = max(statusY - 4, 1)
+    inputRows = min(app.input.visibleLineCount(maxVisibleLines), maxInputRows)
     inputTop = statusY - inputRows
     msgTop = 2
     msgBottom = inputTop - 2
-    msgHeight = max(msgBottom - msgTop + 1, 1)
+    msgHeight = max(msgBottom - msgTop + 1, 0)
   result = Layout(msgTop: msgTop, msgHeight: msgHeight, inputTop: inputTop,
                   inputRows: inputRows, statusY: statusY)
 
@@ -414,7 +425,8 @@ proc render*(tb: var TerminalBuffer, app: App) =
   # explicit padding rather than tabs, which every terminal expands to its own
   # stops.
   let home = getHomeDir()
-  let dir = getCurrentDir().replace(home, "~")
+  let dir = if home.len > 0: getCurrentDir().replace(home, "~")
+            else: getCurrentDir()
   let ctx = app.backend.contextUsageLine()
   let copying = app.copyMsg.len > 0 and epochTime() < app.copyMsgUntil
   let spinIdx = int(epochTime() * 8) mod spinnerFrames.len
@@ -424,8 +436,8 @@ proc render*(tb: var TerminalBuffer, app: App) =
                " " & spinnerFrames[spinIdx] & "  working...   esc interrupt"
              else:
                " " & dir
-  let right = if ctx.len > 0: ctx & "   ctrl+p commands "
-             else: "ctrl+p commands   ctrl+d quit "
+  let right = if ctx.len > 0: ctx & "   / commands "
+             else: "enter send   / commands   ctrl+d quit "
 
   let (statusFg, statusStyle) =
     if copying: (colOk, {})

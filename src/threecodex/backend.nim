@@ -144,3 +144,8 @@ method nextChunk*(b: MockBackend): Chunk =
 
 method isDone*(b: MockBackend): bool =
   b.pos >= b.text.len
+
+method interrupt*(b: MockBackend) =
+  ## Cancel the canned reply. Esc and Ctrl-C have to stop the mock too, or the
+  ## only backend available without a provider would ignore its cancel key.
+  b.pos = b.text.len
