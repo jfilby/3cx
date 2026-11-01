@@ -5,8 +5,9 @@
 ## drawing layer is exercised end-to-end by driving the real binary in a pty
 ## rather than being unit tested, since it is mostly straight-line blitting.
 
-import std/[base64, json, os, sequtils, strutils, unicode, unittest]
+import std/[base64, json, options, os, sequtils, strutils, unicode, unittest]
 import illwill
+from threecode/types import Profile
 import ../src/threecodex/[uwidth, markdown, inputbox, keyevent, session, selection,
                            clipboard, types, backend, config, theme]
 import ../src/threecodex/[app, threecode_backend]
@@ -695,6 +696,30 @@ suite "session":
     check loaded.messages[0].content == "hi"
     check loaded.messages[0].model == ""
 
+  test "the agent session behind the transcript survives a round trip":
+    # Without this link a relaunch repaints the scrollback over an agent that
+    # has never seen it, which is exactly the "resumed from zero" surprise.
+    let dir = getTempDir() / "threecodex_link"
+    setSessionDir(dir)
+    defer: removeDir(dir)
+    var chat = Chat()
+    chat.addMessage(rUser, "hello")
+    chat.backendPath = "/tmp/some-session.3log"
+    check chat.saveSession()
+    let loaded = loadSession()
+    check loaded.backendPath == "/tmp/some-session.3log"
+    check loaded.messages.len == 1
+
+  test "a transcript with no recorded session keeps the key out of the file":
+    let dir = getTempDir() / "threecodex_nolink"
+    setSessionDir(dir)
+    defer: removeDir(dir)
+    var chat = Chat()
+    chat.addMessage(rUser, "hello")
+    check chat.saveSession()
+    check loadSession().backendPath == ""
+    check not readFile(sessionPath()).contains("backend")
+
 suite "backend":
 
   test "the mock streams its full reply exactly once":
@@ -736,6 +761,54 @@ suite "backend":
     check formatTokens(148233) == "148K"
     check formatTokens(999999) == "1.0M"
     check formatTokens(1234567) == "1.2M"
+
+  test "context usage is a share of one prompt, not of every turn ever run":
+    # The number behind the percentage is the size of the last prompt: that is
+    # what the next request will carry. The session's *running total*
+    # (`usage().promptTokens`) is a different, ever-growing number — 250K
+    # after a long conversation would have read (2083%) against this 12K stub
+    # window, which is exactly what the header used to show.
+    check contextUsageFor(Profile(model: "stub-model"), 8342) == "8.3K (69%)"
+
+  test "context usage honours a configured window over the model heuristic":
+    # The substring heuristic would call this 128K and inflate the share; a
+    # `[params] context_window` is the operator's answer, and the `Profile`
+    # overload is what consults it.
+    var p = Profile(model: "unsuffixed-model", name: "p.unsuffixed-model")
+    p.params.contextWindow = some(200_000)
+    check contextUsageFor(p, 100_000) == "100K (50%)"
+
+  test "no prompt yet means no context usage to show":
+    check contextUsageFor(Profile(model: "stub-model"), 0).len == 0
+
+  test "a launch attaches to the session the transcript came from":
+    # The whole point of recording the path: the screen and the agent's context
+    # are then the same conversation, with no `--resume` needed.
+    let dir = getTempDir() / "threecodex_resume_choice"
+    if not dirExists(dir): createDir(dir)
+    defer: removeDir(dir)
+    let saved = dir / "s.3log"
+    writeFile(saved, "")
+    let chosen = resumeChoice(saved, resumeLatest = false)
+    check not chosen.latest
+    check chosen.id == saved
+
+  test "--resume takes the newest session, not the recorded one":
+    # An explicit request outranks the transcript's own session, even when that
+    # session is still on disk.
+    let chosen = resumeChoice("/tmp/still-here.3log", resumeLatest = true)
+    check chosen.latest
+    check chosen.id == ""
+
+  test "a recorded session that is gone starts a new one":
+    let chosen = resumeChoice("/nonexistent/gone.3log", resumeLatest = false)
+    check not chosen.latest
+    check chosen.id == ""
+
+  test "a transcript with no recorded session starts a new one":
+    let chosen = resumeChoice("", resumeLatest = false)
+    check not chosen.latest
+    check chosen.id == ""
 
   test "interrupting the mock ends the turn":
     let b = newMockBackend()

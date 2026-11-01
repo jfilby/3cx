@@ -25,6 +25,12 @@ type
 
   Chat* = object
     messages*: seq[Message]
+    backendPath*: string  ## The 3code session file this transcript continues, so
+                          ## the next launch can resume the same agent context
+                          ## instead of painting the scrollback over an empty
+                          ## one. Empty means no session is recorded: the mock
+                          ## backend, or a document written before this field
+                          ## existed.
 
 proc addMessage*(chat: var Chat, role: Role, content: string, model = "") =
   ## Append a message to the chat.

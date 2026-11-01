@@ -22,7 +22,8 @@ proc usage() =
   echo "  --mock              use the offline mock backend (UI development only)"
   echo "  -m, --model NAME    provider[.model], overrides the 3code config"
   echo "  -C, --cwd DIR       working directory for tools and the sandbox"
-  echo "  -r, --resume        resume the latest 3code session for this directory"
+  echo "  -r, --resume        the newest 3code session for this directory, not the"
+  echo "                      one the restored transcript came from"
   echo "  -v, --version       print version information and exit"
   echo "  -h, --help          show this help"
   echo ""
@@ -71,16 +72,24 @@ proc main() =
   applyTheme(loadConfig().theme)
 
   var backend: Backend
+  var attached = false  ## Whether the agent has the transcript's history.
   if opts.useMock:
     backend = newMockBackend()
   else:
+    # Which saved session to attach to, decided before anything is opened: the
+    # transcript's own unless `--resume` asks for the newest for this directory.
+    let choice = resumeChoice(chat.backendPath, opts.resume)
+    attached = choice.latest or choice.id.len > 0
     # No silent fallback: a mock reply presented as the agent is worse than a
     # clear failure. A backend that cannot start ends the launch here, before
     # the terminal is taken over - so there is nothing to restore.
     try:
       let b = newThreeCodeBackend(model = opts.model, cwd = opts.cwd,
-                                  resume = opts.resume)
+                                  resume = choice.latest, resumeId = choice.id)
       backend = b
+      # Saved with the transcript, so the next launch attaches to this same
+      # conversation instead of painting the scrollback over an empty agent.
+      chat.backendPath = b.agentSessionPath()
     except CatchableError as e:
       stderr.writeLine "3cx: cannot start 3code: " & e.msg
       stderr.writeLine "3cx: configure a provider with `3code provider add`, " &
@@ -94,6 +103,13 @@ proc main() =
     welcome.add "\n\n`/help` lists the agent's commands; `/themes` switches between " &
       "light and dark."
     chat.addMessage(rSystem, welcome)
+  elif not attached and not opts.useMock:
+    # The scrollback came back but the agent has no memory of it: the session
+    # file it was written against is gone. Say so, rather than letting the
+    # transcript imply a context the model cannot see.
+    chat.addMessage(rSystem, "**This conversation is new to the agent.** The " &
+      "3code session behind the transcript above is gone, so it starts empty; " &
+      "the text stays as a record of the old conversation.")
 
   run(chat, backend)
 

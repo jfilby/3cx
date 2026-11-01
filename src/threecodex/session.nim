@@ -3,6 +3,11 @@
 ## The transcript is written as a small JSON document under the user's config
 ## directory so a session survives a restart. Saving is best-effort: a read-only
 ## or unwritable config directory must never take the UI down with it.
+##
+## The document also records which 3code session the transcript continues. The
+## two stores are independent - 3code writes its own `.3log` per turn - so
+## without that link a restart would paint the restored scrollback over an agent
+## that has never heard of it.
 
 import std/[json, os, strutils]
 import ./types
@@ -57,7 +62,7 @@ proc roleFromName(s: string): Role =
 
 proc saveSession*(chat: Chat): bool =
   ## Write `chat` to disk. Returns false if the write failed.
-  var node = newJArray()
+  var messages = newJArray()
   for m in chat.messages:
     var o = newJObject()
     o["role"] = newJString(roleName(m.role))
@@ -67,7 +72,13 @@ proc saveSession*(chat: Chat): bool =
     # absence as "use the backend's current name".
     if m.model.len > 0:
       o["model"] = newJString(m.model)
-    node.add o
+    messages.add o
+  var node = newJObject()
+  # Omitted when there is none rather than written as "", so a document from
+  # before the link existed and one that never had a backend stay identical.
+  if chat.backendPath.len > 0:
+    node["backend"] = newJString(chat.backendPath)
+  node["messages"] = messages
   try:
     let dir = sessionPath().parentDir
     if not dirExists(dir):
@@ -88,7 +99,11 @@ proc loadSession*(): Chat =
   try:
     var assistantTexts: seq[string]
     let node = parseFile(path)
-    for item in node:
+    # A bare array is the pre-link format: messages only, no agent session
+    # recorded. It still loads, and the next save upgrades it in place.
+    let items = if node.kind == JObject: node{"messages"} else: node
+    result.backendPath = node{"backend"}.getStr("")
+    for item in items:
       if item.kind == JObject:
         let role = roleFromName(item{"role"}.getStr("system"))
         let content = item{"content"}.getStr("")

@@ -27,6 +27,7 @@
 
 import std/[deques, locks, math, os, strutils]
 import threecode/library
+import threecode/types
 import threecode/compact
 import threecode/config
 # `classifyCommand` / `CommandKind` are how 3code itself decides whether a line is
@@ -51,6 +52,12 @@ type
     running: bool        ## A worker thread is alive.
     worker: Thread[TurnJob] ## Handle for the in-flight turn, joined on close.
 
+  ResumeChoice* = object
+    ## Which saved 3code session a launch attaches to.
+    latest*: bool  ## Ask 3code for the newest session for the cwd.
+    id*: string    ## Resume this session file; "" with `latest` unset means
+                   ## start a new one.
+
 # ---------------------------------------------------------------------------
 # Queue plumbing. Called from both the worker thread and the UI thread.
 # ---------------------------------------------------------------------------
@@ -69,8 +76,24 @@ proc markFinished(b: ThreeCodeBackend) {.gcsafe.} =
 # Construction
 # ---------------------------------------------------------------------------
 
+proc resumeChoice*(recorded: string, resumeLatest: bool): ResumeChoice =
+  ## Which 3code session a launch attaches to.
+  ##
+  ## `--resume` means "the newest session for this directory" and wins: it is
+  ## the explicit request. Otherwise continue the session the restored
+  ## transcript came from, which is what makes the scrollback on screen and the
+  ## agent's context the same conversation.
+  ##
+  ## A recorded path that no longer exists (deleted, or rotated away) is the one
+  ## case that falls through to a fresh session. The caller says so out loud
+  ## rather than letting the transcript imply a history the model cannot see.
+  if resumeLatest:
+    return ResumeChoice(latest: true)
+  if recorded.len > 0 and fileExists(recorded):
+    return ResumeChoice(id: recorded)
+
 proc newThreeCodeBackend*(model = "", cwd = "", resume = false,
-                         experimental = false): ThreeCodeBackend =
+                         resumeId = "", experimental = false): ThreeCodeBackend =
   ## Open a 3code session and wrap it as a `Backend`.
   ##
   ## Raises `AgentError` when no provider is configured, the model does not
@@ -93,6 +116,7 @@ proc newThreeCodeBackend*(model = "", cwd = "", resume = false,
   if model.len > 0: opts.model = model
   if cwd.len > 0: opts.cwd = cwd
   opts.resume = resume
+  opts.resumeId = resumeId
 
   var b = ThreeCodeBackend()
   initLock(b.lock)
@@ -120,6 +144,13 @@ proc newThreeCodeBackend*(model = "", cwd = "", resume = false,
       b.push(Chunk(kind: ckError, text: ev.text))
 
   result = b
+
+proc agentSessionPath*(b: ThreeCodeBackend): string =
+  ## The 3code session file behind this conversation.
+  ##
+  ## The UI saves it next to the transcript so the next launch attaches to the
+  ## same conversation instead of painting the scrollback over an empty agent.
+  b.session.state.savePath
 
 # ---------------------------------------------------------------------------
 # Worker
@@ -274,22 +305,34 @@ proc formatTokens*(n: int): string =
   let shown = if v >= 100.0: $int(v.round) else: formatFloat(v, ffDecimal, 1)
   result = shown & units[u]
 
+proc contextUsageFor*(profile: Profile, lastPromptTokens: int): string =
+  ## Context window usage as "8.3K (8%)", or "" if there is nothing to show
+  ## yet. `lastPromptTokens` is the size of the most recent request's prompt,
+  ## which is what the next request will carry.
+  if lastPromptTokens <= 0:
+    return ""
+  # The `Profile` overload, not the model string: it honours a configured
+  # `[params] context_window` and the curated known-good table, so a
+  # 1M-token model is not measured against the 128K fallback.
+  let window = compact.contextWindowFor(profile)
+  if window <= 0:
+    return ""
+  let pct = int(lastPromptTokens.float / window.float * 100.0)
+  result = formatTokens(lastPromptTokens) & " (" & $pct & "%)"
+
 method contextUsageLine*(b: ThreeCodeBackend): string =
   ## Context window usage as "8.3K (8%)" for the header bar, or "" if
-  ## unknown. Uses the vendor's `contextWindowFor` heuristic and the
-  ## session's current `promptTokens`.
+  ## unknown.
+  ##
+  ## `lastPromptTokens`, not `usage().promptTokens`: the latter is the
+  ## session's *cumulative* input tokens, summed over every turn, so a
+  ## percentage of the window drawn from it climbs past 100% within a few
+  ## turns of a long conversation.
   ##
   ## A `method`, not a `proc`: `App` reads this through its `Backend` field, so
   ## a proc here would only shadow the base method and the header would render
   ## blank.
-  let u = b.session.usage()
-  if u.promptTokens == 0:
-    return ""
-  let window = compact.contextWindowFor(b.name)
-  if window <= 0:
-    return ""
-  let pct = int(u.promptTokens.float / window.float * 100.0)
-  result = formatTokens(u.promptTokens) & " (" & $pct & "%)"
+  contextUsageFor(b.session.profile, b.session.state.lastPromptTokens)
 
 proc close*(b: ThreeCodeBackend) =
   ## Interrupt, join the worker, then persist and release the session.
