@@ -26,10 +26,17 @@ method interrupt(b: RecordingBackend) =
   inc b.interrupts
 
 type
+  # A backend that knows one context usage number, so the header bar can be
+  # checked without a provider or a 3code session behind it.
+  CtxBackend = ref object of Backend
+
   # A backend that speaks the UI's `/` prefix about as simply as one can, so
   # the prompt path can be driven without a provider or a 3code session.
   CommandBackend = ref object of Backend
     ran: seq[string]
+
+method contextUsageLine(b: CtxBackend): string =
+  "8.3K (8%)"
 
 method supportsCommands(b: CommandBackend): bool = true
 
@@ -719,6 +726,15 @@ suite "backend":
     b.start("x")
     check b.nextChunk().text.len == 5
 
+  test "a token count is compacted for a bar":
+    check formatTokens(0) == "0"
+    check formatTokens(942) == "942"
+    check formatTokens(1000) == "1.0K"
+    check formatTokens(8342) == "8.3K"
+    check formatTokens(148233) == "148K"
+    check formatTokens(999999) == "1.0M"
+    check formatTokens(1234567) == "1.2M"
+
   test "interrupting the mock ends the turn":
     let b = newMockBackend()
     b.chunkSize = 2
@@ -1150,6 +1166,39 @@ suite "slash commands from the prompt":
     check app.chat.messages.len == 2
     check app.chat.messages[0].content == "run ./3cx"
     check app.chat.messages[1].role == rAssistant
+
+suite "header bar":
+  # The context usage lives in the top right of the frame, next to the model it
+  # belongs to - the status bar has the key hints, and repeating the number in
+  # two places made both bars read as chrome noise.
+
+  proc painted(w, h: int): TerminalBuffer =
+    var chat = Chat()
+    chat.addMessage(rAssistant, "hi")
+    var app = App(chat: chat, input: newInputBox(),
+                  backend: CtxBackend(name: "gpt-x"), streamIdx: -1)
+    var tb = newTerminalBuffer(w, h)
+    render(tb, app)
+    result = tb
+
+  test "the usage sits at the right edge, beside the app and the model":
+    let row = rowText(painted(40, 10), 0)
+    check row.startsWith("  3cx   gpt-x")
+    check row.endsWith("8.3K (8%) ")
+    check row.len == 40
+
+  test "a narrow header drops the usage rather than the title":
+    # 20 columns cannot hold "  3cx   gpt-x" and the number: the title is the
+    # half worth keeping.
+    let row = rowText(painted(20, 10), 0)
+    check row.startsWith("  3cx   gpt-x")
+    check "(8%)" notin row
+
+  test "the status bar keeps the hints and no longer repeats the usage":
+    let status = rowText(painted(40, 10), 9)
+    check "/ commands" in status
+    check "ctrl+d quit" in status
+    check "(8%)" notin status
 
 suite "themes":
   # A theme is only ever seen as painted cells, so most of these read a

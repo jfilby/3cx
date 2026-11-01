@@ -25,7 +25,7 @@
 ## through `nextChunk`, which must not block. Hence the lock-protected queue:
 ## that is the entire concurrency story.
 
-import std/[deques, locks, os, strutils]
+import std/[deques, locks, math, os, strutils]
 import threecode/library
 import threecode/compact
 import threecode/config
@@ -256,10 +256,32 @@ proc usageLine*(b: ThreeCodeBackend): string =
   result = $u.totalTokens & " tokens" &
            (if u.cachedTokens > 0: " (" & $u.cachedTokens & " cached)" else: "")
 
-proc contextUsageLine*(b: ThreeCodeBackend): string =
-  ## Context window usage as "83.6K (8%)" for the status bar, or "" if
+proc formatTokens*(n: int): string =
+  ## A token count in the compact form a bar has room for: `"942"`,
+  ## `"8.3K"`, `"148K"`, `"1.0M"`.
+  ##
+  ## A raw six-digit count would crowd the header on a laptop-width terminal,
+  ## and the digit it costs buys nothing at a glance.
+  if n < 1000:
+    return $n
+  const units = ["K", "M", "G"]
+  var
+    v = n.float
+    u = -1
+  while v >= 999.5 and u < units.high:
+    v /= 1000.0
+    inc u
+  let shown = if v >= 100.0: $int(v.round) else: formatFloat(v, ffDecimal, 1)
+  result = shown & units[u]
+
+method contextUsageLine*(b: ThreeCodeBackend): string =
+  ## Context window usage as "8.3K (8%)" for the header bar, or "" if
   ## unknown. Uses the vendor's `contextWindowFor` heuristic and the
   ## session's current `promptTokens`.
+  ##
+  ## A `method`, not a `proc`: `App` reads this through its `Backend` field, so
+  ## a proc here would only shadow the base method and the header would render
+  ## blank.
   let u = b.session.usage()
   if u.promptTokens == 0:
     return ""
@@ -267,8 +289,7 @@ proc contextUsageLine*(b: ThreeCodeBackend): string =
   if window <= 0:
     return ""
   let pct = int(u.promptTokens.float / window.float * 100.0)
-  let tokens = $u.promptTokens
-  result = tokens & " (" & $pct & "%)"
+  result = formatTokens(u.promptTokens) & " (" & $pct & "%)"
 
 proc close*(b: ThreeCodeBackend) =
   ## Interrupt, join the worker, then persist and release the session.

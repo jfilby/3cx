@@ -5,7 +5,7 @@
 ##
 ## ```
 ## +--------------------------------------------------+
-## | header: app name + backend                       |  row 0
+## | header: app name + backend .... context usage    |  row 0
 ## |--------------------------------------------------|  row 1
 ## |                                                  |
 ## | transcript (scrollable, follows the tail)        |  rows 2 .. msgBottom
@@ -216,6 +216,27 @@ proc drawBar(tb: var TerminalBuffer, y: int, text: string, bg: BackgroundColor,
   tb.write(0, y, visible)
   applyCanvas(tb)
 
+proc headerLine*(app: App, w: int): string =
+  ## The text of the header bar: the app and its backend on the left, the
+  ## context usage on the right.
+  ##
+  ## Unlike the status bar, the usage is *dropped* rather than squeezing the
+  ## title when the terminal is too narrow for both: on a cramped screen the
+  ## frame still has to say which app and model it is, and a percentage of a
+  ## window nobody can name is the lesser half of the pair.
+  result = "  3cx" &
+           (if app.backend.name.len > 0: "   " & app.backend.name
+            else: "   no backend")
+  let ctx = app.backend.contextUsageLine()
+  if ctx.len == 0:
+    return
+  # One trailing space keeps the number off the right edge, the same way the
+  # status bar's hints are inset.
+  let gap = w - displayWidth(result) - displayWidth(ctx) - 1
+  if gap < 1:
+    return
+  result.add " ".repeat(gap) & ctx & " "
+
 proc padStatus(left, right: string, w: int): string =
   ## Left- and right-justify two chunks across a bar `w` columns wide, padding
   ## the gap with spaces. When the two would collide, the left chunk is cut
@@ -407,10 +428,8 @@ proc render*(tb: var TerminalBuffer, app: App) =
   # the transcript that actually exists right now.
   let start = app.visibleStart(lay.msgHeight)
 
-  # Header.
-  let title = "  3cx" &
-              (if app.backend.name.len > 0: "   " & app.backend.name else: "   no backend")
-  drawBar(tb, 0, title, colBarBg, colBarFg)
+  # Header: app and backend, with the context usage tucked into the right edge.
+  drawBar(tb, 0, app.headerLine(w), colBarBg, colBarFg)
 
   # Transcript.
   if w >= minWidth:
@@ -460,13 +479,12 @@ proc render*(tb: var TerminalBuffer, app: App) =
       tb.drawLine(lay.inputTop + row, sideMargin, line, bodyWidth)
 
   # Status bar: left shows the busy indicator or the current directory; the
-  # right always carries the context usage and the command hint. Laid out with
-  # explicit padding rather than tabs, which every terminal expands to its own
-  # stops.
+  # right carries the command hint and the exit key. Laid out with explicit
+  # padding rather than tabs, which every terminal expands to its own stops.
+  # Context usage lives in the header, so it is not repeated here.
   let home = getHomeDir()
   let dir = if home.len > 0: getCurrentDir().replace(home, "~")
             else: getCurrentDir()
-  let ctx = app.backend.contextUsageLine()
   let copying = app.copyMsg.len > 0 and epochTime() < app.copyMsgUntil
   let spinIdx = int(epochTime() * 8) mod spinnerFrames.len
   let left = if copying:
@@ -475,8 +493,7 @@ proc render*(tb: var TerminalBuffer, app: App) =
                " " & spinnerFrames[spinIdx] & "  working...   esc interrupt"
              else:
                " " & dir
-  let right = if ctx.len > 0: ctx & "   / commands "
-             else: "enter send   / commands   ctrl+d quit "
+  let right = "enter send   / commands   ctrl+d quit "
 
   let (statusFg, statusStyle) =
     if copying: (colOk, {})
