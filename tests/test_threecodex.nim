@@ -9,7 +9,7 @@ import std/[base64, json, os, sequtils, strutils, unicode, unittest]
 import illwill
 import ../src/threecodex/[uwidth, markdown, inputbox, keyevent, session, selection,
                            clipboard, types, backend, config, theme]
-import ../src/threecodex/app
+import ../src/threecodex/[app, threecode_backend]
 
 type
   # A backend that only counts interrupts, so the quit keys can be checked
@@ -24,6 +24,27 @@ proc rowText(tb: TerminalBuffer, y: int): string =
 
 method interrupt(b: RecordingBackend) =
   inc b.interrupts
+
+type
+  # A backend that speaks the UI's `/` prefix about as simply as one can, so
+  # the prompt path can be driven without a provider or a 3code session.
+  CommandBackend = ref object of Backend
+    ran: seq[string]
+
+method supportsCommands(b: CommandBackend): bool = true
+
+method commandPrefix(b: CommandBackend): char = '/'
+
+method isCommand(b: CommandBackend, text: string): bool =
+  text.strip in ["/help", "/tokens"]
+
+method isQuitCommand(b: CommandBackend, text: string): bool =
+  text.strip in ["/quit", "/q"]
+
+method runCommand(b: CommandBackend, cmd: string): string =
+  b.ran.add cmd.strip
+  if cmd.strip == "/help": "commands:\n  /tokens  show usage"
+  else: "no tokens used yet"
 
 suite "app style mapping":
   # On POSIX illwill emits `ESC[<ordinal>m`, so a Style flag *is* an SGR code.
@@ -945,6 +966,121 @@ suite "clipboard":
     check decoded.len <= 96 * 1024
     check decoded.endsWith("日")
     check decoded.len mod 3 == 2
+
+suite "3code command prefix":
+  # 3code spells its commands `:help`; this UI documents `/help`. The adapter
+  # translates one into the other, and without it every command came back
+  # "unknown" - the slash line never reached `classifyCommand` at all.
+
+  # `isCommand` / `isQuitCommand` only look at the text, so a session is not
+  # needed (and would need a configured provider to build).
+  var b = ThreeCodeBackend()
+
+  test "a slash command is the colon command it means":
+    check toCommand("/help") == ":help"
+    check toCommand("/model list") == ":model list"
+    check toCommand("  /tokens  ") == ":tokens"
+    # A colon command is already in the library's spelling, and prose is not a
+    # command either way.
+    check toCommand(":tokens") == ":tokens"
+    check toCommand("run ./3cx") == "run ./3cx"
+
+  test "slash commands are recognised, and only the known ones":
+    check b.isCommand("/help")
+    check b.isCommand("/?")
+    check b.isCommand("/tokens")
+    check b.isCommand("/model list")
+    check b.isCommand("/sandbox show")
+    check b.isCommand(":tokens")
+    check not b.isCommand("/models")      # a typo is not a command
+
+  test "/quit is reported as the quit command":
+    check b.isQuitCommand("/quit")
+    check b.isQuitCommand("/q")
+    check not b.isQuitCommand("/help")
+
+  test "help lists its commands with the UI's prefix":
+    # `:tokens` would be sent to the model as a prompt if the user typed it
+    # back, so the help has to show the spelling that works here.
+    let body = asSlashCommands("  :tokens   show usage\n" &
+                               "  :q :quit  exit\n" &
+                               "  :! CMD    run it\n" &
+                               "see https://example.com and note: keep me\n")
+    check "  /tokens" in body
+    check "  /q /quit" in body
+    check "  /! CMD" in body
+    check ":tokens" notin body
+    # Only command tokens move: a URL and ordinary prose keep their colons.
+    check "https://example.com" in body
+    check "note: keep me" in body
+
+suite "slash commands from the prompt":
+  # The adapter tests above check the translation in isolation; these drive the
+  # same line through the prompt, which is where a command is either consumed
+  # or handed to the model.
+
+  proc commandApp(): tuple[app: App, b: CommandBackend] =
+    let b = CommandBackend()
+    let app = App(chat: Chat(), input: newInputBox(), backend: b,
+                  streamIdx: -1, streaming: false)
+    (app, b)
+
+  proc submit(app: App, text: string) =
+    app.input.paste(text)
+    app.handleEvent(InputEvent(kind: evKey, key: Key.Enter), Layout(), 0)
+
+  proc slashDir(suffix: string): string =
+    result = getTempDir() / ("threecodex_" & suffix)
+    setSessionDir(result)
+    removeDir(result)
+
+  test "a known command runs and is recorded once":
+    # Both the echo and the result belong in the transcript exactly once: the
+    # prompt line used to be added by the slash path and again by the callback
+    # that records the output.
+    let dir = slashDir("slash_known")
+    defer: removeDir(dir)
+    let (app, b) = commandApp()
+    submit(app, "/help")
+    check b.ran == @["/help"]
+    check app.chat.messages.len == 2
+    check app.chat.messages[0].role == rUser
+    check app.chat.messages[0].content == "/help"
+    check app.chat.messages[1].role == rTool
+    check app.chat.messages[1].content == "commands:\n  /tokens  show usage"
+    # Consumed, so no turn was started against the model.
+    check not app.streaming
+
+  test "an unknown command is reported, not sent to the model":
+    let dir = slashDir("slash_unknown")
+    defer: removeDir(dir)
+    let (app, b) = commandApp()
+    submit(app, "/models")
+    check b.ran.len == 0
+    check not app.streaming
+    check app.chat.messages.len == 2
+    check app.chat.messages[1].content == "unknown command: /models  (try /help)"
+
+  test "quit ends the session and is echoed once":
+    let dir = slashDir("slash_quit")
+    defer: removeDir(dir)
+    let (app, b) = commandApp()
+    submit(app, "/quit")
+    check app.quit
+    check b.ran.len == 0
+    check app.chat.messages.len == 1
+    check app.chat.messages[0].content == "/quit"
+
+  test "prose containing a slash is still a prompt":
+    let dir = slashDir("slash_prose")
+    defer: removeDir(dir)
+    let (app, b) = commandApp()
+    submit(app, "run ./3cx")
+    check b.ran.len == 0
+    check app.streaming
+    check app.chat.messages.len == 2
+    check app.chat.messages[0].content == "run ./3cx"
+    check app.chat.messages[1].role == rAssistant
 
 suite "themes":
   # A theme is only ever seen as painted cells, so most of these read a

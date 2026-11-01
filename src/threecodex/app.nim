@@ -536,11 +536,12 @@ proc runSlash(app: App, text: string): bool =
   if prefix == '\0' or c[0] != prefix:
     return false
 
-  app.chat.addMessage(rUser, text)
-
   # `/quit` is the one command that ends the session, and `runCommand` reports
-  # it rather than performing it.
+  # it rather than performing it. It has no output to record, so its echo
+  # happens here; every other line is echoed by `recordCommand`, and echoing it
+  # first as well put the same command in the transcript twice.
   if app.backend.isQuitCommand(c):
+    app.chat.addMessage(rUser, text)
     app.quit = true
     return true
 

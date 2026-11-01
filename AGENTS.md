@@ -15,7 +15,7 @@ Use illwill (https://github.com/johnnovak/illwill) for the TUI.
 
 ## TUI rules
 
-- Use the / prefix to indicate a command.
+- Use the / prefix to indicate a command (3code uses the : prefix).
 - Ctrl-C is to cancel the current op.
 - Ctrl-D is to exit the program.
 - Text should be selectable by the mouse, and copied to the clipboard once

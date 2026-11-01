@@ -176,13 +176,44 @@ method supportsCommands*(b: ThreeCodeBackend): bool =
 method commandPrefix*(b: ThreeCodeBackend): char =
   '/'
 
-method isCommand*(b: ThreeCodeBackend, text: string): bool =
-  ## 3code classifies any leading-`/` line itself, so the same test applies.
+proc toCommand*(text: string): string =
+  ## 3code's command surface is introduced by `:`, but this UI documents `/`,
+  ## so a slash line is translated into the colon command it means before the
+  ## library sees it. Anything else is handed over untouched.
   let c = text.strip
-  c.len > 0 and c[0] == '/' and classifyCommand(c) != ckUnknown
+  if c.len > 0 and c[0] == '/':
+    ":" & c[1 .. ^1]
+  else:
+    text
+
+proc asSlashCommands*(body: string): string =
+  ## Rewrite 3code's `:command` tokens as `/command`, the prefix this UI
+  ## documents, so help output can be typed back the way it is shown.
+  ##
+  ## The same shape `renderHelpS` highlights: a colon followed by a command
+  ## word. A colon before anything else - `https://`, `note: ...` - is left
+  ## alone, which is why this is a scan rather than a blanket replace.
+  result = newStringOfCap(body.len)
+  var i = 0
+  while i < body.len:
+    if body[i] == ':' and i + 1 < body.len and
+       body[i + 1] in {'a' .. 'z', 'A' .. 'Z', '?', '!'}:
+      result.add '/'
+      inc i
+      while i < body.len and body[i] in {'a' .. 'z', 'A' .. 'Z', '?', '!'}:
+        result.add body[i]
+        inc i
+    else:
+      result.add body[i]
+      inc i
+
+method isCommand*(b: ThreeCodeBackend, text: string): bool =
+  ## 3code classifies a leading-`:` line itself; `/` is this UI's spelling of
+  ## the same prefix.
+  classifyCommand(toCommand(text)) != ckUnknown
 
 method isQuitCommand*(b: ThreeCodeBackend, text: string): bool =
-  classifyCommand(text.strip) == ckQuit
+  classifyCommand(toCommand(text)) == ckQuit
 
 method runCommand*(b: ThreeCodeBackend, cmd: string): string =
   ## Run a 3code slash command (`/tokens`, `/model ...`, `/sandbox show`, ...)
@@ -191,11 +222,17 @@ method runCommand*(b: ThreeCodeBackend, cmd: string): string =
   ## `AgentSession.command` returns a plain error string for modal commands
   ## (`/provider add`) rather than raising, and raises only for `/quit`, which
   ## the caller intercepts before getting here.
+  let line = toCommand(cmd)
   let before = b.session.profileLabel()
   try:
-    result = b.session.command(cmd)
+    result = b.session.command(line)
   except CatchableError as e:
     result = e.msg
+  if line == ":help" or line == ":?":
+    # The help lists its commands as `:tokens`, but here they are typed with a
+    # slash; spelling them 3code's way would hand the user lines this UI sends
+    # to the model as prompts.
+    result = asSlashCommands(result)
 
   # `/model <name>` and `/provider <name>` move the session's profile, and the
   # header names it, so the label has to follow or it goes stale - `b.name` was
