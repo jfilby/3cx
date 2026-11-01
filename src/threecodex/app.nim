@@ -287,13 +287,16 @@ proc buildTranscript*(app: App, width: int): seq[Line] =
     # session file) falls back to the backend's current name.
     let label0 = if m.model.len > 0: m.model else: app.backend.name
     let (label, col) = roleLabel(m.role, label0)
+    # A tool card sits on the darker surface: tool output is chrome around the
+    # conversation, and a panel as bright as a reply made every call shout.
+    let cardBg = if m.role == rTool: colToolCard else: colCard
     # Tool cards carry no header: the content is the tool call, and a row
     # reading "tool" above it says nothing the bar has not already said.
     if m.role != rTool:
       var header: Line
       header.bar = cardBar
       header.barFg = col
-      header.cardBg = colCard
+      header.cardBg = cardBg
       header.addSpan Span(text: label, fg: col, bold: true)
       result.add header
 
@@ -304,7 +307,7 @@ proc buildTranscript*(app: App, width: int): seq[Line] =
     for row in body.mitems:
       row.bar = cardBar
       row.barFg = col
-      row.cardBg = colCard
+      row.cardBg = cardBg
       result.add row
 
 # ---------------------------------------------------------------------------

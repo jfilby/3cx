@@ -59,6 +59,9 @@ type
     select*: ForegroundColor   ## Selected transcript text
     selectBg*: BackgroundColor ## Selection background
     card*: BackgroundColor     ## The surface each message card is painted on
+    toolCard*: BackgroundColor ## ... and the one under a tool call, a shade
+                               ## darker so tool output recedes from the
+                               ## conversation it surrounds
     barBg*: BackgroundColor    ## Header and status bar
     barFg*: ForegroundColor    ## ... and their text
 
@@ -105,6 +108,7 @@ const
     # status bar are pale panels on the white canvas rather than the black
     # chrome a light theme would inherit from its SGR-only background slots.
     card: bgCyan,
+    toolCard: bgCyan,
     barBg: bgCyan,
     barFg: fgBlack)
 
@@ -131,7 +135,10 @@ const
     error: fgRed,
     ok: fgGreen,
     prompt: fgCyan,
-    tool: fgYellow,
+    # The dark-grey highlight of a tool card's bar: slot 4 is pinned to
+    # #2a2a2a for this theme (see `applyExactPalette`), which on the black
+    # tool card reads as a quiet edge rather than a call to look here.
+    tool: fgBlue,
     cursor: fgBlack,
     cursorBg: bgCyan,
     select: fgBlack,
@@ -139,6 +146,10 @@ const
     # Slot 4 is already pinned to #2a2a2a for this theme's bars, which is
     # exactly the quiet panel a card wants on a black canvas.
     card: bgBlue,
+    # Slot 0, pinned to pure black: a tool card is the canvas colour, darker
+    # than the #2a2a2a message cards, so a run of tool output stops competing
+    # with the replies above and below it.
+    toolCard: bgBlack,
     barBg: bgBlue,
     barFg: fgWhite)
 
@@ -171,6 +182,7 @@ template colCursorBg*: untyped = currentTheme.cursorBg ## Block cursor backgroun
 template colSelect*: untyped = currentTheme.select ## Selected transcript text
 template colSelectBg*: untyped = currentTheme.selectBg ## Selection background
 template colCard*: untyped = currentTheme.card ## Message card surface
+template colToolCard*: untyped = currentTheme.toolCard ## Tool card surface
 template colBarBg*: untyped = currentTheme.barBg ## Header and status bar
 template colBarFg*: untyped = currentTheme.barFg ## Text on those bars
 

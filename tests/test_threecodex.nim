@@ -293,6 +293,8 @@ suite "message cards":
     check rows.len == 1
     check rows[0].isCard
     check rows[0].barFg == colTool
+    check rows[0].cardBg == colToolCard      # the darker tool surface
+    check rows[0].cardBg != colCard
     check rows[0].lineText == "\u258c ran a tool"
 
   test "a copy leaves the card bar out":
@@ -1352,13 +1354,37 @@ suite "themes":
                lightTheme.error, lightTheme.prompt, lightTheme.ok,
                lightTheme.accent, lightTheme.rule, lightTheme.codeBar]:
       check fg notin [fgWhite, fgGreen, fgYellow, fgCyan]
+    # `tool` is the one dark colour left out of the list above: it draws no
+    # transcript text, only the bar of a tool card, which is meant to be the
+    # dark grey of slot 4 on that card's black surface.
     for fg in [darkTheme.text, darkTheme.code, darkTheme.heading1,
                darkTheme.heading2, darkTheme.heading3, darkTheme.quote,
-               darkTheme.user, darkTheme.assistant, darkTheme.tool,
+               darkTheme.user, darkTheme.assistant,
                darkTheme.error, darkTheme.ok, darkTheme.prompt,
                darkTheme.accent, darkTheme.rule, darkTheme.codeBar]:
       check fg != fgBlack
       check fg != fgBlue
+
+  test "a tool card is the darker, quieter panel":
+    # Tool output wraps the conversation, it is not part of it: its card is the
+    # canvas colour rather than a reply's #2a2a2a, and the bar that marks it is
+    # the dark grey of slot 4 - a quiet edge, not a yellow flag.
+    discard useTheme("dark")
+    defer: discard useTheme(defaultTheme.name)
+    check darkTheme.toolCard == bgBlack        # slot 0, pinned to pure black
+    check darkTheme.toolCard != darkTheme.card
+    check darkTheme.tool == fgBlue             # slot 4, pinned to #2a2a2a
+    var chat = Chat()
+    chat.addMessage(rTool, "ran a tool")
+    var app = App(chat: chat, input: newInputBox(),
+                  backend: newMockBackend("mock"), streamIdx: -1,
+                  streaming: false)
+    var tb = newTerminalBuffer(40, 10)
+    render(tb, app)
+    check tb[2, 2].fg == darkTheme.tool        # the card's bar
+    check tb[2, 2].bg == darkTheme.toolCard    # on the darker surface
+    check tb[37, 2].bg == darkTheme.toolCard   # which reaches the right edge
+    check tb[1, 2].bg == darkTheme.bg          # the margin is still canvas
 
   test "markdown picks up the theme in force":
     themed()
