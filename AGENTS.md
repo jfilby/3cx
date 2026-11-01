@@ -20,3 +20,8 @@ Use illwill (https://github.com/johnnovak/illwill) for the TUI.
 - Ctrl-D is to exit the program.
 - Text should be selectable by the mouse, and copied to the clipboard once
 selected.
+
+
+## Don'ts
+
+- Don't update AGENTS.md or README.md unless specifically requested.
