@@ -276,6 +276,18 @@ suite "message cards":
     check tb[1, 2].bg == darkTheme.bg       # but not the margins
     check tb[38, 2].bg == darkTheme.bg
 
+  test "a tool card has no header row":
+    # A tool message is content only: its card opens straight onto the tool
+    # call, so nothing above it says "tool".
+    var chat = Chat()
+    chat.addMessage(rTool, "ran a tool")
+    let rows = App(chat: chat, backend: newMockBackend("mock"), streamIdx: -1,
+                   streaming: false).buildTranscript(40)
+    check rows.len == 1
+    check rows[0].isCard
+    check rows[0].barFg == colTool
+    check rows[0].lineText == "\u258c ran a tool"
+
   test "a copy leaves the card bar out":
     # The bar is chrome. A paste that begins with "\u258c" is never what the
     # drag meant.
