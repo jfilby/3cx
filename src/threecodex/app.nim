@@ -300,11 +300,11 @@ type
 proc computeLayout(app: App, w, h: int): Layout =
   ## Where each part of the window lands for a given size.
   ##
-  ## The prompt is capped so the header, one transcript row, its separator and
-  ## the status bar always fit. A six-row prompt on a six-row terminal used to
-  ## put `inputTop` above the top of the buffer, and illwill's drawing procs
-  ## take Natural coordinates - so the next frame raised a RangeDefect rather
-  ## than painting.
+  ## The prompt is capped so the header, its blank row, one transcript row, the
+  ## blank row above the prompt and the status bar always fit. A six-row prompt
+  ## on a six-row terminal used to put `inputTop` above the top of the buffer,
+  ## and illwill's drawing procs take Natural coordinates - so the next frame
+  ## raised a RangeDefect rather than painting.
   let
     statusY = h - 1
     maxInputRows = max(statusY - 4, 1)
@@ -408,8 +408,6 @@ proc render*(tb: var TerminalBuffer, app: App) =
   let title = "  3cx" &
               (if app.backend.name.len > 0: "   " & app.backend.name else: "   no backend")
   drawBar(tb, 0, title, colBarBg, colBarFg)
-  tb.setForegroundColor(colRule)
-  tb.drawHorizLine(0, w - 1, 1)
 
   # Transcript.
   if w >= minWidth:
@@ -420,10 +418,6 @@ proc render*(tb: var TerminalBuffer, app: App) =
       let (cs, ce) = app.sel.rowRange(idx)
       tb.drawLine(lay.msgTop + row, sideMargin, app.transcript[idx], bodyWidth,
                   cs, ce)
-
-  # Separator above the input area.
-  tb.setForegroundColor(colRule)
-  tb.drawHorizLine(0, w - 1, lay.inputTop - 1)
 
   # Input area: its own filled surface, so the prompt reads as a box rather
   # than text floating on the canvas - the way OpenCode's prompt does. The
