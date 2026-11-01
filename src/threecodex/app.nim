@@ -47,6 +47,8 @@ const
   sideMargin  = 2      ## Columns of breathing room on each side.
   minWidth    = 24     ## Below this the layout stops trying to be pretty.
   copyFlashSecs = 1.5  ## How long a "copied" message holds the status bar.
+  cardBar     = "\u258c " ## The left edge of every message card: one bar glyph
+                        ## and the column of air between it and the text.
 
 const
   spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -140,39 +142,65 @@ proc applySpan(tb: var TerminalBuffer, s: Span) =
   tb.setBackgroundColor(if s.bg == bgNone: colBg else: s.bg)
   tb.setStyle(spanStyle(s))
 
+proc drawSpan(tb: var TerminalBuffer, y: int, x: var int, x0, maxWidth: int,
+              s: Span, selFrom, selTo: int) =
+  ## Blit one span at `x`, advancing past it, clipped to `maxWidth` columns
+  ## measured from `x0`.
+  ##
+  ## The selected stretch is painted with the selection colours but keeps the
+  ## span's own bold and italic flags, so a selection across a heading does not
+  ## flatten it.
+  let remaining = maxWidth - (x - x0)
+  if remaining <= 0:
+    return
+  let text = truncateToWidth(s.text, remaining)
+  if text.len == 0:
+    return
+  let (a, b, c) = splitSelected(text, selFrom - (x - x0), selTo - (x - x0))
+  if a.len > 0:
+    tb.applySpan(s)
+    tb.write(x, y, a)
+    x += displayWidth(a)
+  if b.len > 0:
+    tb.setForegroundColor(colSelect)
+    tb.setBackgroundColor(colSelectBg)
+    tb.setStyle(spanStyle(s))
+    tb.write(x, y, b)
+    x += displayWidth(b)
+  if c.len > 0:
+    tb.applySpan(s)
+    tb.write(x, y, c)
+    x += displayWidth(c)
+
 proc drawLine(tb: var TerminalBuffer, y: int, x0: int, line: Line,
               maxWidth: int, selFrom = -1, selTo = -1) =
   ## Blit one rendered line at `(x0, y)`, clipped to `maxWidth` columns.
   ##
-  ## `selFrom`/`selTo` bound the selection within the line - display columns,
-  ## `-1` for none - and the default is a plain blit. The selected stretch is
-  ## painted with the selection colours but keeps the span's own bold and
-  ## italic flags, so a selection across a heading does not flatten it.
+  ## A card row is filled to the full width first and then drawn on, so the
+  ## surface reaches the card's right edge however short the text on that row
+  ## is - which is what makes a run of rows read as one block instead of as
+  ## text with a coloured bar beside it. The bar goes through the same
+  ## selection path as the spans: it is a cell like any other, and a drag that
+  ## starts at column zero has to cover it.
   if y < 0 or y >= tb.height or maxWidth <= 0:
     return
   var x = x0
+  if line.isCard:
+    tb.setForegroundColor(colText)
+    tb.setBackgroundColor(line.cardBg)
+    tb.setStyle({})
+    tb.fill(x0, y, x0 + maxWidth - 1, y, " ")
+  if line.bar.len > 0:
+    tb.drawSpan(y, x, x0, maxWidth,
+                Span(text: line.bar, fg: line.barFg, bg: line.cardBg),
+                selFrom, selTo)
   for s in line.spans:
-    let remaining = maxWidth - (x - x0)
-    if remaining <= 0:
-      break
-    let text = truncateToWidth(s.text, remaining)
-    if text.len == 0:
-      continue
-    let (a, b, c) = splitSelected(text, selFrom - (x - x0), selTo - (x - x0))
-    if a.len > 0:
-      tb.applySpan(s)
-      tb.write(x, y, a)
-      x += displayWidth(a)
-    if b.len > 0:
-      tb.setForegroundColor(colSelect)
-      tb.setBackgroundColor(colSelectBg)
-      tb.setStyle(spanStyle(s))
-      tb.write(x, y, b)
-      x += displayWidth(b)
-    if c.len > 0:
-      tb.applySpan(s)
-      tb.write(x, y, c)
-      x += displayWidth(c)
+    # Inside a card, a span that names no background of its own sits on the
+    # card, not on the canvas behind it.
+    var span = s
+    if span.bg == bgNone and line.isCard:
+      span.bg = line.cardBg
+    tb.drawSpan(y, x, x0, maxWidth, span, selFrom, selTo)
   applyCanvas(tb)
 
 proc drawBar(tb: var TerminalBuffer, y: int, text: string, bg: BackgroundColor,
@@ -217,10 +245,18 @@ proc roleLabel(role: Role, backendName: string): tuple[label: string, col: Foreg
 proc buildTranscript*(app: App, width: int): seq[Line] =
   ## Render the whole chat to styled lines, re-wrapped to `width` columns.
   ##
+  ## Every message is a card: it opens with a header row naming whatever wrote
+  ## it, and every row of the card carries the same left bar and the same
+  ## surface. Blank rows *inside* a message are card rows - that is what keeps
+  ## the bar unbroken across a paragraph break - while the blank row *between*
+  ## messages is not, and is what separates one card from the next.
+  ##
   ## Exported because the role labels it stamps on each message are tested
   ## through it: a wrong label is invisible from the shell, which is the whole
   ## class of bug this module's other tests exist for.
-  let bodyWidth = max(width - 2 * sideMargin, 8)
+  let
+    cardWidth = max(width, 8)
+    textWidth = max(cardWidth - displayWidth(cardBar), 8)
   for i, m in app.chat.messages:
     if i > 0:
       result.add Line()
@@ -231,15 +267,21 @@ proc buildTranscript*(app: App, width: int): seq[Line] =
     let label0 = if m.model.len > 0: m.model else: app.backend.name
     let (label, col) = roleLabel(m.role, label0)
     var header: Line
-    header.addSpan Span(text: "\u258c ", fg: col, bold: true)
+    header.bar = cardBar
+    header.barFg = col
+    header.cardBg = colCard
     header.addSpan Span(text: label, fg: col, bold: true)
     result.add header
 
-    let body = if m.role == rUser or m.role == rTool:
-                 renderPlain(m.content, bodyWidth)
+    var body = if m.role == rUser or m.role == rTool:
+                 renderPlain(m.content, textWidth)
                else:
-                 renderMarkdown(m.content, bodyWidth)
-    result.add body
+                 renderMarkdown(m.content, textWidth)
+    for row in body.mitems:
+      row.bar = cardBar
+      row.barFg = col
+      row.cardBg = colCard
+      result.add row
 
 # ---------------------------------------------------------------------------
 # Layout

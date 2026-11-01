@@ -95,6 +95,20 @@ proc rowRange*(sel: Selection, row: int): tuple[cs, ce: int] =
   result.cs = if row == top.row: top.col else: 0
   result.ce = if row == bot.row: bot.col else: lineEndCol
 
+proc rowSlice(l: Line, fromCol, toCol: int): string =
+  ## The part of a transcript row between two display columns.
+  ##
+  ## The card bar the row is decorated with is left out: it is chrome, and a
+  ## paste that begins with "\u258c" is never what the drag meant. Everything
+  ## after it shifts left by the bar's width, and a selection that started on
+  ## the bar itself starts at the text.
+  if l.bar.len == 0:
+    return sliceColumns(l.lineText, fromCol, toCol)
+  let
+    barWidth = displayWidth(l.bar)
+    text = l.lineText[l.bar.len .. ^1]
+  sliceColumns(text, max(fromCol - barWidth, 0), toCol - barWidth)
+
 proc selectedText*(sel: Selection, lines: seq[Line]): string =
   ## The plain text the selection covers, with rows joined by newlines.
   ##
@@ -108,13 +122,12 @@ proc selectedText*(sel: Selection, lines: seq[Line]): string =
     return
   let botRow = min(bot.row, lines.len - 1)
   if top.row == botRow:
-    return sliceColumns(lines[top.row].lineText, top.col, bot.col)
+    return rowSlice(lines[top.row], top.col, bot.col)
   for row in top.row ..< botRow:
-    let text = lines[row].lineText
-    result.add sliceColumns(text, if row == top.row: top.col else: 0,
-                            lineEndCol)
+    result.add rowSlice(lines[row], if row == top.row: top.col else: 0,
+                        lineEndCol)
     result.add '\n'
-  result.add sliceColumns(lines[botRow].lineText, 0, bot.col)
+  result.add rowSlice(lines[botRow], 0, bot.col)
 
 proc splitSelected*(s: string, fromCol, toCol: int): tuple[before, sel, after: string] =
   ## Cut `s` into the part before the selection, the selected part, and the

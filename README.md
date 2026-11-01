@@ -173,18 +173,21 @@ Illwill only offers the eight ANSI colours, and terminals disagree on what those
 names mean — GNOME Terminal's `bgWhite` is a light grey and its `bgBlack` a
 near-black. Two measures keep the canvases true and the text legible anyway:
 
-- **The three background slots are redefined.** On startup, on a `/themes`
+- **The background slots are redefined.** On startup, on a `/themes`
   switch and until exit, 3cx pins palette slot 0 to pure black, slot 7 to
-  pure white and slot 4 — which backs the bars' `bgBlue` — to `#1c3f7a`
+  pure white, slot 4 — which backs the bars' and the dark theme's cards'
+  `bgBlue` — to `#1c3f7a` on the light theme and `#2a2a2a` on the dark one,
+  and slot 6 — which backs the light theme's cards' `bgCyan` — to a light grey
   (OSC 4), and moves the terminal's default foreground/background onto the
-  theme's canvas colours (OSC 10/11) so resize gaps match the canvas. Since
-  only SGR 40, 44 and 47 are ever used as backgrounds, the dark canvas is
+  theme's canvas colours (OSC 10/11) so resize gaps match the canvas. With
+  every background SGR 40, 44, 46 and 47 can reach pinned, the dark canvas is
   genuinely black, the light one genuinely white, and white bar text holds
   ~10:1 on the dark theme's blue however the terminal defines its blue. On
   exit the slots are reset (OSC 104/110/111), handing the terminal its own
-  colours back. Foreground slots are left alone — the reset forms mean
-  nothing is stolen permanently. (Slot 4 doubles as `fgBlue` in the light
-  theme's headings and code; the pin lifts that text on white to 10.3:1.)
+  colours back. Foreground slots are left alone — the reset forms mean nothing
+  is stolen permanently. (Slot 4 doubles as `fgBlue` in the light theme's
+  headings and code; the pin lifts that text on white to 10.3:1. Slot 6 is
+  handed back on the dark theme, which draws cyan *text*.)
 - **Every foreground field is chosen for the worst canvas it can land on.**
   The light theme draws canvas text only in black, blue, magenta and red
   (green, yellow and cyan wash out on a light background), and the dark one
@@ -197,6 +200,22 @@ moment they are used instead of being baked in at compile time. The transcript i
 rebuilt every frame, so a switch lands on the next one with nothing to re-parse
 or invalidate. Adding a theme is a `Theme(...)` literal in `theme.nim` plus a
 line in its `themes` table.
+
+## The transcript
+
+Every message is a card. Its first row names whatever wrote it - `you`, `tool`,
+`system`, or the model that answered - and its `▌` bar runs down every row of
+the message, over one background that fills the block from the left margin to
+the right. A blank row *inside* a message stays a card row, so a paragraph
+break does not cut the bar in two; the blank row *between* messages is canvas,
+and that is what separates one card from the next.
+
+The card surface is `Theme.card`: `bgBlue` in the dark theme, which the palette
+pin makes the same `#2a2a2a` panel the bars are drawn on, and `bgCyan` in the
+light one, repainted to a light grey while that theme is live (see above). A
+span with no background of its own inherits the card, so the canvas cannot show
+through the middle of a message. The bar is chrome, not content: a mouse
+selection copies the rows without it.
 
 ## Keybindings
 
@@ -451,17 +470,18 @@ a local fix rather than something to wait for.
 
 ## Tests
 
-`nimble test` runs 131 checks. Note that they do **not** import the vendored
+`nimble test` runs 161 checks. Note that they do **not** import the vendored
 3code, so they compile in seconds and need no provider:
 
 - `tests/test_threecodex.nim` — Unicode width and hard-breaking, the Markdown
   renderer, the input editor, session round-tripping (including every `Role`
   surviving the role↔string mapping, and the per-message model stamp round-
   tripping as well as degrading to empty in a pre-stamp file), the transcript
-  role labels, the chunk types, and the style→SGR mapping. The theme tests read
-  a real `TerminalBuffer` after a real frame, since a theme is only ever visible
-  as painted cells: the canvas, the two bars, and the fact that a switch
-  repaints all of it.
+  role labels, the message cards and the bar a copy leaves out, the chunk
+  types, and the style→SGR mapping. The theme tests read a real
+  `TerminalBuffer` after a real frame, since a theme is only ever visible as
+  painted cells: the canvas, the two bars, the card surfaces, and the fact that
+  a switch repaints all of it.
 - `tests/test_keyevent.nim` — the decoder: UTF-8 including runes split across
   reads, the Enter/Ctrl+J distinction, xterm modifier bitmasks, kitty CSI-u,
   SGR mouse, and sequences split across several reads.

@@ -27,6 +27,10 @@ type
 
   Line* = object
     spans*: seq[Span]
+    bar*: string             ## The card's left bar, drawn before `spans`.
+    barFg*: ForegroundColor  ## ... in this colour.
+    cardBg*: BackgroundColor ## The surface behind the whole row; `bgNone`
+                             ## means the row is not part of a card.
 
   Block = object
     indent: int        ## Left padding of the first row, in columns.
@@ -56,13 +60,23 @@ proc addSpan*(line: var Line, s: Span) =
       return
   line.spans.add s
 
+proc isCard*(l: Line): bool =
+  ## True when the row is painted as part of a card.
+  l.cardBg != bgNone
+
 proc lineWidth*(l: Line): int =
-  ## Total width of all spans in the line.
+  ## Total width of the line, card bar included.
+  result = displayWidth(l.bar)
   for s in l.spans:
     result += displayWidth(s.text)
 
 proc lineText*(l: Line): string =
   ## The line rendered as plain text, used for hit testing and tests.
+  ##
+  ## The card bar leads the text, so a transcript column is a screen column:
+  ## the selection indexes rows by what was painted rather than by what the
+  ## spans alone would occupy.
+  result = l.bar
   for s in l.spans:
     result.add s.text
 

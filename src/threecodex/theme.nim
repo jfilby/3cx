@@ -58,6 +58,7 @@ type
     cursorBg*: BackgroundColor ## Block cursor background
     select*: ForegroundColor   ## Selected transcript text
     selectBg*: BackgroundColor ## Selection background
+    card*: BackgroundColor     ## The surface each message card is painted on
     barBg*: BackgroundColor    ## Header and status bar
     barFg*: ForegroundColor    ## ... and their text
 
@@ -92,6 +93,10 @@ const
     cursorBg: bgBlue,
     select: fgWhite,
     selectBg: bgBlue,
+    # Cyan is the one slot this theme never draws *text* in, and
+    # `applyExactPalette` repaints it to a light grey while this theme is live:
+    # the terminal's own cyan is far too loud to sit behind every message.
+    card: bgCyan,
     barBg: bgBlack,
     barFg: fgWhite)
 
@@ -123,6 +128,9 @@ const
     cursorBg: bgCyan,
     select: fgBlack,
     selectBg: bgWhite,
+    # Slot 4 is already pinned to #2a2a2a for this theme's bars, which is
+    # exactly the quiet panel a card wants on a black canvas.
+    card: bgBlue,
     barBg: bgBlue,
     barFg: fgWhite)
 
@@ -154,6 +162,7 @@ template colCursor*: untyped = currentTheme.cursor ## Block cursor glyph
 template colCursorBg*: untyped = currentTheme.cursorBg ## Block cursor background
 template colSelect*: untyped = currentTheme.select ## Selected transcript text
 template colSelectBg*: untyped = currentTheme.selectBg ## Selection background
+template colCard*: untyped = currentTheme.card ## Message card surface
 template colBarBg*: untyped = currentTheme.barBg ## Header and status bar
 template colBarFg*: untyped = currentTheme.barFg ## Text on those bars
 
@@ -215,7 +224,7 @@ proc themeHelp*(): string =
 # (bgBlack) to #171421 and SGR 47 (bgWhite) to #d0cfcc, so a "black" canvas
 # renders near-black at best and a "white" one light grey. illwill's display
 # path cannot emit anything beyond SGR 30-37/40-47, so the fix is not in the
-# per-cell colours but in what those SGR codes *mean*: on startup three
+# per-cell colours but in what those SGR codes *mean*: on startup a few
 # palette slots are redefined with OSC 4 - colour 0 to pure black, colour 4
 # (which backs the two bars' `bgBlue`) to #1c3f7a, colour 7 to pure white -
 # and the terminal's own default fg/bg (OSC 10/11) to the theme's, so the
@@ -224,14 +233,18 @@ proc themeHelp*(): string =
 # the terminal defines its blue (solarized's #268bd2, for instance, gives
 # white text only 3.7:1).
 #
-# Only these three slots are redefined because only SGR 40, 44 and 47 are
-# ever used as backgrounds (`bg`, `barBg`, `cursorBg`, `selectBg` are drawn
-# from those), and the foreground text colours are left to the terminal's
+# Only slots 0, 4 and 7 are redefined for both themes, since those are the
+# three SGR 40, 44 and 47 reach (`bg`, `barBg`, `cursorBg`, `selectBg` and the
+# dark theme's cards are drawn from them); the foreground text colours are
+# left to the terminal's
 # palette: they were tuned against it, and overwriting colour slots the
 # terminal shares with every other program is exactly the kind of theft the
 # restore below exists to undo. (Slot 4 doubles as `fgBlue` in the light
 # theme's headings and code; #1c3f7a lifts that text on white from 5.8:1 to
-# 10.3:1, so the pin helps there too.)
+# 10.3:1, so the pin helps there too.) Slot 6 is the exception, and only while
+# the light theme is live: it backs that theme's cards, which want a light grey
+# rather than the terminal's cyan. The dark theme draws cyan text, so it gets
+# the slot handed back.
 #
 # `resetExactPalette` undoes the whole override with the reset forms (OSC 104
 # for the palette slots, OSC 110/111 for the defaults), which return the
@@ -241,9 +254,11 @@ const
   oscSetColor0 = "\x1b]4;0;rgb:0000/0000/0000\x07"
   oscSetColor4 = "\x1b]4;4;rgb:1c3f/1c3f/7a7a\x07"
   oscSetColor7 = "\x1b]4;7;rgb:ffff/ffff/ffff\x07"
+  oscSetColor6 = "\x1b]4;6;rgb:e8e8/e8e8/e8e8\x07"
   oscResetColor0 = "\x1b]104;0\x07"
   oscResetColor4 = "\x1b]104;4\x07"
   oscResetColor7 = "\x1b]104;7\x07"
+  oscResetColor6 = "\x1b]104;6\x07"
 
 proc applyExactPalette*(t: Theme) =
   ## Pin the two background slots to true black/white and move the terminal's
@@ -262,6 +277,11 @@ proc applyExactPalette*(t: Theme) =
   stdout.write(oscSetColor0)
   stdout.write("\x1b]4;4;rgb:" & slot4Rgb & "\x07")
   stdout.write(oscSetColor7)
+  # Slot 6 backs the light theme's cards. The light theme draws no text in
+  # cyan, so repainting it costs nothing there; the dark theme does - headings,
+  # rules and the assistant label are all `fgCyan` - so it is handed back
+  # whenever the dark theme is the one on screen.
+  stdout.write(if t.card == bgCyan: oscSetColor6 else: oscResetColor6)
   stdout.write("\x1b]10;" & fgRgb & "\x07")
   stdout.write("\x1b]11;" & bgRgb & "\x07")
   stdout.flushFile()
@@ -270,5 +290,5 @@ proc resetExactPalette*() =
   ## Hand the terminal its own colours back. The reset forms (104/110/111)
   ## restore the terminal's defaults without us having had to read them.
   stdout.write(oscResetColor0, oscResetColor4, oscResetColor7,
-               "\x1b]110\x07", "\x1b]111\x07")
+               oscResetColor6, "\x1b]110\x07", "\x1b]111\x07")
   stdout.flushFile()

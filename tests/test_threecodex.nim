@@ -185,12 +185,15 @@ suite "transcript role labels":
   # new model had produced them. Hence the per-message stamp.
 
   proc roleLabels(app: App): seq[string] =
-    ## Just the role headers, in order. Compared whole rather than stripped of
-    ## their "\u258c " gutter: that prefix is two runes but four bytes, and
-    ## slicing it off by byte index splits the box-drawing character in half.
+    ## Just the role headers, in order - the first row of each card. Compared
+    ## whole rather than stripped of their "\u258c " bar: that prefix is two
+    ## runes but four bytes, and slicing it off by byte index splits the
+    ## box-drawing character in half.
+    var inCard = false
     for line in app.buildTranscript(60):
-      if line.lineText.startsWith("\u258c "):
+      if line.isCard and not inCard:
         result.add line.lineText
+      inCard = line.isCard
 
   proc stampedApp(): App =
     var chat = Chat()
@@ -225,6 +228,60 @@ suite "transcript role labels":
                   streamIdx: -1, streaming: false)
     applyChunk(app, Chunk(kind: ckText, text: "orphan"))
     check app.chat.messages[0].model == "zai.glm-5.1"
+
+suite "message cards":
+  # A message is one block: every row of it carries the same bar on the left
+  # and the same surface behind it, so a reply reads as a card rather than as a
+  # header with loose text under it. The blank row *between* messages is what
+  # separates one card from the next, and is deliberately not part of either.
+
+  proc cardApp(): App =
+    var chat = Chat()
+    chat.addMessage(rUser, "first\n\nsecond")
+    chat.addMessage(rAssistant, "reply")
+    result = App(chat: chat, backend: newMockBackend("mock"), streamIdx: -1,
+                 streaming: false)
+
+  test "every row of a message is a card row":
+    let rows = cardApp().buildTranscript(40)
+    # Two cards: `you` over four rows - header, two paragraphs and the blank
+    # row between them - then the mock's over two. The gap row is in neither.
+    check rows.len == 7
+    for i in 0 .. 3:
+      check rows[i].isCard
+      check rows[i].bar == "\u258c "
+      check rows[i].cardBg == colCard
+    check rows[2].spans.len == 0     # the paragraph break is card, not gap
+    check not rows[4].isCard
+    check rows[4].bar.len == 0
+    for i in 5 .. 6:
+      check rows[i].isCard
+
+  test "the card surface spans the transcript area, not just the text":
+    # The failure this pins: a background only as wide as the glyphs, which
+    # leaves a ragged right edge instead of a card.
+    discard useTheme("dark")
+    defer: discard useTheme(defaultTheme.name)
+    var chat = Chat()
+    chat.addMessage(rUser, "hi")
+    var app = App(chat: chat, input: newInputBox(),
+                  backend: newMockBackend("mock"), streamIdx: -1)
+    var tb = newTerminalBuffer(40, 10)
+    render(tb, app)
+    # Columns 2 .. 37 are the transcript area: `sideMargin` on each side, out
+    # of a 40-column buffer.
+    check tb[2, 2].bg == darkTheme.card
+    check tb[37, 2].bg == darkTheme.card
+    check tb[2, 3].bg == darkTheme.card     # the body row too
+    check tb[1, 2].bg == darkTheme.bg       # but not the margins
+    check tb[38, 2].bg == darkTheme.bg
+
+  test "a copy leaves the card bar out":
+    # The bar is chrome. A paste that begins with "\u258c" is never what the
+    # drag meant.
+    let rows = cardApp().buildTranscript(40)
+    let sel = selection(Cell(row: 0, col: 0), Cell(row: 1, col: lineEndCol))
+    check sel.selectedText(rows) == "you\nfirst"
 
 suite "cursor rendering":
   # The cursor is painted into the buffer, so it can never appear in two places
@@ -1136,9 +1193,9 @@ suite "themes":
     # invisible in a light theme, and a dark band across a white canvas.
     let tb = paint(lightTheme)
     check tb[2, 2].fg == lightTheme.assistant     # the role label
-    check tb[2, 2].bg == lightTheme.bg
-    check tb[2, 3].bg == lightTheme.bg            # body text
-    check tb[39, 2].bg == lightTheme.bg           # empty margin right of it
+    check tb[2, 2].bg == lightTheme.card          # on the card, not the canvas
+    check tb[2, 3].bg == lightTheme.card          # body text, likewise
+    check tb[39, 2].bg == lightTheme.bg           # nothing outside the card
 
   test "the bars take their colours from the theme":
     themed()
