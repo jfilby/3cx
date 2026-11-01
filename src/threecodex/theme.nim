@@ -68,12 +68,14 @@ const
     description: "black text on a white canvas",
     bg: bgWhite,
     text: fgBlack,
-    # Chrome text only ever lands on `barBg`, which is a bar and not the
-    # canvas - white would vanish on the white canvas.
-    dim: fgWhite,
-    # Dimmed white on the black bar still reads (dim blends it toward black,
-    # ~5:1). On the dark theme's blue bar the same dim blends toward blue and
-    # washes out, so dark turns `barDim` off instead.
+    # Chrome text only ever lands on `barBg`, so it is black like the body
+    # text: the light bar is a pale grey (see `barBg` below) and white on it
+    # would vanish.
+    dim: fgBlack,
+    # Dimmed black on the pale bar still reads (dim blends it toward the
+    # background, leaving a mid grey, ~3:1). On the dark theme's blue bar the
+    # same dim blends toward blue and washes out, so dark turns `barDim` off
+    # instead.
     barDim: true,
     heading1: fgBlue,
     heading2: fgMagenta,
@@ -86,7 +88,10 @@ const
     user: fgMagenta,
     assistant: fgBlue,
     error: fgRed,
-    ok: fgGreen,
+    # The clipboard flash is status-bar text, which now sits on the pale bar:
+    # green there is ~2.7:1. Blue is the one non-black colour the light theme
+    # already trusts on the bar (`prompt`), and slot 4 is pinned to #1c3f7a.
+    ok: fgBlue,
     prompt: fgBlue,
     tool: fgMagenta,
     cursor: fgWhite,
@@ -94,11 +99,14 @@ const
     select: fgWhite,
     selectBg: bgBlue,
     # Cyan is the one slot this theme never draws *text* in, and
-    # `applyExactPalette` repaints it to a light grey while this theme is live:
-    # the terminal's own cyan is far too loud to sit behind every message.
+    # `applyExactPalette` repaints it to a light grey (#e8e8e8) while this
+    # theme is live: the terminal's own cyan is far too loud to sit behind
+    # every message. The bars share it, so the header, the prompt box and the
+    # status bar are pale panels on the white canvas rather than the black
+    # chrome a light theme would inherit from its SGR-only background slots.
     card: bgCyan,
-    barBg: bgBlack,
-    barFg: fgWhite)
+    barBg: bgCyan,
+    barFg: fgBlack)
 
   darkTheme* = Theme(
     name: "dark",
@@ -226,25 +234,25 @@ proc themeHelp*(): string =
 # path cannot emit anything beyond SGR 30-37/40-47, so the fix is not in the
 # per-cell colours but in what those SGR codes *mean*: on startup a few
 # palette slots are redefined with OSC 4 - colour 0 to pure black, colour 4
-# (which backs the two bars' `bgBlue`) to #1c3f7a, colour 7 to pure white -
-# and the terminal's own default fg/bg (OSC 10/11) to the theme's, so the
-# canvas is genuinely black in the dark theme and genuinely white in the
-# light one, and white bar text holds ~10:1 on the blue in dark mode however
-# the terminal defines its blue (solarized's #268bd2, for instance, gives
-# white text only 3.7:1).
+# to the dark theme's bar grey (#2a2a2a, or #1c3f7a in the light theme, where
+# it doubles as `fgBlue`), colour 7 to pure white - and the terminal's own
+# default fg/bg (OSC 10/11) to the theme's, so the canvas is genuinely black
+# in the dark theme and genuinely white in the light one, and white bar text
+# holds ~10:1 on the blue in dark mode however the terminal defines its blue
+# (solarized's #268bd2, for instance, gives white text only 3.7:1).
 #
 # Only slots 0, 4 and 7 are redefined for both themes, since those are the
-# three SGR 40, 44 and 47 reach (`bg`, `barBg`, `cursorBg`, `selectBg` and the
-# dark theme's cards are drawn from them); the foreground text colours are
-# left to the terminal's
-# palette: they were tuned against it, and overwriting colour slots the
-# terminal shares with every other program is exactly the kind of theft the
-# restore below exists to undo. (Slot 4 doubles as `fgBlue` in the light
-# theme's headings and code; #1c3f7a lifts that text on white from 5.8:1 to
-# 10.3:1, so the pin helps there too.) Slot 6 is the exception, and only while
-# the light theme is live: it backs that theme's cards, which want a light grey
-# rather than the terminal's cyan. The dark theme draws cyan text, so it gets
-# the slot handed back.
+# three SGR 40, 44 and 47 reach (`bg`, `cursorBg`, `selectBg` and the dark
+# theme's bars and cards are drawn from them); the foreground text colours are
+# left to the terminal's palette: they were tuned against it, and overwriting
+# colour slots the terminal shares with every other program is exactly the
+# kind of theft the restore below exists to undo. (Slot 4 doubles as `fgBlue`
+# in the light theme's headings and code; #1c3f7a lifts that text on white
+# from 5.8:1 to 10.3:1, so the pin helps there too.) Slot 6 is the exception,
+# and only while the light theme is live: it backs that theme's cards *and*
+# bars, which want a light grey rather than the terminal's cyan, and the light
+# theme never draws text in cyan. The dark theme does, so it gets the slot
+# handed back.
 #
 # `resetExactPalette` undoes the whole override with the reset forms (OSC 104
 # for the palette slots, OSC 110/111 for the defaults), which return the
@@ -277,10 +285,10 @@ proc applyExactPalette*(t: Theme) =
   stdout.write(oscSetColor0)
   stdout.write("\x1b]4;4;rgb:" & slot4Rgb & "\x07")
   stdout.write(oscSetColor7)
-  # Slot 6 backs the light theme's cards. The light theme draws no text in
-  # cyan, so repainting it costs nothing there; the dark theme does - headings,
-  # rules and the assistant label are all `fgCyan` - so it is handed back
-  # whenever the dark theme is the one on screen.
+  # Slot 6 backs the light theme's cards and bars. The light theme draws no
+  # text in cyan, so repainting it costs nothing there; the dark theme does -
+  # headings, rules and the assistant label are all `fgCyan` - so it is handed
+  # back whenever the dark theme is the one on screen.
   stdout.write(if t.card == bgCyan: oscSetColor6 else: oscResetColor6)
   stdout.write("\x1b]10;" & fgRgb & "\x07")
   stdout.write("\x1b]11;" & bgRgb & "\x07")

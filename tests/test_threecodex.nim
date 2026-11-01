@@ -1205,6 +1205,23 @@ suite "themes":
       check tb[0, 0].fg == t.barFg
       check tb[20, 9].bg == t.barBg               # status bar
 
+  test "the light theme's chrome is light as well":
+    # The header, the prompt box and the status bar are pale panels on the
+    # white canvas, not the black chrome the SGR-only background slots would
+    # hand a "light" theme - which is what the top and bottom of the frame
+    # used to be.
+    themed()
+    check lightTheme.barBg == bgCyan        # slot 6, repainted to #e8e8e8
+    check lightTheme.barFg == fgBlack
+    check lightTheme.dim == fgBlack         # the status bar is on the bar too
+    let tb = paint(lightTheme)
+    check tb[0, 0].bg == bgCyan             # header
+    check tb[9, 0].bg == bgCyan             # status bar
+    for y in 0 ..< tb.height:
+      for x in 0 ..< tb.width:
+        if tb[y, x].bg == bgBlack:
+          check false                       # no dark chrome anywhere
+
   test "the status bar hints the slash prefix, not an unbound key":
     # `ctrl+p commands` used to sit in the footer although nothing handled
     # ctrl+p, and commands are typed with a leading `/` by design.
@@ -1263,18 +1280,17 @@ suite "themes":
     check darkTheme.text == fgWhite
     # Terminals do not agree on what the eight ANSI colours mean: GNOME
     # Terminal's bgWhite is #d0cfcc and its bgBlack #171421. Green, yellow and
-    # cyan wash out on a light grey canvas, so the light theme draws canvas
-    # text only in black, blue, magenta and red; `ok` is exempt because it
-    # lands on the black status bar, not the canvas. On the dark side blue's
-    # dark-palette shade (#12488b) is barely visible on a near-black canvas,
-    # so the dark theme keeps it off the transcript entirely.
+    # cyan wash out on a light grey canvas, so the light theme draws text only
+    # in black, blue, magenta and red - on the canvas and on its pale bars
+    # alike. On the dark side blue's dark-palette shade (#12488b) is barely
+    # visible on a near-black canvas, so the dark theme keeps it off the
+    # transcript entirely.
     for fg in [lightTheme.text, lightTheme.code, lightTheme.heading1,
                lightTheme.heading2, lightTheme.heading3, lightTheme.quote,
                lightTheme.user, lightTheme.assistant, lightTheme.tool,
-               lightTheme.error, lightTheme.prompt,
+               lightTheme.error, lightTheme.prompt, lightTheme.ok,
                lightTheme.accent, lightTheme.rule, lightTheme.codeBar]:
       check fg notin [fgWhite, fgGreen, fgYellow, fgCyan]
-    check lightTheme.ok == fgGreen      # status bar only, on bgBlack
     for fg in [darkTheme.text, darkTheme.code, darkTheme.heading1,
                darkTheme.heading2, darkTheme.heading3, darkTheme.quote,
                darkTheme.user, darkTheme.assistant, darkTheme.tool,
